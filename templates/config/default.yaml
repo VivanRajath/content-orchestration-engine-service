@@ -1,6 +1,10 @@
 # Environment config. Override per environment with config/<env>.yaml.
 sandbox:
   enabled: false        # true routes execution through a container
+  allow_shell: false    # run_command takes an argv array and runs with
+                        # shell:false. Turning this on reintroduces shell
+                        # metacharacters, which is where command-gate bypasses
+                        # live — so every command becomes a human checkpoint.
   cpu: 2
   memory: 4g
   disk: 10g

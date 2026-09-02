@@ -60,6 +60,62 @@ pre_edit:
       - "**/*.sql"
       - "**/migrations/**"
 
+
+# Commands are executed with execFile and shell:false, so argv arrives as an
+# array and there are no metacharacters to smuggle a bypass through. Gating a
+# free-form shell string is not reliably possible; gating argv is.
+# See sandbox.allow_shell in config/default.yaml for the opt-out.
+pre_command:
+  - name: no-force-push
+    description: >-
+      No force push, and no history rewrite on the session branch. The write
+      hooks are theatre if the model can just shell out to git.
+    severity: block
+    overridable: false          # never relax this one
+
+  - name: protected-read
+    description: >-
+      The read side of protected-paths. A command may not name a protected
+      file either — blocking writes to .env while allowing `cat .env` is not
+      a guardrail.
+    severity: block
+    overridable: false          # never relax this one
+    # Deliberately narrower than protected-paths: this hook is sealed, so a
+    # false positive is one nobody can switch off, and a command legitimately
+    # names node_modules/.bin/... . Widen it here if your repo needs more.
+    paths:
+      - ".env*"
+      - ".git/**"
+      - "**/*.pem"
+      - "**/id_rsa*"
+      - "**/.npmrc"
+      - "**/.aws/credentials"
+
+  - name: no-sudo
+    description: Never escalate privileges.
+    severity: block
+    overridable: false          # never relax this one
+    commands: ["sudo", "doas", "su", "runas"]
+
+  - name: no-exfil
+    description: No network destination from inside a run.
+    severity: block
+    overridable: true
+    commands: ["curl", "wget", "nc", "ncat", "netcat", "telnet", "scp", "sftp", "ssh", "rsync"]
+
+  - name: destructive
+    description: Recursive deletes, working-tree discards, and database drops.
+    severity: block
+    overridable: true
+
+  - name: dep-change
+    description: >-
+      Not a block. DUTIES.md already makes a dependency change a human
+      checkpoint, so this routes there rather than failing the step.
+    severity: checkpoint
+    overridable: true
+    commands: ["npm", "pnpm", "yarn", "bun", "pip", "pip3", "cargo", "go", "gem", "apt", "apt-get"]
+
 pre_commit:
   - name: build-gate
     description: Do not commit a red build. Route to build-doctor instead.

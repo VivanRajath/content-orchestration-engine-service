@@ -83,18 +83,32 @@ Fail at setup, not mid-task.
 `hooks/hooks.yaml` is enforced by the harness, not by prompt text — a model that
 ignores its own `RULES.md` still cannot get past it.
 
-| Hook | Blocks | Overridable |
-|---|---|---|
-| `secret-scan` | diffs introducing credential-shaped strings | no |
-| `protected-paths` | `.env*`, `.git/`, lockfiles, CI config | yes |
-| `diff-ceiling` | oversized single edits | yes |
-| `scope-fence` | `ui-editor` reaching into logic | yes |
-| `build-gate` | committing a red build | yes |
-| `no-force-push` | rewriting session branch history | no |
+| Phase | Hook | Blocks | Overridable |
+|---|---|---|---|
+| edit | `secret-scan` | diffs introducing credential-shaped strings | no |
+| edit | `protected-paths` | `.env*`, `.git/`, lockfiles, CI config | yes |
+| edit | `diff-ceiling` | oversized single edits | yes |
+| edit | `scope-fence` | `ui-editor` reaching into logic | yes |
+| command | `no-force-push` | force push and history rewrites | no |
+| command | `protected-read` | commands naming `.env`, `.git/`, key material | no |
+| command | `no-sudo` | privilege escalation | no |
+| command | `no-exfil` | `curl`/`scp`/`ssh` to a network destination | yes |
+| command | `destructive` | `rm -rf`, `git clean -f`, database drops | yes |
+| command | `dep-change` | routes to a human checkpoint, does not block | yes |
+| commit | `build-gate` | committing a red build | yes |
 
-`secret-scan` and `no-force-push` are non-overridable by design. With
-bring-your-own-key, the one thing a user must not be able to switch off is the
-check that stops a key from getting committed.
+`secret-scan`, `no-force-push`, `protected-read`, and `no-sudo` are sealed in
+code, not merely marked non-overridable in the file they are declared in.
+Editing `hooks.yaml` cannot disable them, downgrade their severity, or shorten
+their lists — it can only widen them. Deleting the file entirely still leaves
+them running. With bring-your-own-key, the one thing a user must not be able to
+switch off is the check that stops a key from leaving the machine.
+
+Commands run through `execFile` with `shell:false`, so `run_command` takes an
+argv array and there are no shell metacharacters to smuggle a bypass through.
+Gating a free-form shell string is not reliably possible; gating argv is. The
+write hooks would be theatre without this — blocking edits to `.env` while
+allowing `cat .env` is not a guardrail.
 
 ## Design notes
 
