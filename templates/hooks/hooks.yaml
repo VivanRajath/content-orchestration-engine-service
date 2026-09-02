@@ -1,0 +1,77 @@
+# Guardrails run at the harness level, not inside a persona prompt.
+# A model that ignores its RULES.md still cannot get past these.
+
+pre_edit:
+  - name: secret-scan
+    description: Block diffs introducing credential-shaped strings.
+    severity: block
+    overridable: false          # never relax this one
+    checks:
+      - known_prefixes:
+          - "sk-"               # OpenAI-style
+          - "ghp_"              # GitHub PAT
+          - "gho_"
+          - "AKIA"              # AWS access key
+          - "AIza"              # Google API key
+          - "xoxb-"             # Slack bot token
+          - "-----BEGIN"        # private key blocks
+      - high_entropy:
+          min_length: 32
+          min_entropy_bits: 4.0
+          # A hash in a lockfile is high entropy and harmless. Scope it.
+          ignore_paths: ["**/*.lock", "**/*.sum", "**/package-lock.json"]
+
+  - name: protected-paths
+    description: Refuse edits to environment, VCS internals, and CI config.
+    severity: block
+    overridable: true           # per-repo opt-out, logged when used
+    paths:
+      - ".env*"
+      - ".git/**"
+      - "node_modules/**"
+      - ".github/workflows/**"
+      - "**/*.lock"
+      - "**/package-lock.json"
+
+  - name: diff-ceiling
+    description: Large single edits require a stated plan step first.
+    severity: warn
+    overridable: true
+    max_lines: 400
+
+  - name: scope-fence
+    description: >-
+      Restrict ui-editor to presentational files. Enforced structurally
+      because a persona prompt alone will not hold this boundary.
+    severity: block
+    overridable: true
+    applies_to: [ui-editor]
+    allow:
+      - "**/*.css"
+      - "**/*.scss"
+      - "**/*.tsx"
+      - "**/*.jsx"
+      - "**/*.vue"
+      - "**/*.svelte"
+      - "**/*.html"
+    deny:
+      - "**/api/**"
+      - "**/server/**"
+      - "**/*.sql"
+      - "**/migrations/**"
+
+pre_commit:
+  - name: build-gate
+    description: Do not commit a red build. Route to build-doctor instead.
+    severity: block
+    overridable: true
+
+  - name: no-force-push
+    description: Never rewrite session branch history.
+    severity: block
+    overridable: false
+
+post_run:
+  - name: session-summary
+    description: Write tier path and handoff reasons to memory/MEMORY.md.
+    severity: info

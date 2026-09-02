@@ -1,0 +1,45 @@
+# GAP agent manifest. Edit freely — this is yours.
+apiVersion: gitagent/v1
+kind: Agent
+
+metadata:
+  name: jr-architect
+  description: Four-tier coding agent harness with editable personas and guardrails.
+  version: 0.1.0
+
+# Your model, your key. Nothing is pinned by this tool.
+# Key is read from the env var named below — never written to this file.
+model:
+  provider: anthropic          # anthropic | openai | ollama | openai-compatible
+  name: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  base_url: null               # set for ollama / vLLM / OpenRouter / LM Studio
+  temperature: 0.2
+  max_tokens: 8192
+
+identity:
+  soul: SOUL.md
+  rules: RULES.md
+  duties: DUTIES.md
+
+memory:
+  path: memory/MEMORY.md
+  commit: true                 # memory updates land as git commits
+
+hooks: hooks/hooks.yaml
+
+agents:
+  - build-doctor
+  - senior-dev
+  - junior-dev
+  - ui-editor
+
+routing:
+  entry: auto                  # auto | build-doctor | senior-dev | junior-dev | ui-editor
+  junior_retry_limit: 2
+  senior_retry_limit: 2
+  diff_line_ceiling: 400
+  classifier_confidence_floor: 0.6
+  # If the model fails the capability probe, collapse to one agent
+  # instead of thrashing through the ladder.
+  degraded_fallback: senior-dev

@@ -1,0 +1,74 @@
+#!/usr/bin/env node
+import { init } from '../src/init.js';
+import { config } from '../src/config.js';
+import { personas } from '../src/personas.js';
+import { doctor } from '../src/doctor.js';
+import { c } from '../src/util.js';
+
+const HELP = `
+${c.b('jr-architect')} — Jr Architect coding agent in your terminal
+
+  ${c.d('Scaffolds a GAP-format .gitagent/ folder into your repo.')}
+  ${c.d('Your model, your key, your rules. Nothing leaves your machine except')}
+  ${c.d('the calls you configure to your own provider.')}
+
+${c.b('USAGE')}
+  npx jr-architect <command> [options]
+
+${c.b('COMMANDS')}
+  init                  Scaffold .gitagent/ into the current repo
+  config                Show or set model / provider / key env var
+  personas              List, add, or remove persona tiers
+  doctor                Probe the configured model for required capabilities
+
+${c.b('INIT OPTIONS')}
+  --provider <name>     anthropic | openai | ollama | openai-compatible
+  --model <name>        Model identifier
+  --base-url <url>      For ollama, vLLM, OpenRouter, LM Studio
+  --minimal             Only agent.yaml, SOUL.md, RULES.md
+  --force               Overwrite an existing .gitagent/
+
+${c.b('EXAMPLES')}
+  npx jr-architect init
+  npx jr-architect init --provider ollama --model qwen2.5-coder:14b \\
+      --base-url http://localhost:11434/v1
+  jr-architect personas add reviewer
+  jr-architect config set model.name gpt-4o
+  jr-architect doctor
+`;
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+
+const flags = {};
+const positional = [];
+for (let i = 1; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith('--')) {
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    if (next && !next.startsWith('--')) { flags[key] = next; i++; }
+    else flags[key] = true;
+  } else positional.push(a);
+}
+
+try {
+  switch (cmd) {
+    case 'init':     await init(flags); break;
+    case 'config':   await config(positional, flags); break;
+    case 'personas': await personas(positional, flags); break;
+    case 'doctor':   await doctor(flags); break;
+    case '-v':
+    case '--version': console.log('0.1.0'); break;
+    case undefined:
+    case '-h':
+    case '--help':   console.log(HELP); break;
+    default:
+      console.error(c.r(`Unknown command: ${cmd}`));
+      console.log(HELP);
+      process.exit(1);
+  }
+} catch (err) {
+  console.error(c.r('✗ ') + err.message);
+  process.exit(1);
+}
