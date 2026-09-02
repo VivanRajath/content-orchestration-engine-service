@@ -1,0 +1,11 @@
+{
+  "name": "jr-architect",
+  "version": "0.1.0",
+  "description": "Jr Architect coding agent in your terminal. Scaffolds a GAP-format .gitagent/ folder with editable coding personas and guardrails. Bring your own model and key.",
+  "type": "module",
+  "bin": { "jr-architect": "./bin/jr-architect.js", "jra": "./bin/jr-architect.js" },
+  "files": ["bin", "src", "templates"],
+  "engines": { "node": ">=18" },
+  "keywords": ["gitagent", "opengap", "coding-agent", "cli", "ai"],
+  "license": "MIT"
+}

@@ -1,0 +1,15 @@
+# Environment config. Override per environment with config/<env>.yaml.
+sandbox:
+  enabled: false        # true routes execution through a container
+  cpu: 2
+  memory: 4g
+  disk: 10g
+
+git:
+  session_branch: true         # work on jr-architect/session-<id>
+  branch_prefix: jr-architect
+  auto_commit: true
+  auto_push: false             # explicit by default
+
+telemetry:
+  enabled: false               # this tool sends nothing, anywhere
