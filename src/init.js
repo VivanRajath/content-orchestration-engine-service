@@ -1,6 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { TEMPLATES, agentDir, repoRoot } from './paths.js';
+import { patchSection } from './config.js';
 import { c, ok, info, warn } from './util.js';
 
 const PROVIDERS = {
@@ -41,17 +42,18 @@ export async function init(flags) {
     cpSync(TEMPLATES, dir, { recursive: true });
   }
 
-  // Patch agent.yaml. Scope edits to the model: block — `name:` also appears
-  // under metadata:, and a file-wide replace clobbers it.
+  // Patch agent.yaml. patchSection scopes each edit to the model: block —
+  // `name:` also appears under metadata:, and a file-wide replace clobbers it.
   const manifestPath = join(dir, 'agent.yaml');
-  const text = readFileSync(manifestPath, 'utf8');
-  const manifest = text.replace(/^model:\n(?:[ \t]+.*\n|\n)*/m, (block) =>
-    block
-      .replace(/^(\s*provider:).*$/m,    `$1 ${provider}`)
-      .replace(/^(\s*name:).*$/m,        `$1 ${model}`)
-      .replace(/^(\s*api_key_env:).*$/m, `$1 ${p.key}`)
-      .replace(/^(\s*base_url:).*$/m,    `$1 ${baseUrl ?? 'null'}`)
-  );
+  let manifest = readFileSync(manifestPath, 'utf8');
+  for (const [key, value] of [
+    ['provider',    provider],
+    ['name',        model],
+    ['api_key_env', p.key],
+    ['base_url',    baseUrl ?? 'null'],
+  ]) {
+    manifest = patchSection(manifest, 'model', key, value);
+  }
   writeFileSync(manifestPath, manifest);
 
   // Never let a key land in git.
