@@ -9,6 +9,35 @@ function manifestPath() {
   return p;
 }
 
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Replace `key:` inside the `section:` block only, and return the new text.
+ *
+ * `name:` appears under both `metadata:` and `model:`, so a file-wide replace
+ * clobbers the wrong one. This is the only implementation of that scoping —
+ * `init` and `config set` both call it. Two copies is how the bug got in.
+ *
+ * Line-based rather than one big regex: a block that ends at EOF or runs past
+ * blank lines is fiddly to express and easy to get subtly wrong.
+ */
+export function patchSection(text, section, key, value) {
+  const lines = text.split('\n');
+  const head = lines.findIndex((l) => l.startsWith(`${section}:`));
+  if (head === -1) throw new Error(`Section "${section}:" not found in agent.yaml`);
+
+  const keyRe = new RegExp(`^(\\s+${escapeRe(key)}:)`);
+  for (let i = head + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') continue;      // a blank line does not end the block
+    if (!/^[ \t]/.test(line)) break;       // a dedent to column 0 does
+    const m = line.match(keyRe);
+    // Assign, don't String.replace — a value containing $& or $1 would expand.
+    if (m) { lines[i] = `${m[1]} ${value}`; return lines.join('\n'); }
+  }
+  throw new Error(`Key "${section}.${key}" not found in agent.yaml`);
+}
+
 /** Minimal reader for the flat keys we expose. Not a general YAML parser. */
 export function readManifest() {
   const text = readFileSync(manifestPath(), 'utf8');
@@ -49,14 +78,11 @@ export async function config(positional, _flags) {
     if (!path || value === undefined) {
       throw new Error('Usage: jr-architect config set <section.key> <value>\n  e.g. config set model.name gpt-4o');
     }
-    const [, key] = path.split('.');
-    if (!key) throw new Error(`Expected <section.key>, got "${path}"`);
+    const [section, key] = path.split('.');
+    if (!section || !key) throw new Error(`Expected <section.key>, got "${path}"`);
 
     const p = manifestPath();
-    const text = readFileSync(p, 'utf8');
-    const re = new RegExp(`^(\\s*${key}:).*$`, 'm');
-    if (!re.test(text)) throw new Error(`Key "${key}" not found in agent.yaml`);
-    writeFileSync(p, text.replace(re, `$1 ${value}`));
+    writeFileSync(p, patchSection(readFileSync(p, 'utf8'), section, key, value));
     ok(`${path} = ${value}`);
     return;
   }
