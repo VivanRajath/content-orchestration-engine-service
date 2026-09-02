@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir } from './paths.js';
+import { parseYaml } from './yaml.js';
 import { c, ok, info } from './util.js';
 
 function manifestPath() {
@@ -38,22 +39,41 @@ export function patchSection(text, section, key, value) {
   throw new Error(`Key "${section}.${key}" not found in agent.yaml`);
 }
 
-/** Minimal reader for the flat keys we expose. Not a general YAML parser. */
-export function readManifest() {
-  const text = readFileSync(manifestPath(), 'utf8');
-  const get = (section, key) => {
-    const re = new RegExp(`^${section}:[\\s\\S]*?^\\s+${key}:\\s*(.+)$`, 'm');
-    const m = text.match(re);
-    if (!m) return null;
-    const v = m[1].trim().replace(/\s+#.*$/, '');
-    return v === 'null' || v === '' ? null : v;
-  };
+/**
+ * Read agent.yaml.
+ *
+ * This was a set of section-scoped regexes reading five flat scalars. The run
+ * loop needs the routing block as well, and CLAUDE.md's own note on the old
+ * reader said to add a real parser rather than stretch the regexes once
+ * manifest handling grew — src/yaml.js is that parser. One reader, not two:
+ * duplicate readers of this file is the shape of bug `config set` just had.
+ */
+export function readManifest(file = manifestPath()) {
+  const doc = parseYaml(readFileSync(file, 'utf8'), 'agent.yaml') ?? {};
+  const model = doc.model ?? {};
+  const routing = doc.routing ?? {};
+  const nil = (v) => (v === undefined || v === '' ? null : v);
+
   return {
-    provider: get('model', 'provider'),
-    model:    get('model', 'name'),
-    keyEnv:   get('model', 'api_key_env'),
-    baseUrl:  get('model', 'base_url'),
-    entry:    get('routing', 'entry'),
+    provider: nil(model.provider),
+    model:    nil(model.name),
+    keyEnv:   nil(model.api_key_env),
+    baseUrl:  nil(model.base_url),
+    entry:    nil(routing.entry),
+
+    temperature: nil(model.temperature),
+    maxTokens:   nil(model.max_tokens),
+
+    juniorRetryLimit: routing.junior_retry_limit ?? 2,
+    seniorRetryLimit: routing.senior_retry_limit ?? 2,
+    diffCeiling:      routing.diff_line_ceiling ?? 400,
+    confidenceFloor:  routing.classifier_confidence_floor ?? 0.6,
+    degradedFallback: nil(routing.degraded_fallback) ?? 'senior-dev',
+
+    agents:   Array.isArray(doc.agents) ? doc.agents : [],
+    identity: doc.identity ?? {},
+    memory:   doc.memory ?? {},
+    raw:      doc,
   };
 }
 

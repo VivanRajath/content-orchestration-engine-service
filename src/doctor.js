@@ -1,4 +1,5 @@
 import { readManifest } from './config.js';
+import { callModel, apiKey, requiresKey, extractJson } from './provider.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -15,30 +16,8 @@ const TOOL = {
   input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
 };
 
-async function callAnthropic(m, key, body) {
-  const res = await fetch((m.baseUrl || 'https://api.anthropic.com') + '/v1/messages', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: m.model, max_tokens: 256, ...body }),
-  });
-  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
-  return res.json();
-}
-
-async function callOpenAI(m, key, body) {
-  const base = m.baseUrl || 'https://api.openai.com/v1';
-  const res = await fetch(base.replace(/\/$/, '') + '/chat/completions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-    body: JSON.stringify({ model: m.model, max_tokens: 256, ...body }),
-  });
-  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
-  return res.json();
-}
-
 export async function doctor() {
   const m = readManifest();
-  const key = process.env[m.keyEnv] || '';
 
   console.log();
   info(`provider  ${m.provider}`);
@@ -46,8 +25,7 @@ export async function doctor() {
   info(`endpoint  ${m.baseUrl || 'provider default'}`);
   console.log();
 
-  const isAnthropic = m.provider === 'anthropic';
-  if (!key && m.provider !== 'ollama') {
+  if (!apiKey(m) && requiresKey(m)) {
     throw new Error(`$${m.keyEnv} is not set.`);
   }
 
@@ -56,15 +34,12 @@ export async function doctor() {
 
   // 1. structured output
   try {
-    const body = isAnthropic
-      ? { messages: [{ role: 'user', content: PROBE_JSON }] }
-      : { messages: [{ role: 'user', content: PROBE_JSON }] };
-    const data = isAnthropic ? await callAnthropic(m, key, body) : await callOpenAI(m, key, body);
-    const text = isAnthropic
-      ? (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('')
-      : data.choices?.[0]?.message?.content ?? '';
-    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
-    jsonPass = parsed.tier === 'junior-dev';
+    const res = await callModel(m, {
+      messages: [{ role: 'user', content: PROBE_JSON }],
+      maxTokens: 256,
+    });
+    const parsed = extractJson(res.text);
+    jsonPass = parsed?.tier === 'junior-dev';
     jsonPass ? ok('structured output') : warn('structured output — parsed, but wrong shape');
   } catch (e) {
     warn(`structured output — failed (${e.message.slice(0, 80)})`);
@@ -72,16 +47,12 @@ export async function doctor() {
 
   // 2. tool calling
   try {
-    const body = isAnthropic
-      ? { tools: [TOOL], messages: [{ role: 'user', content: 'Read the file README.md' }] }
-      : {
-          tools: [{ type: 'function', function: { name: TOOL.name, description: TOOL.description, parameters: TOOL.input_schema } }],
-          messages: [{ role: 'user', content: 'Read the file README.md' }],
-        };
-    const data = isAnthropic ? await callAnthropic(m, key, body) : await callOpenAI(m, key, body);
-    toolPass = isAnthropic
-      ? (data.content || []).some((b) => b.type === 'tool_use')
-      : Boolean(data.choices?.[0]?.message?.tool_calls?.length);
+    const res = await callModel(m, {
+      tools: [TOOL],
+      messages: [{ role: 'user', content: 'Read the file README.md' }],
+      maxTokens: 256,
+    });
+    toolPass = res.toolCalls.length > 0;
     toolPass ? ok('tool calling') : warn('tool calling — model did not call the tool');
   } catch (e) {
     warn(`tool calling — failed (${e.message.slice(0, 80)})`);
@@ -98,4 +69,6 @@ export async function doctor() {
     info('  jr-architect config set routing.entry senior-dev');
   }
   console.log();
+
+  return { jsonPass, toolPass };
 }
