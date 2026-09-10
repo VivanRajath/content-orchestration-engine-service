@@ -126,7 +126,8 @@ export async function init(flags) {
   }
 
   if (!process.env[p.key]) {
-    warn(`$${p.key} is not set. Export it before running the agent.`);
+    warn(`$${p.key} is not set.`);
+    info(`store one:  ${c.c('jr-arch key <your-key>')}`);
   }
 
   console.log(c.b('Next:'));

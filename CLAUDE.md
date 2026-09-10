@@ -19,6 +19,7 @@ src/tools.js            the model's tool surface; every call passes a hook
 src/session.js          session branch, transcript, attempt frames, handoff payload
 src/verify.js           detect and run the project's own build/test command
 src/detect.js           stack / lockfile / verify-command report
+src/env.js              .gitagent/.env loading and the `key` command
 src/personas.js         list / add / remove tiers, --from <git-url> pull
 src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
 src/classify.js         one model call -> {tier, confidence, reason}
@@ -41,7 +42,8 @@ tier classifier, and the error paths. `node --test`, 180 tests, no runner.
 build-doctor, verify, commit to a session branch, streaming its output.
 `run --resume` continues a stopped session on its original branch. `detect`
 reports the stack. `personas add|remove` wires the tier into agent.yaml and
-DUTIES.md rather than telling the user to. 291 tests, `node --test`.
+DUTIES.md rather than telling the user to. `key` stores a provider key without
+ever asking anyone to type `export`. 311 tests, `node --test`.
 
 Not yet exercised against a live model — the ladder is tested with an injected
 scripted model, not a real one. Whoever has a key first should run it on a
@@ -50,8 +52,22 @@ throwaway repo before trusting it on anything else.
 ## Decisions already made — do not relitigate without reason
 
 **Keys never land in `agent.yaml`.** The manifest stores an env var *name*
-(`api_key_env`), never a key. `init` appends `.gitagent/.env` to `.gitignore`.
-The privacy pitch dies the first time a user commits a key.
+(`api_key_env`), never a key. The value lives in the shell or in
+`.gitagent/.env`, which is gitignored and written 0600 by `jr-arch key`. The
+privacy pitch dies the first time a user commits a key.
+
+**The shell beats the file.** `loadEnv` only fills a variable the environment
+left unset. Someone who exported a key for this one command must not be
+silently overridden by a file they set up weeks ago.
+
+**`ensureIgnored` runs before the write, never after.** Putting a key on disk
+is only acceptable while the file is genuinely ignored, so `jr-arch key`
+verifies — and repairs — the `.gitignore` rule first.
+
+**The agent cannot read its own key.** `.env*` is a sealed `protected-read`
+path, so `read_file(".gitagent/.env")` and `cat .gitagent/.env` are both
+blocked even if the user empties `hooks.yaml`. Reading it is the harness's job,
+the same separation as the harness's own git.
 
 **No telemetry, ever.** The CLI makes zero network calls of its own. The only
 outbound traffic is the user's configured provider, plus an explicit

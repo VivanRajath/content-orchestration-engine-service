@@ -44,8 +44,29 @@ npx jr-arch init --provider openai-compatible --model my-model \
     --base-url https://openrouter.ai/api/v1
 ```
 
-Keys are read from an environment variable named in `agent.yaml`. They are never
-written into the file, and `.gitagent/.env` is added to `.gitignore` on init.
+Any provider, any model name, any endpoint. `openai-compatible` covers anything
+speaking the OpenAI API — OpenRouter, Together, Groq, vLLM, LM Studio — and you
+can change all of it later without re-scaffolding:
+
+```bash
+jr-arch config set model.name qwen/qwen3-coder
+jr-arch config set model.base_url https://openrouter.ai/api/v1
+jr-arch config set model.api_key_env OPENROUTER_API_KEY
+```
+
+`agent.yaml` names an environment **variable**, never a key. The value comes
+from your shell, or from `.gitagent/.env`:
+
+```bash
+jr-arch key sk-ant-...     # writes .gitagent/.env, 0600, gitignored
+jr-arch key                # shows whether one is set, and from where
+jr-arch key remove
+```
+
+An exported shell variable always wins over the file. The `.gitignore` rule is
+verified and repaired *before* anything is written, and the agent itself cannot
+read the file back — `.env*` is a sealed guardrail path, so `read_file` and
+`cat` are both refused.
 
 This CLI sends nothing anywhere. No telemetry, no analytics, no crash reporting.
 The only network calls are the ones you configure to your own provider, plus an
@@ -59,6 +80,7 @@ explicit `personas add --from <git-url>`.
 | `run "<task>"` | Run the agent — `--dry-run`, `--resume`, `--allow-dirty`, `--yes`, `--no-stream` |
 | `pull` | Update the installed pack, keeping your edits — `--dry-run`, `--ref`, `--force` |
 | `detect` | Report the stack, verify command, and lockfile state — `--json` |
+| `key [<value>]` | Store your API key, or show whether one is set — `key remove` |
 | `config` | Show current model and routing |
 | `config set <section.key> <value>` | Change a setting |
 | `personas list` | List tiers and their roles |
@@ -70,7 +92,7 @@ explicit `personas add --from <git-url>`.
 
 ```bash
 npx jr-arch init --from https://github.com/VivanRajath/gitagent-default
-export ANTHROPIC_API_KEY=...
+npx jr-arch key sk-ant-...        # or export ANTHROPIC_API_KEY yourself
 npx jr-arch doctor
 npx jr-arch run "add a --json flag to the status command"
 ```
@@ -168,8 +190,10 @@ Editing, not configuration. To make the junior tier bolder, raise
 jr-arch personas add reviewer
 ```
 
-then add it to the `agents:` list in `agent.yaml` and give it an entry and
-escalation conditions in `DUTIES.md`.
+That creates the persona, adds it to the `agents:` list in `agent.yaml`, and
+puts a row in the `DUTIES.md` tier table. What it will not write for you is the
+escalation rule — who this tier hands to, and when. That is a decision, and a
+guess in the contract file is worse than a visible gap.
 
 ## Format
 
