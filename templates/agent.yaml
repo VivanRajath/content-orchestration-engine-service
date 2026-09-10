@@ -3,7 +3,7 @@ apiVersion: gitagent/v1
 kind: Agent
 
 metadata:
-  name: jr-architect
+  name: jr-arch
   description: Four-tier coding agent harness with editable personas and guardrails.
   version: 0.1.0
 

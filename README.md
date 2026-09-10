@@ -1,4 +1,4 @@
-# jr-architect
+# jr-arch
 
 Jr Architect coding agent in your terminal.
 
@@ -7,7 +7,7 @@ coding personas and guardrails. Point it at any model you want — your provider
 your key, your rules.
 
 ```bash
-npx jr-architect init
+npx jr-arch init
 ```
 
 ## What it does
@@ -36,11 +36,11 @@ review persona changes in a PR like any other code.
 ## Bring your own model
 
 ```bash
-npx jr-architect init --provider anthropic --model claude-sonnet-4-6
-npx jr-architect init --provider openai    --model gpt-4o
-npx jr-architect init --provider ollama    --model qwen2.5-coder:14b \
+npx jr-arch init --provider anthropic --model claude-sonnet-4-6
+npx jr-arch init --provider openai    --model gpt-4o
+npx jr-arch init --provider ollama    --model qwen2.5-coder:14b \
     --base-url http://localhost:11434/v1
-npx jr-architect init --provider openai-compatible --model my-model \
+npx jr-arch init --provider openai-compatible --model my-model \
     --base-url https://openrouter.ai/api/v1
 ```
 
@@ -55,13 +55,48 @@ explicit `personas add --from <git-url>`.
 
 | Command | Does |
 |---|---|
-| `init` | Scaffold `.gitagent/` — `--provider`, `--model`, `--base-url`, `--minimal`, `--force` |
+| `init` | Scaffold `.gitagent/` — `--from <git-url>`, `--ref`, `--provider`, `--model`, `--base-url`, `--minimal`, `--force` |
+| `run "<task>"` | Run the agent — `--dry-run`, `--resume`, `--allow-dirty`, `--yes`, `--no-stream` |
+| `pull` | Update the installed pack, keeping your edits — `--dry-run`, `--ref`, `--force` |
+| `detect` | Report the stack, verify command, and lockfile state — `--json` |
 | `config` | Show current model and routing |
 | `config set <section.key> <value>` | Change a setting |
 | `personas list` | List tiers and their roles |
 | `personas add <name>` | New blank persona, or `--from <git-url>` to pull one |
 | `personas remove <name>` | Delete a tier |
 | `doctor` | Probe your model for the capabilities the tiers need |
+
+## Running it
+
+```bash
+npx jr-arch init --from https://github.com/VivanRajath/gitagent-default
+export ANTHROPIC_API_KEY=...
+npx jr-arch doctor
+npx jr-arch run "add a --json flag to the status command"
+```
+
+A run works on its own branch, so it is reviewable and abandonable:
+
+```
+▸ ui-editor  attempt 1/2
+    ✓ read_file  api/handler.js
+    ✗ write_file  api/handler.js
+    ✓ handoff  → junior-dev
+! handoff → junior-dev: the fix is in the handler, not the presentation
+▸ junior-dev  attempt 1/2
+    ✓ write_file  api/handler.js
+    ✓ done
+✓ verify passed (npm run test)
+  commit     867b813
+```
+
+`run` refuses to start on a dirty working tree — failed attempts are rolled
+back with `git reset --hard`, and that guard is what keeps the rollback from
+reaching your uncommitted work.
+
+If a run stops and escalates to you, `run --resume` picks it up on the same
+branch, carrying the diffs that already failed so the next tier does not
+repeat them.
 
 ## Run `doctor` before you trust the tiers
 
@@ -73,7 +108,7 @@ thrash that looks like a bug in this tool.
 tiered mode will hold. If it won't, set `routing.entry` to a single tier:
 
 ```bash
-jr-architect config set routing.entry senior-dev
+jr-arch config set routing.entry senior-dev
 ```
 
 Fail at setup, not mid-task.
@@ -130,7 +165,7 @@ Editing, not configuration. To make the junior tier bolder, raise
 `RULES.md`. To add a fifth tier:
 
 ```bash
-jr-architect personas add reviewer
+jr-arch personas add reviewer
 ```
 
 then add it to the `agents:` list in `agent.yaml` and give it an entry and

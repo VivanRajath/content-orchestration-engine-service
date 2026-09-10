@@ -66,7 +66,7 @@ export async function doctor() {
     warn(c.b('Tiered mode not recommended for this model.'));
     info('escalation would likely thrash between tiers');
     info(`set routing.entry to ${c.c('senior-dev')} in agent.yaml to run single-agent:`);
-    info('  jr-architect config set routing.entry senior-dev');
+    info('  jr-arch config set routing.entry senior-dev');
   }
   console.log();
 

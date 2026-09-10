@@ -262,3 +262,101 @@ describe('the loop', () => {
     });
   });
 });
+
+describe('resume', () => {
+  test('picks up a stopped session, carrying its failed diffs', async () => {
+    const box = sandbox({ manifest: { 'entry: junior-dev': 'entry: senior-dev' } });
+    await inRepo(box, async () => {
+      // First run stops: senior-dev is terminal and never acts.
+      await run(['add a b constant'], {}, {
+        call: scripted([
+          { tools: [tool('write_file', { path: 'index.js', content: 'export const WRONG = 1;\n' })] },
+          { text: 'stuck' }, { text: 'still stuck' }, { text: 'no' },
+          { tools: [tool('write_file', { path: 'index.js', content: 'export const ALSO_WRONG = 2;\n' })] },
+          { text: 'stuck' }, { text: 'still stuck' }, { text: 'no' },
+        ]),
+      });
+
+      const call = scripted([
+        { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 1;\nexport const b = 2;\n' })] },
+        { tools: [tool('done', { summary: 'Added b' })] },
+      ]);
+      const out = await run([], { resume: true }, { call });
+
+      assert.equal(out.status, 'done');
+      const brief = call.calls[0].messages[0].content;
+      assert.match(brief, /add a b constant/);
+      assert.match(brief, /previous run stopped/);
+      assert.match(brief, /WRONG/, 'the earlier diffs must travel into the resumed run');
+    });
+  });
+
+  test('a resumed run stays on the original session branch', async () => {
+    const box = sandbox({ manifest: { 'entry: junior-dev': 'entry: senior-dev' } });
+    await inRepo(box, async () => {
+      await run(['do a thing'], {}, { call: scripted([{ text: 'no tools' }]) });
+      const first = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: box.root, encoding: 'utf8' }).trim();
+
+      await run([], { resume: true }, {
+        call: scripted([{ tools: [tool('done', { summary: 'ok' })] }]),
+      });
+      const after = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: box.root, encoding: 'utf8' }).trim();
+      assert.equal(after, first, 'resuming must not open a second branch');
+    });
+  });
+
+  test('an unknown session id lists the real ones', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      await run(['a task'], {}, { call: scripted([{ text: 'no tools' }]) });
+      await assert.rejects(
+        () => run([], { resume: 'nope' }, { call: scripted([]) }),
+        /No session "nope"[\s\S]*Available:/,
+      );
+    });
+  });
+
+  test('resuming with no sessions at all is a clear error', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      await assert.rejects(() => run([], { resume: true }, { call: scripted([]) }), /No sessions to resume/);
+    });
+  });
+
+  test('a finished session cannot be resumed', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      await run(['a task'], {}, {
+        call: scripted([{ tools: [tool('done', { summary: 'all good' })] }]),
+      });
+      await assert.rejects(
+        () => run([], { resume: true }, { call: scripted([]) }),
+        /finished successfully/,
+      );
+    });
+  });
+});
+
+describe('the idle guard', () => {
+  // Without it an attempt spends its whole step budget on "Continue" and bills
+  // the user for every round trip.
+  test('three tool-free replies in a row end the attempt', async () => {
+    // One attempt only, so `detail` reports this failure rather than the
+    // retry's.
+    const box = sandbox({
+      manifest: { 'entry: junior-dev': 'entry: senior-dev', 'senior_retry_limit: 2': 'senior_retry_limit: 1' },
+    });
+    await inRepo(box, async () => {
+      const call = scripted([
+        { tools: [tool('read_file', { path: 'index.js' })] },
+        { text: 'thinking' }, { text: 'still thinking' }, { text: 'more thinking' },
+        { text: 'never reached' },
+      ]);
+      const out = await run(['spin'], {}, { call });
+      assert.equal(out.status, 'stopped');
+      assert.match(out.detail ?? '', /no tool call/);
+      // 1 tool call + 3 idle replies, then it stops. The fifth is never made.
+      assert.ok(call.calls.length <= 8, `made ${call.calls.length} model calls`);
+    });
+  });
+});

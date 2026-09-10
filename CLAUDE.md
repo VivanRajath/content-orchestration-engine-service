@@ -1,15 +1,15 @@
-# jr-architect
+# jr-arch
 
 CLI that scaffolds a GAP-format `.gitagent/` folder into a user's repo, pre-filled
 with four coding personas and guardrails. Bring-your-own model and key.
 
 Node, ESM, **zero runtime dependencies**. Keep it that way — `npx` speed is a
-feature, and arg parsing is hand-rolled in `bin/jr-architect.js` on purpose.
+feature, and arg parsing is hand-rolled in `bin/jr-arch.js` on purpose.
 
 ## Layout
 
 ```
-bin/jr-architect.js     entry, arg parsing, command dispatch
+bin/jr-arch.js     entry, arg parsing, command dispatch
 src/init.js             scaffold .gitagent/, patch agent.yaml, guard .gitignore
 src/config.js           read/write manifest; readManifest() is the shared reader
 src/pack.js             fetch / validate / install an agent pack from a git repo
@@ -18,6 +18,7 @@ src/run.js              the execution loop: classify -> attempt -> escalate
 src/tools.js            the model's tool surface; every call passes a hook
 src/session.js          session branch, transcript, attempt frames, handoff payload
 src/verify.js           detect and run the project's own build/test command
+src/detect.js           stack / lockfile / verify-command report
 src/personas.js         list / add / remove tiers, --from <git-url> pull
 src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
 src/classify.js         one model call -> {tier, confidence, reason}
@@ -38,7 +39,9 @@ tier classifier, and the error paths. `node --test`, 180 tests, no runner.
 
 `run` drives the full ladder: classify, attempt, block, hand off, nest
 build-doctor, verify, commit to a session branch, streaming its output.
-265 tests, `node --test`.
+`run --resume` continues a stopped session on its original branch. `detect`
+reports the stack. `personas add|remove` wires the tier into agent.yaml and
+DUTIES.md rather than telling the user to. 291 tests, `node --test`.
 
 Not yet exercised against a live model — the ladder is tested with an injected
 scripted model, not a real one. Whoever has a key first should run it on a
@@ -116,6 +119,12 @@ request that never produced a response; `postStream` cannot, because tokens
 already handed to the caller are already on the user's screen. A mid-stream
 failure is an error, not a retry.
 
+**`--resume` is not a conversation replay.** The message history is never
+stored — doing so would write every prompt and tool result into the user's
+repo. A resume rebuilds the same brief a handoff carries: the original task,
+the tier history, and the failed diffs. That is what DUTIES.md already says an
+escalation needs, so a resumed tier reads its history in a format it knows.
+
 **`doctor` fails at setup, not mid-task.** The tier ladder needs strict JSON and
 tool calling. Small local models often give neither and the ladder degrades into
 retry thrash that reads as a bug in this tool. Probe, then tell the user to drop
@@ -147,7 +156,16 @@ except under `--minimal` and `--from`. Adding a template file automatically
 ships it; the `MINIMAL` array in `init.js` is the only place needing a manual
 update.
 
-Boolean flags live in a `BOOLEAN` set in `bin/jr-architect.js`. Without it the
+`personas` patches the DUTIES.md tier table scoped to the `## Tiers` section.
+The tier name also appears in the escalation prose below it, and a file-wide
+replace would rewrite the sentences defining the handoff graph — the
+`metadata:`/`model:` bug again, in a different file.
+
+A resumed run reuses the prior session's branch. Branching again would strand
+the earlier attempts on a branch nobody looks at, which is the opposite of why
+someone resumes.
+
+Boolean flags live in a `BOOLEAN` set in `bin/jr-arch.js`. Without it the
 parser reads the next token as the flag's value, so `run --dry-run "add a
 thing"` silently loses the task. A hand-rolled parser cannot infer arity — new
 valueless flags must be added to that set.
@@ -176,7 +194,7 @@ terminal version — same personas, no sandbox infrastructure.
 
 Two repos:
 - CLI — `github.com/VivanRajath/content-orchestration-engine-service` (npm name
-  is `jr-architect`; the repo name does not affect `npx`)
+  is `jr-arch`; the repo name does not affect `npx`)
 - Default pack — `github.com/VivanRajath/gitagent-default`, the four tiers as a
   standalone pack repo, installed with `init --from`
 
@@ -185,6 +203,6 @@ Two repos:
 1. A live-model run on a throwaway repo. Everything below is speculation until
    that happens.
 2. `run --resume <session-id>`, using the transcript already being written.
-4. Stack detection, ported from `sandbox-engine-cli`, as `jr-architect detect`.
+4. Stack detection, ported from `sandbox-engine-cli`, as `jr-arch detect`.
 5. `personas add` should offer to patch `agent.yaml` and `DUTIES.md` rather than
    printing a reminder to do it by hand.

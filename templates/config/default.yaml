@@ -10,8 +10,8 @@ sandbox:
   disk: 10g
 
 git:
-  session_branch: true         # work on jr-architect/session-<id>
-  branch_prefix: jr-architect
+  session_branch: true         # work on jr-arch/session-<id>
+  branch_prefix: jr-arch
   auto_commit: true
   auto_push: false             # explicit by default
 

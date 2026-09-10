@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
@@ -45,6 +45,10 @@ export function currentBranch(root = repoRoot()) {
   return git(['rev-parse', '--abbrev-ref', 'HEAD'], { root, check: false });
 }
 
+export function branchExists(root, name) {
+  return git(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`], { root, check: false }) !== null;
+}
+
 export function headSha(root = repoRoot()) {
   return git(['rev-parse', 'HEAD'], { root, check: false });
 }
@@ -67,7 +71,8 @@ export function openSession({
   root = repoRoot(),
   task = '',
   branch = true,
-  prefix = 'jr-architect',
+  prefix = 'jr-arch',
+  reuseBranch = null,
 } = {}) {
   const id = `${stamp()}-${Math.random().toString(36).slice(2, 6)}`;
   const dir = join(agentDir(), '.session', id);
@@ -78,8 +83,18 @@ export function openSession({
   let workBranch = startBranch;
 
   if (branch && isRepo(root) && startSha) {
-    workBranch = `${prefix}/session-${id}`;
-    git(['checkout', '-b', workBranch], { root });
+    // A resumed run continues on the branch the first one created. Branching
+    // again would strand the earlier attempts on a branch nobody looks at, and
+    // the whole point of resuming is to keep that work in view.
+    if (reuseBranch && reuseBranch !== startBranch && branchExists(root, reuseBranch)) {
+      workBranch = reuseBranch;
+      git(['checkout', workBranch], { root });
+    } else if (reuseBranch === startBranch) {
+      workBranch = startBranch;
+    } else {
+      workBranch = `${prefix}/session-${id}`;
+      git(['checkout', '-b', workBranch], { root });
+    }
   }
 
   const session = {
@@ -154,6 +169,18 @@ export function closeAttempt(session, frame, { status, reason = null, verify = n
   frame.reason = reason ?? frame.reason;
   frame.verify = verify;
   frame.diff = diffSince(session.root, frame.sha);
+
+  // The diff goes to its own file rather than into the transcript. It is the
+  // one part of an attempt that a later `--resume` genuinely needs — an
+  // escalation without the failed diff is just a slower retry — and inlining
+  // a few hundred lines of patch per attempt would make the transcript
+  // unreadable for the human it is also written for.
+  if (frame.diff) {
+    try {
+      writeFileSync(join(session.dir, `attempt-${frame.n}.diff`), `${frame.diff}\n`);
+    } catch { /* the run matters more than its own bookkeeping */ }
+  }
+
   record(session, 'attempt.close', {
     n: frame.n, tier: frame.tier, status, reason, steps: frame.steps,
     green: verify?.green ?? null,
@@ -231,6 +258,90 @@ export function handoffPayload(session, { task, to, reason }) {
     last?.verify?.output
       ? `\n## Last build output (${last.verify.label ?? 'unknown command'})\n\n\`\`\`\n${last.verify.output}\n\`\`\``
       : '',
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Resuming
+// ---------------------------------------------------------------------------
+
+/** Session ids under .gitagent/.session/, newest first. Ids sort by timestamp. */
+export function listSessions(dir = join(agentDir(), '.session')) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Read a finished session back off disk.
+ *
+ * Deliberately NOT a conversation replay. The message history is not stored,
+ * and storing it would mean writing every prompt and every tool result into
+ * the user's repo. What a resume actually needs is what DUTIES.md already says
+ * a handoff needs: the original task, what was tried, and why it stopped.
+ */
+export function readSession(id, dir = join(agentDir(), '.session')) {
+  const path = join(dir, id);
+  if (!existsSync(path)) return null;
+
+  const read = (f) => {
+    try { return readFileSync(join(path, f), 'utf8'); } catch { return ''; }
+  };
+
+  const events = read('transcript.jsonl')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(Boolean);
+
+  const attempts = [];
+  for (const e of events) {
+    if (e.event === 'attempt.open') attempts.push({ n: e.n, tier: e.tier, reason: e.reason, status: 'running' });
+    if (e.event === 'attempt.close') {
+      const a = attempts.find((x) => x.n === e.n);
+      if (a) Object.assign(a, { status: e.status, steps: e.steps, green: e.green, reason: e.reason ?? a.reason });
+    }
+  }
+  for (const a of attempts) a.diff = read(`attempt-${a.n}.diff`) || null;
+
+  const open = events.find((e) => e.event === 'session.open');
+  const close = events.find((e) => e.event === 'session.close');
+
+  return {
+    id,
+    dir: path,
+    task: read('task.md').trim(),
+    branch: open?.branch ?? null,
+    startBranch: open?.from ?? null,
+    status: close?.status ?? 'incomplete',
+    attempts,
+  };
+}
+
+/**
+ * The brief a resumed run starts from.
+ *
+ * Same shape as a handoff, because it is one: the previous session is handing
+ * the task back with everything it learned. Reusing that shape means a resumed
+ * tier reads its history in the format it already understands.
+ */
+export function resumeBrief(prior) {
+  const failed = prior.attempts.filter((a) => a.diff);
+  return [
+    `## Task (unmodified)\n\n${prior.task}`,
+    `\n## Why this reached you\n\nA previous run stopped without finishing (${prior.status}). You are picking it up.`,
+    `\n## Tier history\n\n${prior.attempts.map((a) => `${a.n}. ${a.tier} — ${a.status}${a.reason ? ` (${a.reason})` : ''}`).join('\n') || 'none recorded'}`,
+    failed.length
+      ? `\n## Diffs already attempted — these approaches are ruled out\n\n${failed
+          .map((a) => `### attempt ${a.n} (${a.tier}, ${a.status})\n\n\`\`\`diff\n${a.diff}\n\`\`\``)
+          .join('\n\n')}`
+      : '\n## Diffs already attempted\n\nNone were recorded.',
   ].join('\n');
 }
 
