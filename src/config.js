@@ -122,6 +122,9 @@ export function readManifest(file = manifestPath()) {
     degradedFallback: nil(routing.degraded_fallback) ?? 'senior-dev',
 
     agents:   Array.isArray(doc.agents) ? doc.agents : [],
+    // Absent until a pack is installed; `pull` reads it to know where to go
+    // back to, and readManifest is the one reader of this file.
+    source:   doc.source ?? null,
     identity: doc.identity ?? {},
     memory:   doc.memory ?? {},
     raw:      doc,

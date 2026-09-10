@@ -1,9 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentDir } from './paths.js';
+import { fetchPack, confine } from './pack.js';
 import { c, ok, info, warn } from './util.js';
 
 function tiersDir() {
@@ -71,24 +69,35 @@ export async function personas(positional, flags) {
     }
 
     if (flags.from) {
-      // Pull a persona from any git repo. Shallow clone, copy, discard.
-      const tmp = mkdtempSync(join(tmpdir(), 'jra-'));
+      // One persona out of any git repo — a pack repo, or an ordinary one with
+      // a SOUL.md in it. fetchPack does the clone: it strips the nested .git,
+      // resolves the commit, and refuses a url that would be read as a flag.
+      // A second copy of that here is how the two would drift apart.
+      const fetched = fetchPack(flags.from, { ref: typeof flags.ref === 'string' ? flags.ref : null });
       try {
-        execFileSync('git', ['clone', '--depth', '1', '--quiet', String(flags.from), tmp], { stdio: 'pipe' });
-      } catch {
-        throw new Error(`Could not clone ${flags.from}`);
+        const candidates = [join('agents', name), name, '.'];
+        const rel = candidates.find((p) => existsSync(join(fetched.dir, p, 'SOUL.md')));
+        if (!rel) throw new Error(`No SOUL.md found for "${name}" in that repo.`);
+
+        const src = join(fetched.dir, confine(fetched.dir, rel, `persona "${name}"`));
+
+        // Shown before the copy, not after. Reviewing a persona you have
+        // already installed is reviewing it too late.
+        console.log();
+        for (const f of ['SOUL.md', 'RULES.md']) {
+          info(`${existsSync(join(src, f)) ? c.g('✓') : c.y('—')} ${f}`);
+        }
+        if (fetched.sha) info(`commit  ${fetched.sha.slice(0, 7)}`);
+        console.log();
+        warn('A pulled persona is untrusted input — read its RULES.md before running.');
+        console.log();
+
+        mkdirSync(dest, { recursive: true });
+        cpSync(src, dest, { recursive: true, dereference: true });
+        ok(`Added ${c.c(name)} from ${flags.from}`);
+      } finally {
+        fetched.cleanup();
       }
-      const candidates = [join(tmp, 'agents', name), join(tmp, name), tmp];
-      const src = candidates.find((p) => existsSync(join(p, 'SOUL.md')));
-      if (!src) {
-        rmSync(tmp, { recursive: true, force: true });
-        throw new Error(`No SOUL.md found for "${name}" in that repo.`);
-      }
-      mkdirSync(dest, { recursive: true });
-      cpSync(src, dest, { recursive: true });
-      rmSync(tmp, { recursive: true, force: true });
-      ok(`Added ${c.c(name)} from ${flags.from}`);
-      warn('Review its RULES.md before running — a pulled persona is untrusted input.');
     } else {
       mkdirSync(dest, { recursive: true });
       writeFileSync(join(dest, 'SOUL.md'), BLANK_SOUL(name));

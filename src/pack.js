@@ -1,4 +1,5 @@
-import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute, normalize, sep } from 'node:path';
@@ -291,3 +292,115 @@ export function installPack(pack, dest) {
  * them, and init writes the ignore rules that actually matter itself.
  */
 const SKIP = new Set(['.gitignore', '.gitattributes', '.github', '.DS_Store']);
+
+// ---------------------------------------------------------------------------
+// The lock — what was installed, so an update can tell your edits from theirs
+// ---------------------------------------------------------------------------
+
+export const LOCK = '.pack.lock';
+
+/**
+ * Every file a pack install would write, repo-relative and sorted.
+ * Shares the SKIP/.git filter with installPack so the lock cannot describe a
+ * set of files different from the one that actually landed.
+ */
+export function packFiles(dir, prefix = '') {
+  const out = [];
+  for (const entry of readdirSync(join(dir, prefix), { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+    if (entry.name === '.git' || SKIP.has(entry.name)) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...packFiles(dir, rel));
+    else out.push(rel);
+  }
+  return out;
+}
+
+export function hashFile(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Record what was installed and at which commit.
+ *
+ * JSON, not YAML, and deliberately: this file is written and read by the tool
+ * and by nobody else. Every other file in .gitagent/ is meant to be edited by
+ * hand, and formatting one of them as a machine record invites someone to edit
+ * this one too — at which point it stops describing what is on disk.
+ *
+ * No timestamp. The commit is the identity, and a field that changes on every
+ * pull whether or not anything moved is noise in the user's diff.
+ */
+export function writeLock(dest, pack) {
+  const files = {};
+  for (const rel of packFiles(pack.dir)) files[rel] = hashFile(join(pack.dir, rel));
+  const body = {
+    url: pack.url ?? null,
+    ref: pack.ref ?? null,
+    commit: pack.sha ?? null,
+    pack: pack.name ?? null,
+    version: pack.version ?? null,
+    files,
+  };
+  writeFileSync(join(dest, LOCK), `${JSON.stringify(body, null, 2)}\n`);
+  return body;
+}
+
+export function readLock(dest) {
+  const file = join(dest, LOCK);
+  if (!existsSync(file)) return null;
+  try {
+    const doc = JSON.parse(readFileSync(file, 'utf8'));
+    return doc && typeof doc === 'object' && doc.files ? doc : null;
+  } catch {
+    // A corrupt lock means we cannot tell your edits from the pack's. Say so
+    // rather than guessing, which is what returning null lets the caller do.
+    return null;
+  }
+}
+
+/**
+ * What updating to `next` would do to the files on disk.
+ *
+ * The lock is the third point that makes this a merge rather than an
+ * overwrite: comparing the working file to the *previously installed* hash is
+ * what distinguishes "you edited this persona" from "the pack changed it".
+ * Without it, pull either clobbers local edits or never updates anything.
+ *
+ * Files you created yourself are absent from the lock and from the pack, so
+ * they are never in any of these lists — pull does not touch them at all.
+ */
+export function planUpdate(dest, next, lock) {
+  const previous = lock?.files ?? {};
+  const incoming = new Set(packFiles(next.dir));
+  const plan = { create: [], update: [], unchanged: [], conflict: [], remove: [], orphaned: [] };
+
+  for (const rel of incoming) {
+    const target = join(dest, rel);
+    const fresh = hashFile(join(next.dir, rel));
+    const recorded = previous[rel] ?? null;
+
+    if (!existsSync(target)) { plan.create.push(rel); continue; }
+    const current = hashFile(target);
+
+    if (current === fresh) { plan.unchanged.push(rel); continue; }
+    // Never installed by us, and it is already there with different content:
+    // that is the user's file sitting where the pack wants to write. Same
+    // resolution as a local edit — theirs wins until they say otherwise.
+    if (recorded === null) { plan.conflict.push(rel); continue; }
+    if (current === recorded) plan.update.push(rel);
+    else plan.conflict.push(rel);
+  }
+
+  // Dropped by the pack. Clean up what we installed and they never touched;
+  // leave anything they edited, because deleting someone's edited file to
+  // honour an upstream removal is the worst possible reading of "update".
+  for (const [rel, recorded] of Object.entries(previous)) {
+    if (incoming.has(rel)) continue;
+    const target = join(dest, rel);
+    if (!existsSync(target)) continue;
+    if (hashFile(target) === recorded) plan.remove.push(rel);
+    else plan.orphaned.push(rel);
+  }
+
+  return plan;
+}
