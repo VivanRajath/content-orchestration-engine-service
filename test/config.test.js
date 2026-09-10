@@ -58,7 +58,7 @@ describe('patchSection', () => {
     // metadata: and model:, and metadata: comes first in the file.
     const out = patchSection(MANIFEST, 'model', 'name', 'gpt-4o');
     assert.equal(sectionValue(out, 'model', 'name'), 'gpt-4o');
-    assert.equal(sectionValue(out, 'metadata', 'name'), 'jr-architect');
+    assert.equal(sectionValue(out, 'metadata', 'name'), 'jr-arch');
   });
 
   test('metadata.name leaves model.name untouched', () => {
@@ -108,7 +108,7 @@ describe('config set', () => {
       await config(['set', 'model.name', 'gpt-4o'], {});
       const out = readFileSync(join(dir, '.gitagent', 'agent.yaml'), 'utf8');
       assert.equal(sectionValue(out, 'model', 'name'), 'gpt-4o');
-      assert.equal(sectionValue(out, 'metadata', 'name'), 'jr-architect');
+      assert.equal(sectionValue(out, 'metadata', 'name'), 'jr-arch');
     });
   });
 
@@ -138,7 +138,7 @@ describe('init', () => {
       assert.equal(sectionValue(out, 'model', 'name'), 'qwen2.5-coder:14b');
       assert.equal(sectionValue(out, 'model', 'api_key_env'), 'OLLAMA_API_KEY');
       assert.equal(sectionValue(out, 'model', 'base_url'), 'http://localhost:11434/v1');
-      assert.equal(sectionValue(out, 'metadata', 'name'), 'jr-architect');
+      assert.equal(sectionValue(out, 'metadata', 'name'), 'jr-arch');
       assert.equal(sectionValue(out, 'metadata', 'version'), '0.1.0');
     });
   });

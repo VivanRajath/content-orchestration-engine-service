@@ -5,17 +5,18 @@ import { personas } from '../src/personas.js';
 import { doctor } from '../src/doctor.js';
 import { pull } from '../src/pull.js';
 import { run } from '../src/run.js';
+import { detect } from '../src/detect.js';
 import { c } from '../src/util.js';
 
 const HELP = `
-${c.b('jr-architect')} — Jr Architect coding agent in your terminal
+${c.b('jr-arch')} — Jr Architect coding agent in your terminal
 
   ${c.d('Scaffolds a GAP-format .gitagent/ folder into your repo.')}
   ${c.d('Your model, your key, your rules. Nothing leaves your machine except')}
   ${c.d('the calls you configure to your own provider.')}
 
 ${c.b('USAGE')}
-  npx jr-architect <command> [options]
+  npx jr-arch <command> [options]
 
 ${c.b('COMMANDS')}
   init                  Scaffold .gitagent/ into the current repo
@@ -23,6 +24,7 @@ ${c.b('COMMANDS')}
   config                Show or set model / provider / key env var
   personas              List, add, or remove persona tiers
   pull                  Update the installed pack, keeping your edits
+  detect                Report the stack, verify command, and lockfile state
   doctor                Probe the configured model for required capabilities
 
 ${c.b('INIT OPTIONS')}
@@ -40,6 +42,10 @@ ${c.b('RUN OPTIONS')}
   --skip-verify         Do not run the build/test command first
   --yes                 Approve human checkpoints without asking
   --no-stream           Do not stream model output as it arrives
+  --resume [<id>]       Continue a stopped session, carrying its failed diffs
+
+${c.b('DETECT OPTIONS')}
+  --json                Machine-readable output
 
 ${c.b('PULL OPTIONS')}
   --ref <branch|sha>    Update to a specific branch, tag, or commit
@@ -47,16 +53,18 @@ ${c.b('PULL OPTIONS')}
   --force               Overwrite locally-edited files too
 
 ${c.b('EXAMPLES')}
-  npx jr-architect run "add a --json flag to the status command"
-  npx jr-architect run "make the header sticky" --dry-run
-  npx jr-architect init
-  npx jr-architect init --from https://github.com/VivanRajath/gitagent-default
-  npx jr-architect init --provider ollama --model qwen2.5-coder:14b \\
+  npx jr-arch run "add a --json flag to the status command"
+  npx jr-arch run "make the header sticky" --dry-run
+  npx jr-arch run --resume
+  npx jr-arch detect
+  npx jr-arch init
+  npx jr-arch init --from https://github.com/VivanRajath/gitagent-default
+  npx jr-arch init --provider ollama --model qwen2.5-coder:14b \\
       --base-url http://localhost:11434/v1
-  jr-architect pull --dry-run
-  jr-architect personas add reviewer
-  jr-architect config set model.name gpt-4o
-  jr-architect doctor
+  jr-arch pull --dry-run
+  jr-arch personas add reviewer
+  jr-arch config set model.name gpt-4o
+  jr-arch doctor
 `;
 
 const argv = process.argv.slice(2);
@@ -70,7 +78,7 @@ const cmd = argv[0];
  */
 const BOOLEAN = new Set([
   'dry-run', 'force', 'minimal', 'yes', 'no-stream',
-  'allow-dirty', 'skip-verify', 'help', 'version',
+  'allow-dirty', 'skip-verify', 'help', 'version', 'json',
 ]);
 
 const flags = {};
@@ -91,6 +99,7 @@ try {
     case 'config':   await config(positional, flags); break;
     case 'personas': await personas(positional, flags); break;
     case 'run':      await run(positional, flags); break;
+    case 'detect':   await detect(positional, flags); break;
     case 'pull':     await pull(positional, flags); break;
     case 'doctor':   await doctor(flags); break;
     case '-v':

@@ -10,7 +10,7 @@ import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
 import {
   openSession, openAttempt, closeAttempt, closeSession, commitAttempt,
-  revertAttempt, dirtyFiles, isRepo, handoffPayload,
+  revertAttempt, dirtyFiles, isRepo, handoffPayload, listSessions, readSession, resumeBrief,
 } from './session.js';
 import { c, ok, info, warn } from './util.js';
 
@@ -26,15 +26,24 @@ import { c, ok, info, warn } from './util.js';
 
 const DEFAULT_MAX_STEPS = 40;
 
+/** Consecutive tool-free replies before an attempt is declared stalled. */
+const IDLE_LIMIT = 3;
+
 export async function run(positional, flags, { call = callModel } = {}) {
   const root = repoRoot();
   const dir = agentDir();
   const task = (positional ?? []).join(' ').trim() || (typeof flags.task === 'string' ? flags.task : '');
 
   if (!existsSync(join(dir, 'agent.yaml'))) {
-    throw new Error('No .gitagent/ found. Run `jr-architect init` first.');
+    throw new Error('No .gitagent/ found. Run `jr-arch init` first.');
   }
-  if (!task) throw new Error('Usage: jr-architect run "<task>"');
+
+  // Resuming replaces the task with the prior session's, so the check for a
+  // missing task comes after it.
+  const prior = flags.resume ? loadPrior(flags.resume) : null;
+  const brief = prior ? resumeBrief(prior) : task;
+  const subject = prior ? prior.task : task;
+  if (!subject) throw new Error('Usage: jr-arch run "<task>"');
 
   const manifest = readManifest();
   const hooks = loadHooks(dir, { reload: true });
@@ -58,10 +67,14 @@ export async function run(positional, flags, { call = callModel } = {}) {
   }
 
   const build = flags['skip-verify'] ? { green: null, output: '', label: null } : verify({ root });
-  banner(manifest, task, build, tiers);
+  banner(manifest, subject, build, tiers);
+  if (prior) {
+    info(`resuming   ${c.c(prior.id)} ${c.d(`(${prior.attempts.length} prior attempt(s), ${prior.status})`)}`);
+    console.log();
+  }
 
   const entry = await classify({
-    task,
+    task: subject,
     buildGreen: build.green,
     files: repoFiles(root),
     manifest,
@@ -79,9 +92,12 @@ export async function run(positional, flags, { call = callModel } = {}) {
 
   const session = openSession({
     root,
-    task,
+    task: subject,
+    // A resumed run stays on the branch the first one made. Branching again
+    // would strand the earlier attempts on a branch nobody looks at.
+    reuseBranch: prior?.branch ?? null,
     branch: manifest.raw?.git?.session_branch !== false && isRepo(root),
-    prefix: manifest.raw?.git?.branch_prefix ?? 'jr-architect',
+    prefix: manifest.raw?.git?.branch_prefix ?? 'jr-arch',
   });
   session.keyEnv = manifest.keyEnv;
   if (session.branched) info(`branch     ${c.c(session.branch)}`);
@@ -99,7 +115,7 @@ export async function run(positional, flags, { call = callModel } = {}) {
   };
 
   try {
-    const outcome = await ladder(ctx, { tier: entry.tier, task });
+    const outcome = await ladder(ctx, { tier: entry.tier, task: subject, brief });
     finish(ctx, outcome);
     return outcome;
   } catch (err) {
@@ -121,7 +137,7 @@ export async function run(positional, flags, { call = callModel } = {}) {
  * another agent, because there is nothing above it and looping is worse than
  * asking.
  */
-export async function ladder(ctx, { tier, task }) {
+export async function ladder(ctx, { tier, task, brief: initial = null }) {
   const limits = {
     'junior-dev': ctx.manifest.juniorRetryLimit ?? 2,
     'ui-editor': ctx.manifest.juniorRetryLimit ?? 2,
@@ -130,7 +146,7 @@ export async function ladder(ctx, { tier, task }) {
   };
   const used = {};
   let current = tier;
-  let brief = task;
+  let brief = initial ?? task;
   let reason = null;
 
   while (current) {
@@ -218,6 +234,7 @@ async function attempt(ctx, frame, brief) {
   const messages = [{ role: 'user', content: brief }];
   const system = prompt(ctx, frame.tier);
   const toolCtx = { ...ctx, tier: frame.tier, touched: new Set() };
+  let idle = 0;
   // commit() gates on the files this attempt actually wrote, so the set has to
   // live on the frame, not only in the tool context that closes over it.
   frame.touched = toolCtx.touched;
@@ -248,13 +265,20 @@ async function attempt(ctx, frame, brief) {
       if (frame.steps === 1) {
         return {
           kind: 'failed',
-          reason: 'the model replied with prose and called no tool. Run `jr-architect doctor` — tiered mode needs tool calling.',
+          reason: 'the model replied with prose and called no tool. Run `jr-arch doctor` — tiered mode needs tool calling.',
         };
+      }
+      // One nudge is worth paying for; a model that will not act does not
+      // start after the third. Without this an attempt spends its whole
+      // step budget on "Continue" and bills the user for every round trip.
+      if (++idle >= IDLE_LIMIT) {
+        return { kind: 'failed', reason: `stopped acting — ${idle} replies in a row with no tool call` };
       }
       messages.push({ role: 'assistant', text: reply.text });
       messages.push({ role: 'user', content: 'Continue, or call done() if the task is complete.' });
       continue;
     }
+    idle = 0;
 
     messages.push({ role: 'assistant', text: reply.text, toolCalls: reply.toolCalls });
 
@@ -340,7 +364,7 @@ function commit(ctx, frame, summary) {
     for (const b of gate.blocked) warn(`commit blocked by ${b.hook}: ${b.reason}`);
     return;
   }
-  const sha = commitAttempt(ctx.session, frame, `${frame.tier}: ${truncate(summary, 68)}\n\nvia jr-architect`);
+  const sha = commitAttempt(ctx.session, frame, `${frame.tier}: ${truncate(summary, 68)}\n\nvia jr-arch`);
   if (sha) info(`commit     ${c.c(sha.slice(0, 7))}`);
 }
 
@@ -459,6 +483,30 @@ function finish(ctx, outcome) {
  * layout. Indentation is applied per newline as tokens arrive, because a delta
  * can end mid-line and the next one continues it.
  */
+/**
+ * Find the session a --resume refers to.
+ *
+ * `--resume` with no id takes the most recent, which is what someone re-running
+ * a run that just stopped almost always means. A wrong id lists the real ones
+ * rather than saying "not found" and leaving the user to go and read a
+ * directory themselves.
+ */
+function loadPrior(flag) {
+  const ids = listSessions();
+  if (!ids.length) throw new Error('No sessions to resume — .gitagent/.session/ is empty.');
+
+  const id = flag === true ? ids[0] : String(flag);
+  const prior = readSession(id);
+  if (!prior) {
+    const available = ids.slice(0, 8).map((s) => `    ${s}`).join(NEWLINE);
+    throw new Error(`No session "${id}".${NEWLINE}  Available:${NEWLINE}${available}`);
+  }
+  if (prior.status === 'done') {
+    throw new Error(`Session ${id} finished successfully — there is nothing to resume.`);
+  }
+  return prior;
+}
+
 const NEWLINE = String.fromCharCode(10);
 
 function streamWriter(indent = '    ') {

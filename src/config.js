@@ -6,7 +6,7 @@ import { c, ok, info } from './util.js';
 
 function manifestPath() {
   const p = join(agentDir(), 'agent.yaml');
-  if (!existsSync(p)) throw new Error('No .gitagent/ found. Run `jr-architect init` first.');
+  if (!existsSync(p)) throw new Error('No .gitagent/ found. Run `jr-arch init` first.');
   return p;
 }
 
@@ -150,7 +150,7 @@ export async function config(positional, _flags) {
 
   if (action === 'set') {
     if (!path || value === undefined) {
-      throw new Error('Usage: jr-architect config set <section.key> <value>\n  e.g. config set model.name gpt-4o');
+      throw new Error('Usage: jr-arch config set <section.key> <value>\n  e.g. config set model.name gpt-4o');
     }
     const [section, key] = path.split('.');
     if (!section || !key) throw new Error(`Expected <section.key>, got "${path}"`);

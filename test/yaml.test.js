@@ -26,7 +26,7 @@ describe('the shipped files parse', () => {
 
   test('agent.yaml keeps both name keys distinct', () => {
     const doc = p(readFileSync(join(TEMPLATES, 'agent.yaml'), 'utf8'));
-    assert.equal(doc.metadata.name, 'jr-architect');
+    assert.equal(doc.metadata.name, 'jr-arch');
     assert.equal(doc.model.name, 'claude-sonnet-4-6');
     assert.equal(doc.model.base_url, null);
     assert.equal(doc.model.temperature, 0.2);

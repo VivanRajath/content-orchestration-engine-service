@@ -17,7 +17,7 @@ import { c, ok, info, warn } from './util.js';
 export async function pull(positional, flags) {
   const dir = agentDir();
   if (!existsSync(join(dir, 'agent.yaml'))) {
-    throw new Error('No .gitagent/ found. Run `jr-architect init --from <git-url>` first.');
+    throw new Error('No .gitagent/ found. Run `jr-arch init --from <git-url>` first.');
   }
 
   const manifest = readManifest();
@@ -26,7 +26,7 @@ export async function pull(positional, flags) {
   if (!url) {
     throw new Error(
       'This .gitagent/ did not come from a pack, so there is nothing to pull.\n' +
-      '  Point it at one:  jr-architect pull <git-url>',
+      '  Point it at one:  jr-arch pull <git-url>',
     );
   }
 
@@ -140,7 +140,7 @@ function rewriteManifest(dir, next) {
     try { text = patchSection(text, 'routing', key, value); } catch { /* leave it */ }
   }
   text = upsertSection(text, 'source', [
-    '# Where this agent came from. `jr-architect pull` re-reads it.',
+    '# Where this agent came from. `jr-arch pull` re-reads it.',
     `url: ${next.url}`,
     `ref: ${next.ref ?? 'null'}`,
     `commit: ${next.sha ?? 'null'}`,

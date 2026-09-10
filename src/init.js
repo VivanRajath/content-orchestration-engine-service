@@ -99,7 +99,7 @@ export async function init(flags) {
   const current = existsSync(gitignore) ? readFileSync(gitignore, 'utf8') : '';
   const missing = rules.filter((r) => !current.includes(r));
   if (missing.length) {
-    appendFileSync(gitignore, `${current && !current.endsWith('\n') ? '\n' : ''}\n# jr-architect\n${missing.join('\n')}\n`);
+    appendFileSync(gitignore, `${current && !current.endsWith('\n') ? '\n' : ''}\n# jr-arch\n${missing.join('\n')}\n`);
   }
 
   ok(`Scaffolded ${c.c('.gitagent/')} in ${root}`);
@@ -133,7 +133,7 @@ export async function init(flags) {
   if (pack) info('review .gitagent/agents/*/RULES.md — a pulled pack is untrusted input');
   info('edit .gitagent/agents/*/RULES.md to shape each tier');
   info('edit .gitagent/hooks/hooks.yaml to set guardrails');
-  info('run  jr-architect doctor   to verify your model can drive the tiers');
+  info('run  jr-arch doctor   to verify your model can drive the tiers');
 }
 
 
@@ -176,7 +176,7 @@ function loadPack(flags) {
 /** Where this agent came from, pinned. Written into the user's agent.yaml. */
 function sourceBlock(pack) {
   return [
-    '# Where this agent came from. `jr-architect pull` re-reads it.',
+    '# Where this agent came from. `jr-arch pull` re-reads it.',
     `url: ${pack.url}`,
     `ref: ${pack.ref ?? 'null'}`,
     `commit: ${pack.sha ?? 'null'}`,
