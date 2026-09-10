@@ -21,6 +21,21 @@ export function apiKey(manifest) {
   return process.env[manifest.keyEnv] || '';
 }
 
+/**
+ * One message for a missing key, in one place.
+ *
+ * Three copies of "here is how to set your key" is three chances to leave one
+ * of them saying `export`, which is not a command on the platform a good share
+ * of users are typing into.
+ */
+export function missingKey(name) {
+  return [
+    `$${name} is not set.`,
+    '  Store one:  jr-arch key <your-key>',
+    '  Or set that variable in your shell.',
+  ].join('\n');
+}
+
 /** Never let a key value reach a log, a transcript, or an error message. */
 export function redact(text, key) {
   const s = String(text);
@@ -295,7 +310,7 @@ export async function readOpenAIStream(events, onDelta) {
 export async function callModel(manifest, { system, messages = [], tools, maxTokens, temperature, onDelta } = {}) {
   const key = apiKey(manifest);
   if (!key && requiresKey(manifest)) {
-    throw new Error(`$${manifest.keyEnv} is not set.`);
+    throw new Error(missingKey(manifest.keyEnv));
   }
   const limit = maxTokens ?? manifest.maxTokens ?? 4096;
   const temp = temperature ?? manifest.temperature ?? 0.2;

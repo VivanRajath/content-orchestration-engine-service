@@ -1,5 +1,5 @@
 import { readManifest } from './config.js';
-import { callModel, apiKey, requiresKey, extractJson } from './provider.js';
+import { callModel, apiKey, requiresKey, extractJson, missingKey } from './provider.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -26,7 +26,7 @@ export async function doctor() {
   console.log();
 
   if (!apiKey(m) && requiresKey(m)) {
-    throw new Error(`$${m.keyEnv} is not set.`);
+    throw new Error(missingKey(m.keyEnv));
   }
 
   let jsonPass = false;

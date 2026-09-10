@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { init } from '../src/init.js';
-import { config } from '../src/config.js';
+import { config, readManifest } from '../src/config.js';
 import { personas } from '../src/personas.js';
 import { doctor } from '../src/doctor.js';
 import { pull } from '../src/pull.js';
 import { run } from '../src/run.js';
 import { detect } from '../src/detect.js';
+import { loadEnv, key } from '../src/env.js';
 import { c } from '../src/util.js';
 
 const HELP = `
@@ -22,6 +23,7 @@ ${c.b('COMMANDS')}
   init                  Scaffold .gitagent/ into the current repo
   run "<task>"          Run the agent on a task
   config                Show or set model / provider / key env var
+  key [<value>]         Store your API key, or show whether one is set
   personas              List, add, or remove persona tiers
   pull                  Update the installed pack, keeping your edits
   detect                Report the stack, verify command, and lockfile state
@@ -44,6 +46,10 @@ ${c.b('RUN OPTIONS')}
   --no-stream           Do not stream model output as it arrives
   --resume [<id>]       Continue a stopped session, carrying its failed diffs
 
+${c.b('KEY OPTIONS')}
+  --env <NAME>          Use a different variable than the manifest names
+  key remove            Delete the stored key
+
 ${c.b('DETECT OPTIONS')}
   --json                Machine-readable output
 
@@ -59,6 +65,8 @@ ${c.b('EXAMPLES')}
   npx jr-arch detect
   npx jr-arch init
   npx jr-arch init --from https://github.com/VivanRajath/gitagent-default
+  npx jr-arch key sk-ant-...
+  npx jr-arch config set model.name gpt-4o
   npx jr-arch init --provider ollama --model qwen2.5-coder:14b \\
       --base-url http://localhost:11434/v1
   jr-arch pull --dry-run
@@ -93,6 +101,10 @@ for (let i = 1; i < argv.length; i++) {
   } else positional.push(a);
 }
 
+// Before any command that talks to a provider. The shell still wins: this
+// only fills a variable the environment left unset.
+loadEnv();
+
 try {
   switch (cmd) {
     case 'init':     await init(flags); break;
@@ -100,6 +112,7 @@ try {
     case 'personas': await personas(positional, flags); break;
     case 'run':      await run(positional, flags); break;
     case 'detect':   await detect(positional, flags); break;
+    case 'key':      await key(positional, flags, { manifest: readManifest() }); break;
     case 'pull':     await pull(positional, flags); break;
     case 'doctor':   await doctor(flags); break;
     case '-v':
