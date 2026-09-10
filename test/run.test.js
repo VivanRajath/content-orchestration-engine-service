@@ -1,0 +1,264 @@
+import { test, describe } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, realpathSync, cpSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { run, escalate } from '../src/run.js';
+import { TEMPLATES } from '../src/paths.js';
+
+/**
+ * The ladder, driven by a scripted model.
+ *
+ * `run` takes its model call as an injectable, so the escalation rules can be
+ * exercised without a key and without paying for a single token. What is being
+ * tested is the machinery — attempt counting, handoff routing, reverting a
+ * failed attempt, build-doctor returning control — not whether a real model
+ * makes good choices.
+ */
+
+let seq = 0;
+const nextId = () => `call_${++seq}`;
+
+/** A model that replays a fixed script of turns, one per call. */
+function scripted(turns) {
+  const calls = [];
+  const fn = async (_manifest, req) => {
+    // Snapshot the message list. attempt() mutates one array across turns, so
+    // storing the request by reference would make every recorded call show the
+    // transcript's final state rather than what this turn actually saw.
+    calls.push({ ...req, messages: [...req.messages] });
+    const turn = turns[calls.length - 1];
+    if (!turn) return { text: 'no more scripted turns', toolCalls: [], stopReason: 'end_turn' };
+    return {
+      text: turn.text ?? '',
+      toolCalls: (turn.tools ?? []).map((t) => ({ id: nextId(), name: t[0], input: t[1] })),
+      stopReason: 'tool_use',
+    };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+const tool = (name, input) => [name, input];
+
+function sandbox({ scripts = { test: 'node -e "process.exit(0)"' }, files = {}, manifest = {} } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'jra-run-')));
+  const git = (...a) => execFileSync('git', a, { cwd: root, stdio: 'pipe' });
+
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts }, null, 2));
+  writeFileSync(join(root, 'index.js'), 'export const a = 1;\n');
+  mkdirSync(join(root, 'api'), { recursive: true });
+  writeFileSync(join(root, 'api', 'handler.js'), 'export function h() {}\n');
+  writeFileSync(join(root, 'style.css'), 'body { color: red; }\n');
+  for (const [rel, body] of Object.entries(files)) writeFileSync(join(root, rel), body);
+
+  const dir = join(root, '.gitagent');
+  cpSync(TEMPLATES, dir, { recursive: true });
+
+  // Pin the entry tier so the classifier never calls the model: these tests are
+  // about the ladder, and a scripted turn spent on classification is noise.
+  // Every manifest edit happens BEFORE the baseline commit — run() refuses a
+  // dirty tree, so editing it afterwards would fail the guard, not the case.
+  const file = join(dir, 'agent.yaml');
+  let text = readFileSync(file, 'utf8').replace('entry: auto', 'entry: junior-dev');
+  for (const [from, to] of Object.entries(manifest)) text = text.replace(from, to);
+  writeFileSync(file, text);
+
+  // What init writes. Without it .gitagent/.session/ is untracked, and the
+  // dirty-tree guard would fire on the agent's own transcript.
+  writeFileSync(join(root, '.gitignore'), '.gitagent/.env\n.gitagent/.session/\n');
+
+  git('init', '-q');
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '--all');
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init');
+  return { root, dir, git };
+}
+
+/** run() reads the repo from cwd, so each case owns the process directory. */
+async function inRepo(box, fn) {
+  const prev = process.cwd();
+  process.chdir(box.root);
+  try {
+    return await fn();
+  } finally {
+    process.chdir(prev);
+    rmSync(box.root, { recursive: true, force: true });
+  }
+}
+
+describe('escalate', () => {
+  const all = ['build-doctor', 'junior-dev', 'ui-editor', 'senior-dev'];
+
+  test('ui-editor hands sideways to its peer, not up to senior', () => {
+    assert.equal(escalate('ui-editor', all), 'junior-dev');
+  });
+
+  test('junior-dev escalates to senior-dev', () => {
+    assert.equal(escalate('junior-dev', all), 'senior-dev');
+  });
+
+  // There is nothing above senior, and looping is worse than asking.
+  test('senior-dev is terminal', () => {
+    assert.equal(escalate('senior-dev', all), null);
+  });
+
+  test('an uninstalled next tier falls back to senior-dev', () => {
+    assert.equal(escalate('ui-editor', ['ui-editor', 'senior-dev']), 'senior-dev');
+  });
+});
+
+describe('the loop', () => {
+  test('a tier that writes and calls done finishes and commits', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const call = scripted([
+        { tools: [tool('read_file', { path: 'index.js' })] },
+        { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 1;\nexport const hello = () => "hi";\n' })] },
+        { tools: [tool('done', { summary: 'Added hello() to index.js' })] },
+      ]);
+      const out = await run(['add a hello function'], {}, { call });
+
+      assert.equal(out.status, 'done');
+      assert.equal(out.tier, 'junior-dev');
+      assert.match(readFileSync(join(box.root, 'index.js'), 'utf8'), /hello/);
+      const log = execFileSync('git', ['log', '--oneline'], { cwd: box.root, encoding: 'utf8' });
+      assert.match(log, /junior-dev: Added hello/);
+    });
+  });
+
+  test('a run refuses to start on a dirty tree', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      writeFileSync(join(box.root, 'uncommitted.txt'), 'work in progress\n');
+      await assert.rejects(
+        () => run(['anything'], {}, { call: scripted([]) }),
+        /uncommitted change/,
+      );
+    });
+  });
+
+  test('--dry-run classifies and writes nothing', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const out = await run(['do a thing'], { 'dry-run': true }, { call: scripted([]) });
+      assert.equal(out.dryRun, true);
+      assert.equal(out.tier, 'junior-dev');
+      assert.ok(!existsSync(join(box.dir, '.session')), 'no session should be opened');
+    });
+  });
+
+  // A blocked hook has to come back as a tool error the model can act on. If it
+  // threw, the run would die and the block reason would never be read.
+  test('a blocked edit is reported to the model, which can then hand off', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const call = scripted([
+        { tools: [tool('write_file', { path: 'index.js', content: 'const k = "sk-abcdefghijklmnopqrstuvwxyz0123";\n' })] },
+        { tools: [tool('done', { summary: 'Wrote nothing secret in the end' })] },
+      ]);
+      const out = await run(['add a key'], {}, { call });
+
+      assert.equal(out.status, 'done');
+      const secondTurn = call.calls[1];
+      const results = secondTurn.messages.at(-1).results;
+      assert.equal(results[0].isError, true);
+      assert.match(results[0].content, /secret-scan/);
+      assert.ok(!readFileSync(join(box.root, 'index.js'), 'utf8').includes('sk-'));
+    });
+  });
+
+  test('a handoff routes to the named tier and reverts the first attempt', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const call = scripted([
+        // junior-dev starts down the wrong path, then recognises the scope
+        { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 999;\n' })] },
+        { tools: [tool('handoff', { to: 'senior-dev', reason: 'this is cross-cutting' })] },
+        // senior-dev picks it up
+        { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 1;\nexport const b = 2;\n' })] },
+        { tools: [tool('done', { summary: 'Added b' })] },
+      ]);
+      const out = await run(['restructure things'], {}, { call });
+
+      assert.equal(out.status, 'done');
+      assert.equal(out.tier, 'senior-dev');
+      const final = readFileSync(join(box.root, 'index.js'), 'utf8');
+      assert.match(final, /export const b = 2/);
+      // The junior's abandoned edit must not survive into the senior's result.
+      assert.ok(!final.includes('999'), 'the reverted attempt leaked into the tree');
+    });
+  });
+
+  test('the handoff brief carries the failed diff, not just the task', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const call = scripted([
+        { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 42;\n' })] },
+        { tools: [tool('handoff', { to: 'senior-dev', reason: 'out of my depth' })] },
+        { tools: [tool('done', { summary: 'handled' })] },
+      ]);
+      await run(['do the thing'], {}, { call });
+
+      const seniorBrief = call.calls[2].messages[0].content;
+      assert.match(seniorBrief, /Task \(unmodified\)/);
+      assert.match(seniorBrief, /out of my depth/);
+      assert.match(seniorBrief, /Diffs already attempted/);
+      assert.match(seniorBrief, /42/, 'the failed diff must travel with the handoff');
+    });
+  });
+
+  test('senior-dev is terminal — it stops rather than escalating further', async () => {
+    const box = sandbox({ manifest: { 'entry: junior-dev': 'entry: senior-dev' } });
+    await inRepo(box, async () => {
+      // Prose with no tool call on the first step is a failed attempt.
+      const call = scripted([{ text: 'I am thinking about it.' }, { text: 'Still thinking.' }]);
+      const out = await run(['impossible task'], {}, { call });
+
+      assert.equal(out.status, 'stopped');
+      assert.equal(out.tier, 'senior-dev');
+      assert.match(out.reason, /terminal/);
+    });
+  });
+
+  test('a red build after done routes to build-doctor, which hands control back', async () => {
+    const box = sandbox({ scripts: { test: 'node -e "require(\'fs\').existsSync(\'FIXED\')?process.exit(0):process.exit(1)"' } });
+    await inRepo(box, async () => {
+      const call = scripted([
+        { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 2;\n' })] },
+        { tools: [tool('done', { summary: 'changed a' })] },
+        // build-doctor runs nested and repairs the build
+        { tools: [tool('write_file', { path: 'FIXED', content: 'ok\n' })] },
+        { tools: [tool('done', { summary: 'build green' })] },
+      ]);
+      const out = await run(['change a'], { 'skip-verify': true }, { call });
+
+      assert.equal(out.status, 'done');
+      // The FEATURE tier owns the outcome; build-doctor does not inherit it.
+      assert.equal(out.tier, 'junior-dev');
+      assert.match(out.summary, /changed a/);
+      assert.ok(existsSync(join(box.root, 'FIXED')));
+    });
+  });
+
+  test('a model that only emits prose is told to run doctor', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const call = scripted([{ text: 'Sure! I would love to help with that.' }]);
+      const out = await run(['do a thing'], {}, { call });
+      assert.equal(out.status, 'stopped');
+      assert.match(out.detail ?? '', /doctor/);
+    });
+  });
+
+  test('the step ceiling ends an attempt that never finishes', async () => {
+    const box = sandbox({ manifest: { 'max_steps: 40': 'max_steps: 3' } });
+    await inRepo(box, async () => {
+      const spin = Array.from({ length: 40 }, () => ({ tools: [tool('read_file', { path: 'index.js' })] }));
+      const out = await run(['spin forever'], {}, { call: scripted(spin) });
+
+      assert.equal(out.status, 'stopped');
+      assert.match(out.detail ?? '', /3-step ceiling/);
+    });
+  });
+});
