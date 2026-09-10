@@ -425,9 +425,7 @@ export function checkCommand(argv, tier, hooks = loadHooks()) {
   const read = active(hooks.pre_command['protected-read']);
   if (read) {
     for (const token of pathTokens(args)) {
-      const path = normalizePath(token);
-      // `.git/**` should also stop a command that names `.git` itself.
-      const hit = matchesAny(path, read.paths) ?? matchesAny(path, (read.paths ?? []).map((g) => g.replace(/\/\*\*$/, '')));
+      const hit = protectedRead(token, read);
       if (hit) {
         block(v, 'protected-read', `"${token}" names a protected path (matches "${hit}"). Reading it is a leak, not just writing it.`);
         break;
@@ -454,6 +452,28 @@ export function checkCommand(argv, tier, hooks = loadHooks()) {
     if (reason) warn(v, 'dep-change', reason, true);
   }
 
+  return v;
+}
+
+/** Which protected-read glob a path hits, if any. `.git/**` also covers `.git`. */
+function protectedRead(token, hook) {
+  const path = normalizePath(token);
+  return matchesAny(path, hook.paths) ?? matchesAny(path, (hook.paths ?? []).map((g) => g.replace(/\/\*\*$/, '')));
+}
+
+/**
+ * The read tool needs the same gate as the command gate. Blocking `cat .env`
+ * while allowing read_file(".env") would just move the leak one tool over.
+ */
+export function checkRead(filePath, tier, hooks = loadHooks()) {
+  const v = verdict();
+  const hook = active(hooks.pre_command['protected-read']);
+  if (hook) {
+    const hit = protectedRead(filePath, hook);
+    if (hit) {
+      block(v, 'protected-read', `${normalizePath(filePath)} is a protected path (matches "${hit}") and may not be read.`);
+    }
+  }
   return v;
 }
 
