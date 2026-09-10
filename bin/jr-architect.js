@@ -22,6 +22,8 @@ ${c.b('COMMANDS')}
   doctor                Probe the configured model for required capabilities
 
 ${c.b('INIT OPTIONS')}
+  --from <git-url>      Install an agent pack from a git repo
+  --ref <branch|sha>    Pin the pack to a branch, tag, or commit
   --provider <name>     anthropic | openai | ollama | openai-compatible
   --model <name>        Model identifier
   --base-url <url>      For ollama, vLLM, OpenRouter, LM Studio
@@ -30,6 +32,7 @@ ${c.b('INIT OPTIONS')}
 
 ${c.b('EXAMPLES')}
   npx jr-architect init
+  npx jr-architect init --from https://github.com/VivanRajath/gitagent-default
   npx jr-architect init --provider ollama --model qwen2.5-coder:14b \\
       --base-url http://localhost:11434/v1
   jr-architect personas add reviewer

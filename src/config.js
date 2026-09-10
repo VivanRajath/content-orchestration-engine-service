@@ -40,6 +40,57 @@ export function patchSection(text, section, key, value) {
 }
 
 /**
+ * Replace a top-level block sequence (`agents:` and its `- ` items).
+ *
+ * patchSection cannot do this: it replaces one scalar inside a mapping, and
+ * the item count here changes with the pack. Same line-based approach and the
+ * same reason — the block ends at the next line in column 0, not at a blank.
+ */
+export function patchSequence(text, key, items) {
+  const lines = text.split('\n');
+  const head = lines.findIndex((l) => l.startsWith(`${key}:`));
+  if (head === -1) throw new Error(`Key "${key}:" not found in agent.yaml`);
+
+  let end = head + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (line.trim() === '' || /^[ \t]/.test(line) || line.trimStart().startsWith('#')) { end++; continue; }
+    break;
+  }
+  // Trailing blank lines belong to the gap before the next section, not to
+  // this block — leaving them in collapses the spacing a little more on every
+  // rewrite until the file is one dense wall.
+  while (end > head + 1 && lines[end - 1].trim() === '') end--;
+
+  const body = items.map((i) => `  - ${i}`);
+  return [...lines.slice(0, head), `${key}:`, ...body, ...lines.slice(end)].join('\n');
+}
+
+/**
+ * Add or replace a whole top-level section, preserving the rest of the file.
+ *
+ * `source:` does not exist in the shipped agent.yaml — it only appears once a
+ * pack has been installed — so this both creates and updates. Rewriting the
+ * file through a YAML serializer instead would drop every comment in it, and
+ * the comments in that manifest are half its documentation.
+ */
+export function upsertSection(text, key, body) {
+  const block = `${key}:\n${body.split('\n').map((l) => (l ? `  ${l}` : l)).join('\n')}`;
+  const lines = text.split('\n');
+  const head = lines.findIndex((l) => l.startsWith(`${key}:`));
+
+  if (head === -1) {
+    const sep = text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
+    return `${text}${sep}${block}\n`;
+  }
+
+  let end = head + 1;
+  while (end < lines.length && (lines[end].trim() === '' || /^[ \t]/.test(lines[end]))) end++;
+  while (end > head + 1 && lines[end - 1].trim() === '') end--;
+  return [...lines.slice(0, head), ...block.split('\n'), ...lines.slice(end)].join('\n');
+}
+
+/**
  * Read agent.yaml.
  *
  * This was a set of section-scoped regexes reading five flat scalars. The run
