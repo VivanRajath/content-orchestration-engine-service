@@ -12,23 +12,30 @@ feature, and arg parsing is hand-rolled in `bin/jr-architect.js` on purpose.
 bin/jr-architect.js     entry, arg parsing, command dispatch
 src/init.js             scaffold .gitagent/, patch agent.yaml, guard .gitignore
 src/config.js           read/write manifest; readManifest() is the shared reader
+src/pack.js             fetch / validate / install an agent pack from a git repo
+src/pull.js             update an installed pack, merging against .pack.lock
 src/personas.js         list / add / remove tiers, --from <git-url> pull
+src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
+src/classify.js         one model call -> {tier, confidence, reason}
+src/provider.js         anthropic + openai wire formats, key redaction
+src/yaml.js             strict YAML subset parser (zero-dep)
 src/doctor.js           model capability probe (structured output + tool calling)
 src/paths.js            repoRoot() walks up to .git; TEMPLATES resolution
 src/util.js             color + log helpers
-templates/              everything copied into the user's .gitagent/
+templates/              bundled default pack, copied into the user's .gitagent/
+test/                   node --test, no runner
 ```
 
 ## Status
 
-Working and manually tested: `init`, `config`, `config set`, `personas list|add|remove`,
-`doctor`, help, and the error paths (existing dir, unknown provider).
+Working, tested: `init` (bundled and `--from <git-url>`), `pull`, `config`,
+`config set`, `personas list|add|remove`, `doctor`, the guardrail engine, the
+tier classifier, and the error paths. `node --test`, 180 tests, no runner.
 
-Not built yet: the execution loop. Nothing reads `.gitagent/` and actually runs the
-agent. That is the next piece — classify task, select tier, call model, apply diff
-with hooks enforced, escalate per `DUTIES.md`.
-
-No test suite yet. Worth adding around `init` and the manifest patcher first.
+Not built yet: **the execution loop**. Nothing reads `.gitagent/` and actually
+runs the agent. Everything it needs now exists — `classify.js` picks the tier,
+`hooks.js` gates edits and commands, `provider.js` talks to the model — and
+`src/run.js` is the piece that drives them.
 
 ## Decisions already made — do not relitigate without reason
 
@@ -59,6 +66,24 @@ Two failed attempts, then stop and report.
 **`ui-editor` is a peer of `junior-dev`, not below it.** Split by domain, not
 seniority — it hands sideways.
 
+**A pack ships identity and guardrails, never a model.** `readPack()` refuses a
+`gitagent.yaml` declaring `model.provider` / `api_key_env` / `base_url` outright
+rather than ignoring it. A pack choosing where someone else's source code gets
+sent is the whole privacy claim inverted, and silently dropping the block leaves
+the user believing it configured something.
+
+**A pulled pack can tighten guardrails, never loosen them.** Enforced by the
+sealing in `hooks.js` at load time, so it holds at runtime regardless. What
+`init --from` adds is *visibility*: the install report shows every attempt to
+unseal a hook before the files land.
+
+**`pull` is a merge, not a re-install.** `.gitagent/` is meant to be edited —
+that is the pitch — so a persona you tuned is never overwritten without
+`--force`. `.pack.lock` is the third point that makes this decidable: comparing
+the working file against the *previously installed* hash is what separates "you
+changed it" from "the pack changed it". Without a lock, every difference is
+treated as yours.
+
 **`doctor` fails at setup, not mid-task.** The tier ladder needs strict JSON and
 tool calling. Small local models often give neither and the ladder degrades into
 retry thrash that reads as a bug in this tool. Probe, then tell the user to drop
@@ -70,17 +95,29 @@ to single-tier if it won't hold.
 regex replace clobbers the wrong one — this bug already happened once. `init.js`
 scopes the patch to the `model:` block. Any new manifest edit must do the same.
 
-`readManifest()` in `config.js` is a deliberately minimal section-scoped reader,
-not a YAML parser. If manifest handling gets more complex, add a real parser
-rather than extending the regexes — but that costs the zero-dep property, so
-weigh it.
+`readManifest()` in `config.js` now parses through `src/yaml.js` rather than the
+old section-scoped regexes — that was the documented escape hatch and it has
+been taken. `yaml.js` is a strict subset: it throws on anchors, aliases, merge
+keys, flow collections, and tab indentation rather than guessing. Keep it that
+way; a parser that guesses on a guardrail file is worse than one that refuses.
+
+Writes to `agent.yaml` still go through the line-based patchers, not the parser:
+`patchSection` for a scalar, `patchSequence` for the `agents:` list,
+`upsertSection` for whole blocks like `source:`. Round-tripping through the
+parser would serialize away every comment, and the comments in that manifest are
+half its documentation.
 
 `repoRoot()` falls back to `cwd` when there is no `.git`. Intentional: the tool
 should work in a not-yet-initialized directory.
 
 Templates are copied wholesale by `cpSync(TEMPLATES, dir, {recursive:true})`
-except under `--minimal`. Adding a template file automatically ships it; the
-`MINIMAL` array in `init.js` is the only place needing a manual update.
+except under `--minimal` and `--from`. Adding a template file automatically
+ships it; the `MINIMAL` array in `init.js` is the only place needing a manual
+update.
+
+`installPack()` and `packFiles()` share one SKIP/`.git` filter on purpose. If
+they diverge, `.pack.lock` describes a set of files different from the one that
+actually landed, and every later `pull` misreads the difference as a local edit.
 
 ## Related
 
@@ -91,11 +128,17 @@ affiliated with the OpenGAP maintainers.
 Sibling product: Jr Architect, the hosted browser IDE. This CLI is the local
 terminal version — same personas, no sandbox infrastructure.
 
+Two repos:
+- CLI — `github.com/VivanRajath/content-orchestration-engine-service` (npm name
+  is `jr-architect`; the repo name does not affect `npx`)
+- Default pack — `github.com/VivanRajath/gitagent-default`, the four tiers as a
+  standalone pack repo, installed with `init --from`
+
 ## Next
 
-1. Execution loop (`src/run.js`) — the missing half.
-2. Hook enforcement engine — parse `hooks.yaml`, apply pre-edit/pre-commit gates.
-3. Tier classifier — one cheap model call returning `{tier, confidence, reason}`;
-   below `classifier_confidence_floor`, route one tier up.
-4. Tests around `init` and the manifest patcher.
-5. Stack detection, ported from `sandbox-engine-cli`, as `jr-architect detect`.
+1. Execution loop (`src/run.js`) — the missing half. Classify, select tier, call
+   model, apply diff with hooks enforced, escalate per `DUTIES.md`.
+2. Session branch + transcript under `.gitagent/.session/` (already gitignored).
+3. Stack detection, ported from `sandbox-engine-cli`, as `jr-architect detect`.
+4. `personas add` should offer to patch `agent.yaml` and `DUTIES.md` rather than
+   printing a reminder to do it by hand.

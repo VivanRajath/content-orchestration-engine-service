@@ -2,7 +2,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync, appendFileS
 import { join, sep } from 'node:path';
 import { TEMPLATES, agentDir, repoRoot } from './paths.js';
 import { patchSection, patchSequence, upsertSection } from './config.js';
-import { fetchPack, readPack, inspectHooks, installPack } from './pack.js';
+import { fetchPack, readPack, inspectHooks, installPack, writeLock } from './pack.js';
 import { c, ok, info, warn } from './util.js';
 
 const PROVIDERS = {
@@ -49,6 +49,9 @@ export async function init(flags) {
   try {
     if (pack) {
       installPack(pack, dir);
+      // Record what landed and at which commit. `pull` diffs against this to
+      // tell a persona you edited from one the pack changed.
+      writeLock(dir, pack);
       cpSync(join(TEMPLATES, 'agent.yaml'), join(dir, 'agent.yaml'));
       for (const sub of ['config', 'memory']) {
         const src = join(TEMPLATES, sub);
