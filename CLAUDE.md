@@ -14,6 +14,10 @@ src/init.js             scaffold .gitagent/, patch agent.yaml, guard .gitignore
 src/config.js           read/write manifest; readManifest() is the shared reader
 src/pack.js             fetch / validate / install an agent pack from a git repo
 src/pull.js             update an installed pack, merging against .pack.lock
+src/run.js              the execution loop: classify -> attempt -> escalate
+src/tools.js            the model's tool surface; every call passes a hook
+src/session.js          session branch, transcript, attempt frames, handoff payload
+src/verify.js           detect and run the project's own build/test command
 src/personas.js         list / add / remove tiers, --from <git-url> pull
 src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
 src/classify.js         one model call -> {tier, confidence, reason}
@@ -32,10 +36,12 @@ Working, tested: `init` (bundled and `--from <git-url>`), `pull`, `config`,
 `config set`, `personas list|add|remove`, `doctor`, the guardrail engine, the
 tier classifier, and the error paths. `node --test`, 180 tests, no runner.
 
-Not built yet: **the execution loop**. Nothing reads `.gitagent/` and actually
-runs the agent. Everything it needs now exists — `classify.js` picks the tier,
-`hooks.js` gates edits and commands, `provider.js` talks to the model — and
-`src/run.js` is the piece that drives them.
+`run` drives the full ladder: classify, attempt, block, hand off, nest
+build-doctor, verify, commit to a session branch. 247 tests, `node --test`.
+
+Not yet exercised against a live model — the ladder is tested with an injected
+scripted model, not a real one. Whoever has a key first should run it on a
+throwaway repo before trusting it on anything else.
 
 ## Decisions already made — do not relitigate without reason
 
@@ -84,6 +90,26 @@ the working file against the *previously installed* hash is what separates "you
 changed it" from "the pack changed it". Without a lock, every difference is
 treated as yours.
 
+**A blocked hook is a tool error, never an exception.** The block reasons in
+`hooks.js` are written as instructions to the agent — "Hand off rather than
+crossing the boundary", "Remove it or read the value from an environment
+variable". The model gets them and corrects. Throwing would end the run and
+waste every one of them.
+
+**`run` refuses to start on a dirty working tree.** Failed attempts are rolled
+back with `git reset --hard`, so this guard is the precondition that makes the
+revert safe: the only work it can destroy is the agent's own. `--allow-dirty`
+exists, but weakening the default means rewriting `revertAttempt`.
+
+**The harness's own git does not go through `checkCommand`.** That gate stops
+the MODEL shelling around the write hooks. Routing our own branch and commit
+calls through it would deadlock the loop against `no-force-push` on its first
+commit. The model only ever reaches `tools.js`.
+
+**A human checkpoint declines when non-interactive.** `--yes` has to be typed by
+a person. A dependency change waved through because the run happened to be in CI
+is precisely what the DUTIES.md checkpoint list exists to prevent.
+
 **`doctor` fails at setup, not mid-task.** The tier ladder needs strict JSON and
 tool calling. Small local models often give neither and the ladder degrades into
 retry thrash that reads as a bug in this tool. Probe, then tell the user to drop
@@ -115,6 +141,15 @@ except under `--minimal` and `--from`. Adding a template file automatically
 ships it; the `MINIMAL` array in `init.js` is the only place needing a manual
 update.
 
+`revertAttempt` runs `git clean -fd -e .gitagent/.session`. Without the
+exclusion it deletes the run's own transcript in any repo whose `.gitignore`
+does not yet mention the session directory.
+
+Windows cannot spawn a `.cmd` shim without a shell (CVE-2024-27980), and
+`shell: true` concatenates argv — the exact metacharacter surface `shell:false`
+exists to remove. `resolveBin()` runs the shim through `cmd.exe` with an argv we
+build, and refuses any token containing a character cmd would interpret.
+
 `installPack()` and `packFiles()` share one SKIP/`.git` filter on purpose. If
 they diverge, `.pack.lock` describes a set of files different from the one that
 actually landed, and every later `pull` misreads the difference as a local edit.
@@ -136,9 +171,11 @@ Two repos:
 
 ## Next
 
-1. Execution loop (`src/run.js`) — the missing half. Classify, select tier, call
-   model, apply diff with hooks enforced, escalate per `DUTIES.md`.
-2. Session branch + transcript under `.gitagent/.session/` (already gitignored).
-3. Stack detection, ported from `sandbox-engine-cli`, as `jr-architect detect`.
-4. `personas add` should offer to patch `agent.yaml` and `DUTIES.md` rather than
+1. A live-model run on a throwaway repo. Everything below is speculation until
+   that happens.
+2. Streaming output — a long attempt currently prints nothing until the model
+   replies, which reads as a hang.
+3. `run --resume <session-id>`, using the transcript already being written.
+4. Stack detection, ported from `sandbox-engine-cli`, as `jr-architect detect`.
+5. `personas add` should offer to patch `agent.yaml` and `DUTIES.md` rather than
    printing a reminder to do it by hand.

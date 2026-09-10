@@ -4,6 +4,7 @@ import { config } from '../src/config.js';
 import { personas } from '../src/personas.js';
 import { doctor } from '../src/doctor.js';
 import { pull } from '../src/pull.js';
+import { run } from '../src/run.js';
 import { c } from '../src/util.js';
 
 const HELP = `
@@ -18,6 +19,7 @@ ${c.b('USAGE')}
 
 ${c.b('COMMANDS')}
   init                  Scaffold .gitagent/ into the current repo
+  run "<task>"          Run the agent on a task
   config                Show or set model / provider / key env var
   personas              List, add, or remove persona tiers
   pull                  Update the installed pack, keeping your edits
@@ -32,12 +34,20 @@ ${c.b('INIT OPTIONS')}
   --minimal             Only agent.yaml, SOUL.md, RULES.md
   --force               Overwrite an existing .gitagent/
 
+${c.b('RUN OPTIONS')}
+  --dry-run             Classify and report the tier, change nothing
+  --allow-dirty         Run with uncommitted changes (they can be lost)
+  --skip-verify         Do not run the build/test command first
+  --yes                 Approve human checkpoints without asking
+
 ${c.b('PULL OPTIONS')}
   --ref <branch|sha>    Update to a specific branch, tag, or commit
   --dry-run             Show what would change, write nothing
   --force               Overwrite locally-edited files too
 
 ${c.b('EXAMPLES')}
+  npx jr-architect run "add a --json flag to the status command"
+  npx jr-architect run "make the header sticky" --dry-run
   npx jr-architect init
   npx jr-architect init --from https://github.com/VivanRajath/gitagent-default
   npx jr-architect init --provider ollama --model qwen2.5-coder:14b \\
@@ -68,6 +78,7 @@ try {
     case 'init':     await init(flags); break;
     case 'config':   await config(positional, flags); break;
     case 'personas': await personas(positional, flags); break;
+    case 'run':      await run(positional, flags); break;
     case 'pull':     await pull(positional, flags); break;
     case 'doctor':   await doctor(flags); break;
     case '-v':
