@@ -39,6 +39,7 @@ ${c.b('RUN OPTIONS')}
   --allow-dirty         Run with uncommitted changes (they can be lost)
   --skip-verify         Do not run the build/test command first
   --yes                 Approve human checkpoints without asking
+  --no-stream           Do not stream model output as it arrives
 
 ${c.b('PULL OPTIONS')}
   --ref <branch|sha>    Update to a specific branch, tag, or commit
@@ -61,6 +62,17 @@ ${c.b('EXAMPLES')}
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 
+/**
+ * Flags that never take a value. Without this list `run --dry-run "add a
+ * thing"` reads the task as the flag's argument and the task is silently lost.
+ * Hand-rolled parsing is deliberate here — the zero-dep property is the point —
+ * but "does this flag take a value" is not something a parser can infer.
+ */
+const BOOLEAN = new Set([
+  'dry-run', 'force', 'minimal', 'yes', 'no-stream',
+  'allow-dirty', 'skip-verify', 'help', 'version',
+]);
+
 const flags = {};
 const positional = [];
 for (let i = 1; i < argv.length; i++) {
@@ -68,7 +80,7 @@ for (let i = 1; i < argv.length; i++) {
   if (a.startsWith('--')) {
     const key = a.slice(2);
     const next = argv[i + 1];
-    if (next && !next.startsWith('--')) { flags[key] = next; i++; }
+    if (!BOOLEAN.has(key) && next && !next.startsWith('--')) { flags[key] = next; i++; }
     else flags[key] = true;
   } else positional.push(a);
 }

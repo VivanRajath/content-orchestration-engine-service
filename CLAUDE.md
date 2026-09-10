@@ -21,7 +21,7 @@ src/verify.js           detect and run the project's own build/test command
 src/personas.js         list / add / remove tiers, --from <git-url> pull
 src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
 src/classify.js         one model call -> {tier, confidence, reason}
-src/provider.js         anthropic + openai wire formats, key redaction
+src/provider.js         anthropic + openai wire formats, streaming, key redaction
 src/yaml.js             strict YAML subset parser (zero-dep)
 src/doctor.js           model capability probe (structured output + tool calling)
 src/paths.js            repoRoot() walks up to .git; TEMPLATES resolution
@@ -37,7 +37,8 @@ Working, tested: `init` (bundled and `--from <git-url>`), `pull`, `config`,
 tier classifier, and the error paths. `node --test`, 180 tests, no runner.
 
 `run` drives the full ladder: classify, attempt, block, hand off, nest
-build-doctor, verify, commit to a session branch. 247 tests, `node --test`.
+build-doctor, verify, commit to a session branch, streaming its output.
+265 tests, `node --test`.
 
 Not yet exercised against a live model — the ladder is tested with an injected
 scripted model, not a real one. Whoever has a key first should run it on a
@@ -110,6 +111,11 @@ commit. The model only ever reaches `tools.js`.
 a person. A dependency change waved through because the run happened to be in CI
 is precisely what the DUTIES.md checkpoint list exists to prevent.
 
+**Streaming stops retrying at the first byte.** `post` can safely replay a
+request that never produced a response; `postStream` cannot, because tokens
+already handed to the caller are already on the user's screen. A mid-stream
+failure is an error, not a retry.
+
 **`doctor` fails at setup, not mid-task.** The tier ladder needs strict JSON and
 tool calling. Small local models often give neither and the ladder degrades into
 retry thrash that reads as a bug in this tool. Probe, then tell the user to drop
@@ -140,6 +146,11 @@ Templates are copied wholesale by `cpSync(TEMPLATES, dir, {recursive:true})`
 except under `--minimal` and `--from`. Adding a template file automatically
 ships it; the `MINIMAL` array in `init.js` is the only place needing a manual
 update.
+
+Boolean flags live in a `BOOLEAN` set in `bin/jr-architect.js`. Without it the
+parser reads the next token as the flag's value, so `run --dry-run "add a
+thing"` silently loses the task. A hand-rolled parser cannot infer arity — new
+valueless flags must be added to that set.
 
 `revertAttempt` runs `git clean -fd -e .gitagent/.session`. Without the
 exclusion it deletes the run's own transcript in any repo whose `.gitignore`
@@ -173,9 +184,7 @@ Two repos:
 
 1. A live-model run on a throwaway repo. Everything below is speculation until
    that happens.
-2. Streaming output — a long attempt currently prints nothing until the model
-   replies, which reads as a hang.
-3. `run --resume <session-id>`, using the transcript already being written.
+2. `run --resume <session-id>`, using the transcript already being written.
 4. Stack detection, ported from `sandbox-engine-cli`, as `jr-architect detect`.
 5. `personas add` should offer to patch `agent.yaml` and `DUTIES.md` rather than
    printing a reminder to do it by hand.
