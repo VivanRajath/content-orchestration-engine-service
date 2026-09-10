@@ -91,6 +91,9 @@ export async function run(positional, flags, { call = callModel } = {}) {
   const ctx = {
     root, dir, session, hooks, manifest, tiers, maxSteps, call,
     interactive: process.stdin.isTTY && process.stdout.isTTY,
+    // Streaming is a terminal affordance. Piped output has nobody watching it
+    // arrive, and --no-stream exists for a run whose log is being captured.
+    stream: Boolean(process.stdout.isTTY) && !flags['no-stream'],
     autoApprove: Boolean(flags.yes),
     identity: readIdentity(dir),
   };
@@ -223,13 +226,20 @@ async function attempt(ctx, frame, brief) {
     frame.steps++;
 
     let reply;
+    const stream = ctx.stream ? streamWriter() : null;
     try {
-      reply = await ctx.call(ctx.manifest, { system, messages, tools: TOOLS });
+      reply = await ctx.call(ctx.manifest, {
+        system, messages, tools: TOOLS,
+        ...(stream ? { onDelta: stream.write } : {}),
+      });
     } catch (e) {
+      stream?.end();
       return { kind: 'failed', reason: `model call failed: ${e.message}` };
     }
+    stream?.end();
 
-    if (reply.text?.trim()) info(c.d(`  ${truncate(reply.text.trim(), 300)}`));
+    // Already shown live when streaming; printing it again would double it.
+    if (!stream && reply.text?.trim()) info(c.d(`  ${truncate(reply.text.trim(), 300)}`));
 
     if (!reply.toolCalls.length) {
       // No tool call and no done(). A capable model ends with done; one that
@@ -439,6 +449,41 @@ function finish(ctx, outcome) {
   }
   closeSession(ctx.session, { status: outcome.status, summary: outcome.summary ?? outcome.reason ?? '' });
   console.log();
+}
+
+/**
+ * Write streamed tokens into the indented tool log without breaking it.
+ *
+ * The model's prose is dimmed and indented to match the tool lines around it,
+ * so a long attempt reads as one column rather than as output fighting the
+ * layout. Indentation is applied per newline as tokens arrive, because a delta
+ * can end mid-line and the next one continues it.
+ */
+const NEWLINE = String.fromCharCode(10);
+
+function streamWriter(indent = '    ') {
+  let started = false;
+  let atLineStart = true;
+
+  // Colour per delta, not per character. Wrapping every letter in its own
+  // escape pair costs about nine bytes a character and makes the raw stream
+  // unreadable in a captured log for no visible gain.
+  const write = (text) => {
+    if (!text) return;
+    started = true;
+    const segments = String(text).split(NEWLINE);
+    segments.forEach((segment, i) => {
+      if (i > 0) { process.stdout.write(NEWLINE); atLineStart = true; }
+      if (!segment) return;
+      if (atLineStart) { process.stdout.write(indent); atLineStart = false; }
+      process.stdout.write(c.d(segment));
+    });
+  };
+
+  return {
+    write,
+    end() { if (started && !atLineStart) process.stdout.write(NEWLINE); },
+  };
 }
 
 const truncate = (s, n) => {

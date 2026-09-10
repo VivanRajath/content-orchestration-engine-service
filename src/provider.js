@@ -131,11 +131,168 @@ async function post(url, headers, body, key, { retries = 2 } = {}) {
 const backoff = (attempt) => Math.min(1000 * 2 ** attempt, 8000);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+/**
+ * Streaming exists for one reason: without it a long attempt prints nothing
+ * until the model finishes, which reads as a hang rather than as work.
+ *
+ * Retries stop at the first byte. `post` can safely replay a request that
+ * never produced a response, but once tokens have been handed to the caller
+ * and printed to a terminal, replaying would duplicate them — so a mid-stream
+ * failure is an error, not a retry.
+ */
+async function postStream(url, headers, body, key, { retries = 2 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { ...headers, accept: 'text/event-stream' },
+        body: JSON.stringify({ ...body, stream: true }),
+      });
+    } catch (err) {
+      lastError = new Error(redact(err.message, key));
+      if (attempt === retries) throw lastError;
+      await sleep(backoff(attempt));
+      continue;
+    }
+    if (res.ok) {
+      if (!res.body) throw new Error('the provider returned no response body to stream');
+      return res.body;
+    }
+
+    const text = redact((await res.text()).slice(0, 400), key);
+    lastError = new Error(`${res.status} ${text}`);
+    if (!RETRY_STATUS.has(res.status) || attempt === retries) throw lastError;
+    const after = Number(res.headers.get('retry-after'));
+    await sleep(Number.isFinite(after) && after > 0 ? Math.min(after * 1000, 15000) : backoff(attempt));
+  }
+  throw lastError;
+}
+
+/**
+ * Server-sent events out of a byte stream.
+ *
+ * Buffers across chunk boundaries: a network chunk splits wherever TCP decided
+ * to, routinely mid-JSON and mid-line, and parsing each chunk on its own drops
+ * exactly the events that happen to straddle one.
+ */
+export async function* parseSSE(source) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  for await (const chunk of source) {
+    buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+
+    let nl;
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).replace(/\r$/, '');
+      buffer = buffer.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;      // event:, id:, comments, blanks
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') continue;     // OpenAI's terminator is not JSON
+      try {
+        yield JSON.parse(data);
+      } catch {
+        // A malformed frame is one lost token, not a lost run.
+      }
+    }
+  }
+}
+
+/**
+ * Anthropic's streaming shape. Content arrives as indexed blocks: text blocks
+ * deliver text_delta, tool_use blocks deliver their arguments as a JSON string
+ * split across input_json_delta frames, which has to be accumulated and parsed
+ * once the block closes rather than per frame.
+ */
+export async function readAnthropicStream(events, onDelta) {
+  const blocks = [];
+  let stopReason = null;
+
+  for await (const e of events) {
+    if (e.type === 'content_block_start') {
+      blocks[e.index] = { ...e.content_block, text: '', json: '' };
+    } else if (e.type === 'content_block_delta') {
+      const b = blocks[e.index] ?? (blocks[e.index] = { type: 'text', text: '', json: '' });
+      if (e.delta?.type === 'text_delta') {
+        b.text += e.delta.text ?? '';
+        onDelta?.(e.delta.text ?? '');
+      } else if (e.delta?.type === 'input_json_delta') {
+        b.json += e.delta.partial_json ?? '';
+      }
+    } else if (e.type === 'message_delta') {
+      stopReason = e.delta?.stop_reason ?? stopReason;
+    } else if (e.type === 'error') {
+      throw new Error(e.error?.message ?? 'the provider reported a stream error');
+    }
+  }
+
+  return {
+    text: blocks.filter((b) => b?.type === 'text').map((b) => b.text).join(''),
+    toolCalls: blocks
+      .filter((b) => b?.type === 'tool_use')
+      .map((b) => ({ id: b.id, name: b.name, input: b.json ? safeParse(b.json) : b.input ?? {} })),
+    stopReason,
+    raw: null,
+  };
+}
+
+/**
+ * OpenAI's streaming shape. Tool calls arrive as deltas keyed by index, with
+ * the id and name usually only on the first frame and `arguments` accumulating
+ * as a string across the rest.
+ */
+export async function readOpenAIStream(events, onDelta) {
+  let text = '';
+  let stopReason = null;
+  const calls = [];
+
+  for await (const e of events) {
+    const choice = e.choices?.[0];
+    if (!choice) continue;
+    const delta = choice.delta ?? {};
+
+    if (delta.content) {
+      text += delta.content;
+      onDelta?.(delta.content);
+    }
+    for (const tc of delta.tool_calls ?? []) {
+      const i = tc.index ?? 0;
+      const slot = calls[i] ?? (calls[i] = { id: null, name: '', args: '' });
+      if (tc.id) slot.id = tc.id;
+      if (tc.function?.name) slot.name += tc.function.name;
+      if (tc.function?.arguments) slot.args += tc.function.arguments;
+    }
+    if (choice.finish_reason) stopReason = choice.finish_reason;
+  }
+
+  return {
+    text,
+    toolCalls: calls.filter(Boolean).map((c, i) => ({
+      id: c.id ?? `call_${i}`,
+      name: c.name,
+      input: safeParse(c.args || '{}'),
+    })),
+    stopReason,
+    raw: null,
+  };
+}
+
 /**
  * One model call. Returns {text, toolCalls, stopReason, raw} whichever
  * provider answered.
+ *
+ * Passing `onDelta` streams: the same result comes back at the end, but text
+ * arrives at the callback as it is generated. Callers that do not care about
+ * progress pass nothing and get the buffered path, which is one request and
+ * one JSON parse rather than a stream to drain.
  */
-export async function callModel(manifest, { system, messages = [], tools, maxTokens, temperature } = {}) {
+export async function callModel(manifest, { system, messages = [], tools, maxTokens, temperature, onDelta } = {}) {
   const key = apiKey(manifest);
   if (!key && requiresKey(manifest)) {
     throw new Error(`$${manifest.keyEnv} is not set.`);
@@ -144,19 +301,23 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
   const temp = temperature ?? manifest.temperature ?? 0.2;
 
   if (isAnthropic(manifest)) {
-    const data = await post(
-      `${(manifest.baseUrl || DEFAULT_ANTHROPIC).replace(/\/$/, '')}/v1/messages`,
-      { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      {
-        model: manifest.model,
-        max_tokens: limit,
-        temperature: temp,
-        ...(system ? { system } : {}),
-        ...(tools?.length ? { tools } : {}),
-        messages: toAnthropicMessages(messages),
-      },
-      key,
-    );
+    const url = `${(manifest.baseUrl || DEFAULT_ANTHROPIC).replace(/\/$/, '')}/v1/messages`;
+    const headers = { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' };
+    const payload = {
+      model: manifest.model,
+      max_tokens: limit,
+      temperature: temp,
+      ...(system ? { system } : {}),
+      ...(tools?.length ? { tools } : {}),
+      messages: toAnthropicMessages(messages),
+    };
+
+    if (onDelta) {
+      const body = await postStream(url, headers, payload, key);
+      return readAnthropicStream(parseSSE(body), (t) => onDelta(redact(t, key)));
+    }
+
+    const data = await post(url, headers, payload, key);
     const blocks = data.content ?? [];
     return {
       text: blocks.filter((b) => b.type === 'text').map((b) => b.text).join(''),
@@ -166,18 +327,22 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
     };
   }
 
-  const data = await post(
-    `${(manifest.baseUrl || DEFAULT_OPENAI).replace(/\/$/, '')}/chat/completions`,
-    { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-    {
-      model: manifest.model,
-      max_tokens: limit,
-      temperature: temp,
-      ...(tools?.length ? { tools: toOpenAITools(tools) } : {}),
-      messages: toOpenAIMessages(messages, system),
-    },
-    key,
-  );
+  const url = `${(manifest.baseUrl || DEFAULT_OPENAI).replace(/\/$/, '')}/chat/completions`;
+  const headers = { 'content-type': 'application/json', authorization: `Bearer ${key}` };
+  const payload = {
+    model: manifest.model,
+    max_tokens: limit,
+    temperature: temp,
+    ...(tools?.length ? { tools: toOpenAITools(tools) } : {}),
+    messages: toOpenAIMessages(messages, system),
+  };
+
+  if (onDelta) {
+    const body = await postStream(url, headers, payload, key);
+    return readOpenAIStream(parseSSE(body), (t) => onDelta(redact(t, key)));
+  }
+
+  const data = await post(url, headers, payload, key);
   const message = data.choices?.[0]?.message ?? {};
   return {
     text: message.content ?? '',
