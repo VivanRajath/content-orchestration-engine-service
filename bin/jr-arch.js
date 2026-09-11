@@ -36,6 +36,7 @@ ${c.b('COMMANDS')}
 
 ${c.b('OPTIONS')}
   --agent <name>        Send the task to one named agent
+  --swarm               Fan out to every agent whose scope the task touches
   --dry-run             Say what would happen, change nothing
   --resume [<id>]       Continue a stopped session
   --from <git-url>      Source for init / add-agent / add-guard
@@ -71,7 +72,7 @@ const cmd = argv[0];
  */
 const BOOLEAN = new Set([
   'dry-run', 'force', 'minimal', 'yes', 'no-stream',
-  'allow-dirty', 'skip-verify', 'help', 'version', 'json',
+  'allow-dirty', 'skip-verify', 'help', 'version', 'json', 'swarm',
 ]);
 
 const flags = {};
