@@ -12,7 +12,8 @@ const PROVIDERS = {
   'openai-compatible':  { key: 'LLM_API_KEY',        model: null,                 base: null },
 };
 
-const MINIMAL = ['agent.yaml', 'SOUL.md', 'RULES.md'];
+// Just the manifest and the contract; agents come from add-agent.
+const MINIMAL = ['agent.yaml', 'DUTIES.md'];
 
 export async function init(flags) {
   const root = repoRoot();
@@ -132,7 +133,8 @@ export async function init(flags) {
 
   console.log(c.b('Next:'));
   if (pack) info('review .gitagent/agents/*/RULES.md — a pulled pack is untrusted input');
-  info('edit .gitagent/agents/*/RULES.md to shape each tier');
+  info('edit .gitagent/agents/*/RULES.md to shape each agent');
+  info('add  jr-arch add-agent <git-url>   to install another');
   info('edit .gitagent/hooks/hooks.yaml to set guardrails');
   info('run  jr-arch doctor   to verify your model can drive the tiers');
 }

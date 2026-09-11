@@ -7,6 +7,8 @@ import { pull } from '../src/pull.js';
 import { run } from '../src/run.js';
 import { detect } from '../src/detect.js';
 import { loadEnv, key } from '../src/env.js';
+import { addAgent, addGuard } from '../src/add.js';
+import { chat } from '../src/chat.js';
 import { c } from '../src/util.js';
 
 const HELP = `
@@ -20,59 +22,42 @@ ${c.b('USAGE')}
   npx jr-arch <command> [options]
 
 ${c.b('COMMANDS')}
-  init                  Scaffold .gitagent/ into the current repo
-  run "<task>"          Run the agent on a task
-  config                Show or set model / provider / key env var
+  ${c.d('(no command)')}         Open the chat and start editing this repo
+  init                  Scaffold .gitagent/ into this repo
+  run "<task>"          Run one task without opening the chat
+  add-agent <git-url>   Install an agent
+  add-guard <git-url>   Install a guardrail file
+  agents                List installed agents
   key [<value>]         Store your API key, or show whether one is set
-  personas              List, add, or remove persona tiers
-  pull                  Update the installed pack, keeping your edits
+  config                Show or change model, provider, and routing
   detect                Report the stack, verify command, and lockfile state
-  doctor                Probe the configured model for required capabilities
+  pull                  Update an installed pack, keeping your edits
+  doctor                Check your model can drive the agents
 
-${c.b('INIT OPTIONS')}
-  --from <git-url>      Install an agent pack from a git repo
-  --ref <branch|sha>    Pin the pack to a branch, tag, or commit
+${c.b('OPTIONS')}
+  --agent <name>        Send the task to one named agent
+  --dry-run             Say what would happen, change nothing
+  --resume [<id>]       Continue a stopped session
+  --from <git-url>      Source for init / add-agent / add-guard
+  --as <name>           Install under a different name
+  --ref <branch|sha>    Pin to a branch, tag, or commit
+  --model <name>        Model for init
   --provider <name>     anthropic | openai | ollama | openai-compatible
-  --model <name>        Model identifier
   --base-url <url>      For ollama, vLLM, OpenRouter, LM Studio
-  --minimal             Only agent.yaml, SOUL.md, RULES.md
-  --force               Overwrite an existing .gitagent/
-
-${c.b('RUN OPTIONS')}
-  --dry-run             Classify and report the tier, change nothing
-  --allow-dirty         Run with uncommitted changes (they can be lost)
-  --skip-verify         Do not run the build/test command first
+  --env <NAME>          Which variable the key command writes
   --yes                 Approve human checkpoints without asking
-  --no-stream           Do not stream model output as it arrives
-  --resume [<id>]       Continue a stopped session, carrying its failed diffs
-
-${c.b('KEY OPTIONS')}
-  --env <NAME>          Use a different variable than the manifest names
-  key remove            Delete the stored key
-
-${c.b('DETECT OPTIONS')}
-  --json                Machine-readable output
-
-${c.b('PULL OPTIONS')}
-  --ref <branch|sha>    Update to a specific branch, tag, or commit
-  --dry-run             Show what would change, write nothing
-  --force               Overwrite locally-edited files too
+  --force               Overwrite what is already there
+  --json                Machine-readable output where it applies
 
 ${c.b('EXAMPLES')}
-  npx jr-arch run "add a --json flag to the status command"
-  npx jr-arch run "make the header sticky" --dry-run
-  npx jr-arch run --resume
-  npx jr-arch detect
   npx jr-arch init
-  npx jr-arch init --from https://github.com/VivanRajath/gitagent-default
   npx jr-arch key sk-ant-...
-  npx jr-arch config set model.name gpt-4o
-  npx jr-arch init --provider ollama --model qwen2.5-coder:14b \\
-      --base-url http://localhost:11434/v1
-  jr-arch pull --dry-run
-  jr-arch personas add reviewer
+  npx jr-arch                                 ${c.d('# opens the chat')}
+
+  jr-arch add-agent https://github.com/you/my-reviewer
+  jr-arch add-guard https://github.com/you/strict-guards
+  jr-arch run "add a --json flag" --agent senior-dev
   jr-arch config set model.name gpt-4o
-  jr-arch doctor
 `;
 
 const argv = process.argv.slice(2);
@@ -109,15 +94,19 @@ try {
   switch (cmd) {
     case 'init':     await init(flags); break;
     case 'config':   await config(positional, flags); break;
-    case 'personas': await personas(positional, flags); break;
-    case 'run':      await run(positional, flags); break;
+    case 'agents':     await personas(['list', ...positional], flags); break;
+    case 'personas':   await personas(positional, flags); break;
+    case 'run':        await run(positional, flags); break;
+    case 'add-agent':  await addAgent(positional, flags); break;
+    case 'add-guard':  await addGuard(positional, flags); break;
+    case 'chat':       await chat(positional, flags); break;
     case 'detect':   await detect(positional, flags); break;
     case 'key':      await key(positional, flags, { manifest: readManifest() }); break;
     case 'pull':     await pull(positional, flags); break;
     case 'doctor':   await doctor(flags); break;
     case '-v':
     case '--version': console.log('0.1.0'); break;
-    case undefined:
+    case undefined:  await chat(positional, flags); break;
     case '-h':
     case '--help':   console.log(HELP); break;
     default:

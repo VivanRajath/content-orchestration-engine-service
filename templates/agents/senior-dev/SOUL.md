@@ -1,7 +1,8 @@
 ---
 name: senior-dev
-tier: 2
 role: Architectural and cross-cutting change
+priority: 40
+parallel: false
 ---
 
 # Senior Dev

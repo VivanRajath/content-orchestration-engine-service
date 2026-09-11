@@ -21,6 +21,9 @@ src/verify.js           detect and run the project's own build/test command
 src/detect.js           stack / lockfile / verify-command report
 src/env.js              .gitagent/.env loading and the `key` command
 src/context.js          the ledger: claims -> records, and the handoff compiler
+src/agents.js           the installed agents, read from their own front matter
+src/add.js              add-agent / add-guard
+src/chat.js             the default command: a chat that edits the repo
 src/personas.js         list / add / remove tiers, --from <git-url> pull
 src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
 src/classify.js         one model call -> {tier, confidence, reason}
@@ -53,6 +56,40 @@ scripted model, not a real one. Whoever has a key first should run it on a
 throwaway repo before trusting it on anything else.
 
 ## Decisions already made — do not relitigate without reason
+
+**The four tiers are a DEFAULT PACK, not the product.** Users install whatever
+agents they want from wherever they want. Nothing may assume a fixed set, a
+fixed count, or a fixed ladder. `readAgents()` reads the directory; twelve
+agents is as valid as four, and zero is an error rather than a fallback to the
+defaults.
+
+**There is no global SOUL.md or RULES.md.** Identity the harness injects into
+every agent makes the harness the co-author of agents it did not write, and
+stops a pulled agent's own file from being the thing that defines it. Shared
+constraints live in `hooks/`, which is enforced rather than suggested. This was
+a deliberate removal, not an oversight — do not add a root identity file back.
+
+**An agent describes itself.** Priority, scope (`owns`), and appetite for
+parallelism are front matter in the agent's own SOUL.md, not harness config.
+The directory is what installs it: no registry entry, no manifest list to keep
+in sync, and deleting the folder uninstalls it.
+
+**Scope is what makes parallelism safe.** Agents write into one working tree,
+so two agents may run concurrently only when both opted in and their scopes are
+provably disjoint. `disjoint()` compares literal prefixes and treats anything
+it cannot prove as overlapping: being wrong that way costs time, the other way
+costs the user's files.
+
+**Guards are additive.** `loadHooks` reads every YAML file in `hooks/`, so
+`add-guard` extends the set rather than replacing it. hooks.yaml loads last so
+the repo's own file wins a conflict, and the sealed hooks still cannot be
+relaxed by any of them.
+
+**`jr-arch` with no arguments is the chat.** Chat is a front door onto `run`,
+never a second execution path — a second path is a second place for the hooks
+to be missing. It passes `--allow-dirty`, because across turns the tree holds
+the agent's own accepted work, and `--quiet`, because the standing facts are
+banner material once and noise every message after. It does NOT pass `--yes`.
 
 **Keys never land in `agent.yaml`.** The manifest stores an env var *name*
 (`api_key_env`), never a key. The value lives in the shell or in
@@ -250,7 +287,11 @@ Two repos:
 
 ## Next
 
-1. **A live-model run on a throwaway repo.** Nothing here has met a real model;
+1. **Swarm execution.** `agents.js` has the pieces — `partition()` splits paths
+   by scope and priority, `swarmable()` groups what can run concurrently — but
+   `ladder()` still runs one agent at a time. The shared ledger in context.js
+   is already the right substrate for the shared knowledge.
+2. **A live-model run on a throwaway repo.** Nothing here has met a real model;
    the ladder is exercised with an injected scripted one.
 2. `doctor` should probe every key in `keyEnvs(manifest)`, not only the default
    one — a per-tier key that is missing currently fails mid-run.

@@ -1,7 +1,8 @@
 ---
 name: build-doctor
-tier: 0
 role: Diagnose and repair broken builds
+priority: 0
+parallel: false
 ---
 
 # Build Doctor

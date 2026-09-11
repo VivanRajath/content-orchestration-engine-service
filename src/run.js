@@ -14,6 +14,7 @@ import {
   record as sessionRecord,
 } from './session.js';
 import { newLedger, reconcile, compile, REPORT_SYSTEM, reportPrompt } from './context.js';
+import { readAgents, findAgent, frontMatter } from './agents.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -51,7 +52,17 @@ export async function run(positional, flags, { call = callModel } = {}) {
   const hooks = loadHooks(dir, { reload: true });
   for (const note of hooks.notes) warn(note);
 
-  const tiers = manifest.agents.length ? manifest.agents : ['senior-dev'];
+  // Installed agents are whatever is in agents/, read from their own front
+  // matter. The manifest no longer decides which exist — a directory does.
+  const agents = readAgents(dir);
+  if (!agents.length) {
+    throw new Error([
+      'No agents installed.',
+      '  Add one:  jr-arch add-agent <git-url>',
+      '  Or scaffold the defaults:  jr-arch init --force',
+    ].join(NEWLINE));
+  }
+  const tiers = agents.map((a) => a.name);
   const maxSteps = manifest.raw?.routing?.max_steps ?? DEFAULT_MAX_STEPS;
 
   // Failed attempts are reverted with `git reset --hard`. Refusing to start on
@@ -69,13 +80,25 @@ export async function run(positional, flags, { call = callModel } = {}) {
   }
 
   const build = flags['skip-verify'] ? { green: null, output: '', label: null } : verify({ root });
-  banner(manifest, subject, build, tiers);
+  // Chat repeats this loop once per message, so the standing facts — model,
+  // agent list, build state — are banner material for a one-off `run` and
+  // noise in a conversation that already showed them at startup.
+  if (!flags.quiet) banner(manifest, subject, build, tiers);
   if (prior) {
     info(`resuming   ${c.c(prior.id)} ${c.d(`(${prior.attempts.length} prior attempt(s), ${prior.status})`)}`);
     console.log();
   }
 
-  const entry = await classify({
+  // An explicitly named agent skips classification entirely — no model call,
+  // and no chance of being routed somewhere the user did not ask for.
+  const named = typeof flags.agent === 'string' ? findAgent(flags.agent, agents) : null;
+  if (typeof flags.agent === 'string' && !named) {
+    throw new Error(`No agent "${flags.agent}". Installed: ${tiers.join(', ')}`);
+  }
+
+  const entry = named
+    ? { tier: named.name, confidence: 1, reason: 'you named this agent', source: 'explicit' }
+    : await classify({
     task: subject,
     buildGreen: build.green,
     files: repoFiles(root),
@@ -83,9 +106,13 @@ export async function run(positional, flags, { call = callModel } = {}) {
     dir,
     call,
   });
-  info(`tier       ${c.c(entry.tier)}  ${c.d(`(${entry.source}, confidence ${entry.confidence})`)}`);
-  info(`why        ${entry.reason}`);
-  console.log();
+  if (flags.quiet) {
+    info(`${c.c(entry.tier)} ${c.d(entry.source === 'explicit' ? '' : `· ${entry.reason}`)}`);
+  } else {
+    info(`agent      ${c.c(entry.tier)}  ${c.d(`(${entry.source}, confidence ${entry.confidence})`)}`);
+    info(`why        ${entry.reason}`);
+    console.log();
+  }
 
   if (flags['dry-run']) {
     info('Dry run — no session opened, nothing written.');
@@ -102,19 +129,20 @@ export async function run(positional, flags, { call = callModel } = {}) {
     prefix: manifest.raw?.git?.branch_prefix ?? 'jr-arch',
   });
   session.keyEnv = manifest.keyEnv;
-  if (session.branched) info(`branch     ${c.c(session.branch)}`);
-  info(`session    ${c.d(session.dir)}`);
-  console.log();
+  if (!flags.quiet) {
+    if (session.branched) info(`branch     ${c.c(session.branch)}`);
+    info(`session    ${c.d(session.dir)}`);
+    console.log();
+  }
 
   const ctx = {
-    root, dir, session, hooks, manifest, tiers, maxSteps, call,
+    root, dir, session, hooks, manifest, tiers, agents, maxSteps, call,
     interactive: process.stdin.isTTY && process.stdout.isTTY,
     // Streaming is a terminal affordance. Piped output has nobody watching it
     // arrive, and --no-stream exists for a run whose log is being captured.
     stream: Boolean(process.stdout.isTTY) && !flags['no-stream'],
     autoApprove: Boolean(flags.yes),
     contextBudget: manifest.raw?.routing?.context_budget ?? 6000,
-    identity: readIdentity(dir),
     // Canonical execution state, owned by the loop and never by a tier. This
     // is what makes a handoff survive a change of model.
     ledger: prior ? priorLedger(prior, subject) : newLedger(subject),
@@ -245,7 +273,7 @@ export function escalate(tier, tiers) {
 
 async function attempt(ctx, frame, brief) {
   const messages = [{ role: 'user', content: brief }];
-  const system = prompt(ctx, frame.tier);
+  const system = prompt(ctx, ctx.agent ?? findAgent(frame.tier, ctx.agents) ?? { name: frame.tier, dir: join(ctx.dir, 'agents', frame.tier), owns: [] });
   const toolCtx = { ...ctx, tier: frame.tier, touched: new Set() };
   let idle = 0;
   // commit() gates on the files this attempt actually wrote, so the set has to
@@ -412,33 +440,37 @@ async function checkpoint(ctx, cp) {
 // Prompt assembly
 // ---------------------------------------------------------------------------
 
-function readIdentity(dir) {
-  const read = (p) => (existsSync(join(dir, p)) ? readFileSync(join(dir, p), 'utf8') : '');
-  return { soul: read('SOUL.md'), rules: read('RULES.md'), duties: read('DUTIES.md') };
-}
-
 /**
- * Global identity, then the tier's own, then the operating contract.
+ * The agent's own identity, and nothing the harness invented.
  *
- * The tier's files come last so they stack ON TOP of the global ones, which is
- * what RULES.md says happens. DUTIES.md is included whole rather than
- * summarised: it is the file the user edits to change escalation, and a
- * paraphrase here would silently stop matching it.
+ * There is deliberately no global SOUL.md or RULES.md prepended here. An agent
+ * is a self-contained unit a user can pull from any URL; injecting identity
+ * the harness owns into every one of them makes the harness the co-author of
+ * agents it did not write, and means a pulled agent's own file no longer
+ * decides how it behaves.
+ *
+ * Shared constraints live in `hooks/hooks.yaml`, which is enforced rather than
+ * suggested, and in DUTIES.md, which is the routing contract between agents
+ * and is included only when the user keeps one.
  */
-function prompt(ctx, tier) {
-  const dir = join(ctx.dir, 'agents', tier);
+function prompt(ctx, agent) {
   const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '');
+  const { body: soul } = frontMatter(read(join(agent.dir, 'SOUL.md')));
+  const duties = read(join(ctx.dir, 'DUTIES.md'));
+  const others = ctx.agents.filter((a) => a.name !== agent.name);
 
   return [
-    ctx.identity.soul,
-    ctx.identity.rules,
-    read(join(dir, 'SOUL.md')),
-    read(join(dir, 'RULES.md')),
-    `# Duties and escalation\n\n${ctx.identity.duties}`,
+    soul,
+    read(join(agent.dir, 'RULES.md')),
+    duties ? ['# Duties and escalation', '', duties].join(NEWLINE) : '',
     [
       '# How you operate',
       '',
-      `You are the \`${tier}\` tier. Installed tiers: ${ctx.tiers.join(', ')}.`,
+      `You are \`${agent.name}\`.`,
+      others.length
+        ? `Other agents installed: ${others.map((a) => `${a.name}${a.role ? ` (${a.role})` : ''}`).join(', ')}.`
+        : 'You are the only agent installed, so there is nobody to hand off to.',
+      agent.owns.length ? `Your scope: ${agent.owns.join(', ')}.` : '',
       '',
       'Work through the tools. Read before you write. write_file takes the COMPLETE',
       'new contents of a file, never a patch or a fragment.',
@@ -451,10 +483,12 @@ function prompt(ctx, tier) {
       'either fix the approach or hand off. Retrying the identical call will fail again.',
       '',
       'Call done() when the task is complete, with one or two lines saying what changed',
-      'and where. Call handoff() the moment the task exceeds your scope — that is the',
-      'design working, not a failure.',
-    ].join('\n'),
-  ].filter((s) => s.trim()).join('\n\n---\n\n');
+      'and where.',
+      others.length
+        ? 'Call handoff() the moment the task exceeds your scope — that is the design working, not a failure.'
+        : '',
+    ].filter(Boolean).join(NEWLINE),
+  ].filter((s) => s.trim()).join(`${NEWLINE}${NEWLINE}---${NEWLINE}${NEWLINE}`);
 }
 
 // ---------------------------------------------------------------------------

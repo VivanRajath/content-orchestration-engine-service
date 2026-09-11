@@ -1,7 +1,8 @@
 ---
 name: junior-dev
-tier: 1
 role: Scoped, single-concern implementation
+priority: 20
+parallel: false
 ---
 
 # Junior Dev
