@@ -2,6 +2,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync, read
 import { join } from 'node:path';
 import { agentDir } from './paths.js';
 import { fetchPack, confine } from './pack.js';
+import { readAgents } from './agents.js';
 import { readManifest, patchSequence } from './config.js';
 import { c, ok, info, warn } from './util.js';
 
@@ -44,20 +45,15 @@ export async function personas(positional, flags) {
 
   if (!action || action === 'list') {
     const dir = tiersDir();
-    const found = readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory());
     console.log();
-    for (const e of found) {
-      const soul = join(dir, e.name, 'SOUL.md');
-      let role = '';
-      if (existsSync(soul)) {
-        const m = readFileSync(soul, 'utf8').match(/^role:\s*(.+)$/m);
-        if (m) role = m[1].trim();
-      }
-      console.log(`  ${c.c(e.name.padEnd(14))}${c.d(role)}`);
+    for (const a of readAgents()) {
+      const scope = a.owns.length ? c.d(`  ${a.owns.join(' ')}`) : '';
+      const par = a.parallel ? c.g('  parallel') : '';
+      console.log(`  ${c.c(a.name.padEnd(14))}${c.d(String(a.priority).padStart(3))}  ${a.role}${scope}${par}`);
     }
     console.log();
     info('edit  .gitagent/agents/<name>/RULES.md');
-    info('add   jr-arch personas add <name>');
+    info('add   jr-arch add-agent <git-url>');
     console.log();
     return;
   }

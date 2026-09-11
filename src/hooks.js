@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { basename as fileName, join, relative, resolve, sep } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { parseYaml } from './yaml.js';
 
@@ -70,29 +70,56 @@ const UNIVERSAL_GLOB = /^(\*|\*\*|\*\*\/\*|\*\*\/\*\*)$/;
 
 const cache = new Map();
 
-export function loadHooks(dir = agentDir(), { reload = false } = {}) {
-  const file = join(dir, 'hooks', 'hooks.yaml');
-  if (!reload && cache.has(file)) return cache.get(file);
+/**
+ * Every guard file in `hooks/`, not just `hooks.yaml`.
+ *
+ * `add-guard` drops files in beside the repo's own, so guards are additive: a
+ * pulled one extends the set rather than replacing it. Load order is
+ * alphabetical with hooks.yaml last, so the repo's own file has the final word
+ * on any hook two files both declare — a guard you installed should not be
+ * able to quietly redefine one you wrote.
+ */
+export function hookFiles(dir = agentDir()) {
+  const base = join(dir, 'hooks');
+  if (!existsSync(base)) return [];
+  let names;
+  try { names = readdirSync(base); } catch { return []; }
+  const yaml = names.filter((n) => /\.ya?ml$/i.test(n)).sort();
+  return [
+    ...yaml.filter((n) => n !== 'hooks.yaml').map((n) => join(base, n)),
+    ...yaml.filter((n) => n === 'hooks.yaml').map((n) => join(base, n)),
+  ];
+}
 
-  let doc = {};
+export function loadHooks(dir = agentDir(), { reload = false } = {}) {
+  const files = hookFiles(dir);
+  const key = files.join('|') || join(dir, 'hooks');
+  if (!reload && cache.has(key)) return cache.get(key);
+
   const notes = [];
-  if (existsSync(file)) {
+  const set = {
+    file: files[files.length - 1] ?? join(dir, 'hooks', 'hooks.yaml'),
+    files, notes,
+    pre_edit: {}, pre_command: {}, pre_commit: {}, post_run: {},
+  };
+
+  if (!files.length) notes.push('no guard files in hooks/ — running with the sealed hooks only');
+
+  for (const path of files) {
     // Fail closed. A guardrail file that does not parse must abort the run,
     // never degrade into an unguarded one.
-    doc = parseYaml(readFileSync(file, 'utf8'), 'hooks/hooks.yaml') ?? {};
+    const label = `hooks/${fileName(path)}`;
+    const doc = parseYaml(readFileSync(path, 'utf8'), label) ?? {};
     if (typeof doc !== 'object' || Array.isArray(doc)) {
-      throw new Error('hooks/hooks.yaml: expected a mapping of hook phases at the top level');
+      throw new Error(`${label}: expected a mapping of hook phases at the top level`);
     }
-  } else {
-    notes.push('hooks/hooks.yaml not found — running with the sealed hooks only');
-  }
-
-  const set = { file, notes, pre_edit: {}, pre_command: {}, pre_commit: {}, post_run: {} };
-  for (const phase of ['pre_edit', 'pre_command', 'pre_commit', 'post_run']) {
-    const declared = Array.isArray(doc[phase]) ? doc[phase] : [];
-    for (const raw of declared) {
-      if (!raw || typeof raw !== 'object' || !raw.name) continue;
-      set[phase][raw.name] = normalize(raw, notes);
+    for (const phase of ['pre_edit', 'pre_command', 'pre_commit', 'post_run']) {
+      const declared = Array.isArray(doc[phase]) ? doc[phase] : [];
+      for (const raw of declared) {
+        if (!raw || typeof raw !== 'object' || !raw.name) continue;
+        if (set[phase][raw.name]) notes.push(`${raw.name}: redefined by ${label}`);
+        set[phase][raw.name] = normalize(raw, notes);
+      }
     }
   }
 
@@ -102,7 +129,7 @@ export function loadHooks(dir = agentDir(), { reload = false } = {}) {
     set[meta.phase][name] = seal(name, set[meta.phase][name], notes);
   }
 
-  cache.set(file, set);
+  cache.set(key, set);
   return set;
 }
 

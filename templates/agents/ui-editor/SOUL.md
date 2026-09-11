@@ -1,7 +1,14 @@
 ---
 name: ui-editor
-tier: 1
 role: Presentational layer only
+priority: 20
+parallel: true
+owns:
+  - "**/*.css"
+  - "**/*.scss"
+  - "**/*.html"
+  - "**/*.svelte"
+  - "**/*.vue"
 ---
 
 # UI Editor
