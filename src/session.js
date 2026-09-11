@@ -1,8 +1,9 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { redact } from './provider.js';
+import { globToRegExp, normalizePath } from './hooks.js';
 
 /**
  * Session state: the branch the agent works on, the transcript it leaves
@@ -146,13 +147,16 @@ export function record(session, event, data = {}) {
  * fence against whichever tier is acting, and a shared "current tier" would
  * read the outer one at exactly the moment it matters.
  */
-export function openAttempt(session, { tier, task, parent = null, reason = null }) {
+export function openAttempt(session, { tier, task, parent = null, reason = null, owns = [] }) {
   const frame = {
     n: session.attempts.length + 1,
     tier,
     task,
     parent,
     reason,
+    // The agent's declared scope, so a revert and a diff can be narrowed to
+    // what this attempt was responsible for.
+    owns,
     sha: headSha(session.root),
     steps: 0,
     status: 'running',
@@ -168,7 +172,7 @@ export function closeAttempt(session, frame, { status, reason = null, verify = n
   frame.status = status;
   frame.reason = reason ?? frame.reason;
   frame.verify = verify;
-  frame.diff = diffSince(session.root, frame.sha);
+  frame.diff = diffSince(session.root, frame.sha, attemptPaths(session, frame));
 
   // The diff goes to its own file rather than into the transcript. It is the
   // one part of an attempt that a later `--resume` genuinely needs — an
@@ -189,11 +193,20 @@ export function closeAttempt(session, frame, { status, reason = null, verify = n
   return frame;
 }
 
-/** Working-tree diff since a commit, including files the agent created. */
-export function diffSince(root, sha) {
+/**
+ * Working-tree diff since a commit, including files the agent created.
+ *
+ * Scoped to `paths` when given. In a swarm the whole-tree diff would attribute
+ * a sibling's edits to whichever agent happened to close first, and that diff
+ * is what a handoff carries as "what I tried".
+ */
+export function diffSince(root, sha, paths = null) {
   if (!sha) return null;
-  git(['add', '--intent-to-add', '--all'], { root, check: false });
-  return git(['diff', sha, '--'], { root, check: false }) || null;
+  const list = paths && paths.length ? paths : null;
+  // --intent-to-add makes new files visible to `git diff`. Narrowed to the
+  // attempt's own paths so it does not stage a sibling's untracked output.
+  git(['add', '--intent-to-add', '--', ...(list ?? ['.'])], { root, check: false });
+  return git(['diff', sha, '--', ...(list ?? [])], { root, check: false }) || null;
 }
 
 /**
@@ -205,14 +218,55 @@ export function diffSince(root, sha) {
  */
 export function revertAttempt(session, frame) {
   if (!frame.sha) return;
-  git(['reset', '--hard', frame.sha], { root: session.root, check: false });
-  // `git clean -fd` removes untracked files, and the session directory is
-  // untracked in a repo whose .gitignore does not mention it yet — a run
-  // scaffolded by hand, or one whose first attempt fails before init's ignore
-  // rules are committed. Excluding it explicitly means the transcript survives
-  // a revert regardless of what .gitignore happens to say.
-  git(['clean', '-fd', '-e', '.gitagent/.session'], { root: session.root, check: false });
-  record(session, 'attempt.revert', { n: frame.n, tier: frame.tier, to: frame.sha });
+  const root = session.root;
+  const paths = attemptPaths(session, frame);
+
+  // Only this attempt's own files. A whole-tree `git reset --hard` would also
+  // discard a sibling agent's work in a swarm, and in chat it would discard an
+  // earlier accepted turn that has not been committed yet. An agent is
+  // responsible for what it wrote and for nothing else.
+  const restored = [];
+  const deleted = [];
+  for (const path of paths) {
+    if (existedAt(root, frame.sha, path)) {
+      git(['checkout', frame.sha, '--', path], { root, check: false });
+      restored.push(path);
+    } else {
+      // Created by this attempt, so removing it returns the tree to where the
+      // attempt found it. rmSync rather than `git clean`, which takes no path
+      // list and would reach files this attempt never touched.
+      try { rmSync(join(root, path), { force: true }); } catch { /* already gone */ }
+      deleted.push(path);
+    }
+  }
+
+  record(session, 'attempt.revert', {
+    n: frame.n, tier: frame.tier, to: frame.sha,
+    restored: restored.length, deleted: deleted.length,
+  });
+}
+
+/**
+ * Everything this attempt is answerable for.
+ *
+ * `touched` covers write_file. A run_command can also change files — a
+ * formatter, a codegen step — so anything currently dirty inside the agent's
+ * declared scope counts too. An agent with no declared scope gets only what it
+ * explicitly wrote, because "everything dirty" would sweep up a sibling's work.
+ */
+export function attemptPaths(session, frame) {
+  const paths = new Set(frame.touched ?? []);
+  const scope = frame.owns ?? [];
+  if (scope.length) {
+    for (const path of dirtyFiles(session.root)) {
+      if (scope.some((glob) => globToRegExp(glob).test(normalizePath(path, session.root)))) paths.add(path);
+    }
+  }
+  return [...paths];
+}
+
+function existedAt(root, sha, path) {
+  return git(['cat-file', '-e', `${sha}:${path}`], { root, check: false }) !== null;
 }
 
 export function commitAttempt(session, frame, message) {

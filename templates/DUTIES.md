@@ -1,9 +1,18 @@
 # Duties and Escalation
 
-Defines who picks up a task, who they hand it to, and what travels with the handoff.
-Edit freely — this file is the contract, not the code.
+Who picks up a task, who they hand it to, and what travels with the handoff.
 
-## Tiers
+**This file is a default, not a requirement.** It describes the four agents
+this scaffold happens to ship with. Delete it, rewrite it, or replace it the
+moment your set of agents stops looking like this one — the loop reads whatever
+is here and passes it to every agent, and reads nothing at all if the file is
+gone. What each agent owns and when it hands off is really declared in its own
+`SOUL.md` and `RULES.md`; this file exists so the agents agree on one story.
+
+What is NOT optional, and is not in this file: `hooks/`. Those are enforced by
+the harness whatever any agent believes.
+
+## Agents
 
 | Tier | Owns | Never does |
 |---|---|---|
@@ -14,7 +23,8 @@ Edit freely — this file is the contract, not the code.
 
 ## Entry
 
-Entry tier is chosen from repo state and task shape, never from language or framework.
+Entry agent is chosen from repo state and task shape, never from language or
+framework. Priority order comes from each agent's own front matter.
 
 1. Build fails, dependencies missing, or no lockfile → `build-doctor`. Nothing else runs until the build is green.
 2. Task is presentational (styling, layout, copy, component markup) → `ui-editor`.
@@ -22,7 +32,7 @@ Entry tier is chosen from repo state and task shape, never from language or fram
 4. Task is cross-cutting, ambiguous, or touches more than three files → `senior-dev`.
 
 Classification returns strict JSON: `{tier, confidence, reason}`. Below the
-confidence floor, route one tier higher. Over-qualifying costs tokens;
+confidence floor, route one step higher. Over-qualifying costs tokens;
 under-qualifying costs a thrash loop and the user's trust.
 
 ## Escalation

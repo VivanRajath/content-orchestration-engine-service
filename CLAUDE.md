@@ -74,6 +74,23 @@ parallelism are front matter in the agent's own SOUL.md, not harness config.
 The directory is what installs it: no registry entry, no manifest list to keep
 in sync, and deleting the folder uninstalls it.
 
+**A failed agent rolls back its own files and nothing else.** `revertAttempt`
+restores only what the attempt touched — `git checkout <sha> -- <path>` for
+files that existed, delete for files it created. A whole-tree `git reset
+--hard` would take a sibling's successful work in a swarm, and in chat it would
+take an earlier accepted turn that has not been committed yet. Scope widens the
+set to anything dirty the agent owns, so a formatter run via run_command is
+caught too; an agent with no declared scope gets only what it explicitly wrote,
+because "everything dirty" would sweep up work that is not its own.
+
+**Model calls run in parallel; git does not.** The index is one shared mutable
+thing, and two agents staging at once produce a diff belonging to neither.
+`gitLock` serialises the bookkeeping while the slow part stays concurrent.
+
+**A swarm is opt-in.** `--swarm` fans out; the default runs one agent. Fanning
+out by default would multiply a user's token bill the first time they installed
+two scoped agents, without them asking.
+
 **Scope is what makes parallelism safe.** Agents write into one working tree,
 so two agents may run concurrently only when both opted in and their scopes are
 provably disjoint. `disjoint()` compares literal prefixes and treats anything
@@ -212,6 +229,12 @@ section was omitted assumes the record is complete.
 one shape to speak. Carrying a base_url across a provider change points an
 Anthropic tier at an OpenAI-compatible endpoint and fails unreadably.
 
+**DUTIES.md is a default, not a requirement.** It describes the four agents
+this scaffold ships with. The loop passes whatever is there and passes nothing
+when the file is gone — what an agent owns and when it hands off really lives
+in its own SOUL.md and RULES.md. Code that treats a missing or rewritten
+DUTIES.md as an error is wrong.
+
 **`doctor` fails at setup, not mid-task.** The tier ladder needs strict JSON and
 tool calling. Small local models often give neither and the ladder degrades into
 retry thrash that reads as a bug in this tool. Probe, then tell the user to drop
@@ -287,11 +310,10 @@ Two repos:
 
 ## Next
 
-1. **Swarm execution.** `agents.js` has the pieces — `partition()` splits paths
-   by scope and priority, `swarmable()` groups what can run concurrently — but
-   `ladder()` still runs one agent at a time. The shared ledger in context.js
-   is already the right substrate for the shared knowledge.
-2. **A live-model run on a throwaway repo.** Nothing here has met a real model;
+1. **A live-model run on a throwaway repo.** Nothing here has met a real model.
+2. Swarm currently fans out to one group and does not escalate: a failed agent
+   rolls back and stops rather than handing to another. The ladder and the
+   swarm are still two paths through `run()`. Nothing here has met a real model;
    the ladder is exercised with an injected scripted one.
 2. `doctor` should probe every key in `keyEnvs(manifest)`, not only the default
    one — a per-tier key that is missing currently fails mid-run.

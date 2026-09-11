@@ -14,7 +14,7 @@ import {
   record as sessionRecord,
 } from './session.js';
 import { newLedger, reconcile, compile, REPORT_SYSTEM, reportPrompt } from './context.js';
-import { readAgents, findAgent, frontMatter } from './agents.js';
+import { readAgents, findAgent, frontMatter, swarmable, partition } from './agents.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -149,6 +149,27 @@ export async function run(positional, flags, { call = callModel } = {}) {
   };
 
   try {
+    // A swarm is opt-in. Fanning out by default would multiply a user's token
+    // bill the first time they installed two scoped agents, without them ever
+    // asking for it.
+    const group = flags.swarm && !named ? swarmFor(ctx, { files: repoFiles(root) }) : null;
+    if (group) {
+      const result = await swarm(ctx, group, { task: subject, brief });
+      const outcome = result.done.length
+        ? {
+            status: result.failed.length ? 'partial' : 'done',
+            tier: result.done.map((d) => d.agent.name).join(', '),
+            summary: result.done.map((d) => `${d.agent.name}: ${d.result.summary}`).join('; '),
+            build: result.build,
+          }
+        : { status: 'stopped', reason: 'every agent in the swarm failed', detail: result.failed[0]?.result?.reason };
+      if (outcome.status !== 'stopped') {
+        for (const d of result.done) commit(ctx, d.frame, d.result.summary);
+      }
+      finish(ctx, outcome);
+      return outcome;
+    }
+
     const outcome = await ladder(ctx, { tier: entry.tier, task: subject, brief });
     finish(ctx, outcome);
     return outcome;
@@ -193,7 +214,7 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
       c.b(`▸ ${current}`) + c.d(`  attempt ${used[current]}/${limit}`) +
       (differs ? c.d(`  ${tierModel.model}`) : ''),
     );
-    const frame = openAttempt(ctx.session, { tier: current, task: brief, reason });
+    const frame = openAttempt(ctx.session, { tier: current, task: brief, reason, owns: agentOf(ctx, current).owns });
     const result = await attempt({ ...ctx, tierModel }, frame, brief);
 
     if (result.kind === 'done') {
@@ -265,6 +286,97 @@ export function escalate(tier, tiers) {
   const next = { 'ui-editor': 'junior-dev', 'junior-dev': 'senior-dev', 'build-doctor': 'senior-dev' }[tier] ?? null;
   if (!next) return null;
   return tiers.includes(next) ? next : tiers.includes('senior-dev') ? 'senior-dev' : null;
+}
+
+
+// ---------------------------------------------------------------------------
+// Swarm
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a group of agents at the same time, on one shared ledger.
+ *
+ * Only agents that opted in AND whose scopes are provably disjoint reach here
+ * — see swarmable(). That is what makes concurrent writes into a single
+ * working tree safe: no two agents in a group can claim the same file.
+ *
+ * What they share is the ledger. Each agent's handoff report is reconciled into
+ * the same record, so one agent's decisions and ruled-out approaches are
+ * visible to the next round rather than dying with the attempt that learned
+ * them. That is the "shared knowledge" half of a swarm; the scope split is the
+ * half that stops them treading on each other.
+ *
+ * Model work runs concurrently; git bookkeeping does not. The index is one
+ * shared mutable thing, and two agents staging at once produce a diff that
+ * belongs to neither of them.
+ */
+export async function swarm(ctx, group, { task, brief }) {
+  console.log(c.b(`▸ swarm`) + c.d(`  ${group.map((a) => a.name).join(' ∥ ')}`));
+
+  const settled = await Promise.all(group.map(async (agent) => {
+    const tierModel = modelFor(ctx.manifest, agent.name);
+    const frame = await gitLock(ctx, () =>
+      openAttempt(ctx.session, { tier: agent.name, task: brief, owns: agent.owns }));
+    try {
+      const result = await attempt({ ...ctx, tierModel, agent }, frame, brief);
+      return { agent, frame, result, tierModel };
+    } catch (e) {
+      return { agent, frame, tierModel, result: { kind: 'failed', reason: e.message } };
+    }
+  }));
+
+  const done = [];
+  const failed = [];
+
+  for (const { agent, frame, result, tierModel } of settled) {
+    if (result.kind === 'done') {
+      await gitLock(ctx, () => closeAttempt(ctx.session, frame, { status: 'done' }));
+      ok(`${c.c(agent.name)} ${result.summary || 'done'}`);
+      done.push({ agent, frame, result });
+    } else {
+      await gitLock(ctx, async () => {
+        closeAttempt(ctx.session, frame, { status: result.kind, reason: result.reason });
+        await record(ctx, { frame, tierModel, status: result.kind, reason: result.reason, result });
+        // Only this agent's files. Its siblings succeeded on paths it never
+        // owned, and a whole-tree reset would throw their work away too.
+        revertAttempt(ctx.session, frame);
+      });
+      warn(`${agent.name}: ${result.reason ?? 'failed'} — its files were rolled back`);
+      failed.push({ agent, frame, result });
+    }
+  }
+
+  // Verify once, after the whole group. Running it per agent would race on the
+  // same build directory and report each agent the others' failures.
+  const build = verify({ root: ctx.root });
+  return { done, failed, build };
+}
+
+/**
+ * Serialise git. Model calls are the slow part and stay parallel; the index is
+ * not safe to share.
+ */
+function gitLock(ctx, fn) {
+  const queue = ctx.gitQueue ?? Promise.resolve();
+  const next = queue.then(fn, fn);
+  ctx.gitQueue = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+/** The registered agent, or a minimal stand-in for one only named in DUTIES. */
+function agentOf(ctx, name) {
+  return findAgent(name, ctx.agents) ?? { name, dir: join(ctx.dir, 'agents', name), owns: [], role: '' };
+}
+
+/** The agents a task should fan out to, or null when it is one agent's job. */
+export function swarmFor(ctx, { files = [] } = {}) {
+  const groups = swarmable(ctx.agents).filter((g) => g.length > 1);
+  if (!groups.length) return null;
+  // Fan out only when the work actually spans more than one agent's scope.
+  const group = groups[0];
+  const { claims } = partition(group, files);
+  const busy = group.filter((a) => (claims.get(a.name) ?? []).length);
+  return busy.length > 1 ? busy : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +499,7 @@ async function callBuildDoctor(ctx, parent, build) {
     `\n## Output\n\n\`\`\`\n${build.output}\n\`\`\``,
   ].join('\n');
 
-  const frame = openAttempt(ctx.session, { tier: 'build-doctor', task: brief, parent, reason: 'red build' });
+  const frame = openAttempt(ctx.session, { tier: 'build-doctor', task: brief, parent, reason: 'red build', owns: agentOf(ctx, 'build-doctor').owns });
   const result = await attempt(ctx, frame, brief);
   const after = verify({ root: ctx.root });
   closeAttempt(ctx.session, frame, { status: after.green ? 'done' : 'failed', verify: after });
@@ -509,7 +621,8 @@ function banner(manifest, task, build, tiers) {
 
 function finish(ctx, outcome) {
   console.log();
-  if (outcome.status === 'done') {
+  if (outcome.status === 'done' || outcome.status === 'partial') {
+    if (outcome.status === 'partial') warn('Some agents failed; their files were rolled back.');
     ok(c.b(outcome.summary || 'Done.'));
     if (ctx.session.branched) info(`on branch ${c.c(ctx.session.branch)} — review, then merge or discard`);
   } else {

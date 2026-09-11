@@ -177,11 +177,11 @@ function patchDuties(file, name, action, role) {
   if (!existsSync(file)) return;
   const lines = readFileSync(file, 'utf8').split('\n');
 
-  const head = lines.findIndex((l) => /^##\s+Tiers\b/.test(l));
-  if (head === -1) {
-    warn('DUTIES.md has no "## Tiers" table — add the row yourself.');
-    return;
-  }
+  // DUTIES.md is a default, not a requirement, so a repo that rewrote or
+  // deleted it is normal rather than broken. Nothing to patch and nothing to
+  // warn about — an agent's scope really lives in its own SOUL.md.
+  const head = lines.findIndex((l) => /^##\s+(Agents|Tiers)\b/.test(l));
+  if (head === -1) return;
   const end = lines.findIndex((l, i) => i > head && /^##\s/.test(l));
   const stop = end === -1 ? lines.length : end;
 
