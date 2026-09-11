@@ -2,16 +2,18 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { agentDir, repoRoot } from './paths.js';
-import { readManifest } from './config.js';
+import { readManifest, modelFor } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
-import { callModel } from './provider.js';
+import { callModel, extractJson } from './provider.js';
 import { classify } from './classify.js';
 import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
 import {
   openSession, openAttempt, closeAttempt, closeSession, commitAttempt,
-  revertAttempt, dirtyFiles, isRepo, handoffPayload, listSessions, readSession, resumeBrief,
+  revertAttempt, dirtyFiles, isRepo, listSessions, readSession, resumeBrief,
+  record as sessionRecord,
 } from './session.js';
+import { newLedger, reconcile, compile, REPORT_SYSTEM, reportPrompt } from './context.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -111,7 +113,11 @@ export async function run(positional, flags, { call = callModel } = {}) {
     // arrive, and --no-stream exists for a run whose log is being captured.
     stream: Boolean(process.stdout.isTTY) && !flags['no-stream'],
     autoApprove: Boolean(flags.yes),
+    contextBudget: manifest.raw?.routing?.context_budget ?? 6000,
     identity: readIdentity(dir),
+    // Canonical execution state, owned by the loop and never by a tier. This
+    // is what makes a handoff survive a change of model.
+    ledger: prior ? priorLedger(prior, subject) : newLedger(subject),
   };
 
   try {
@@ -153,9 +159,14 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
     used[current] = (used[current] ?? 0) + 1;
     const limit = limits[current] ?? 2;
 
-    console.log(c.b(`▸ ${current}`) + c.d(`  attempt ${used[current]}/${limit}`));
+    const tierModel = modelFor(ctx.manifest, current);
+    const differs = tierModel.model !== ctx.manifest.model || tierModel.provider !== ctx.manifest.provider;
+    console.log(
+      c.b(`▸ ${current}`) + c.d(`  attempt ${used[current]}/${limit}`) +
+      (differs ? c.d(`  ${tierModel.model}`) : ''),
+    );
     const frame = openAttempt(ctx.session, { tier: current, task: brief, reason });
-    const result = await attempt(ctx, frame, brief);
+    const result = await attempt({ ...ctx, tierModel }, frame, brief);
 
     if (result.kind === 'done') {
       const check = await verifyAndGate(ctx);
@@ -176,17 +187,19 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
       reason = `the build is red after your change: ${truncate(check.build.output, 800)}`;
     } else if (result.kind === 'handoff') {
       closeAttempt(ctx.session, frame, { status: 'handoff', reason: result.reason });
-      // A handoff carries its diff forward but does not keep the edits: the
+      await record(ctx, { frame, tierModel, status: 'handoff', reason: result.reason, result });
+      // A handoff carries its record forward but does not keep the edits: the
       // receiving tier decides its own approach, and half a junior's attempt
       // sitting in the tree is not a starting point, it is a trap.
       revertAttempt(ctx.session, frame);
       warn(`handoff → ${result.to}: ${result.reason}`);
       current = result.to;
-      brief = handoffPayload(ctx.session, { task, to: result.to, reason: result.reason });
+      brief = compile(ctx.ledger, { to: result.to, reason: result.reason, budget: ctx.contextBudget });
       reason = result.reason;
       continue;
     } else {
       closeAttempt(ctx.session, frame, { status: 'failed', reason: result.reason });
+      await record(ctx, { frame, tierModel, status: 'failed', reason: result.reason, result });
       revertAttempt(ctx.session, frame);
       warn(`attempt failed: ${result.reason}`);
       reason = result.reason;
@@ -203,10 +216,10 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
         };
       }
       warn(`${current} exhausted ${used[current]} attempts → ${next}`);
-      brief = handoffPayload(ctx.session, { task, to: next, reason: reason ?? 'attempts exhausted' });
+      brief = compile(ctx.ledger, { to: next, reason: reason ?? 'attempts exhausted', budget: ctx.contextBudget });
       current = next;
     } else {
-      brief = handoffPayload(ctx.session, { task, to: current, reason: reason ?? 'retry' });
+      brief = compile(ctx.ledger, { to: current, reason: reason ?? 'retry', budget: ctx.contextBudget });
     }
   }
 
@@ -245,7 +258,7 @@ async function attempt(ctx, frame, brief) {
     let reply;
     const stream = ctx.stream ? streamWriter() : null;
     try {
-      reply = await ctx.call(ctx.manifest, {
+      reply = await ctx.call(ctx.tierModel ?? ctx.manifest, {
         system, messages, tools: TOOLS,
         ...(stream ? { onDelta: stream.write } : {}),
       });
@@ -505,6 +518,71 @@ function loadPrior(flag) {
     throw new Error(`Session ${id} finished successfully — there is nothing to resume.`);
   }
   return prior;
+}
+
+/**
+ * Ask the finishing tier for its handoff report, then merge it into the ledger.
+ *
+ * A SECOND model call, deliberately separate from the task turn. A model asked
+ * for the work and the report in one prompt writes an optimistic report and
+ * drifts out of the task; splitting them costs one small call per handoff and
+ * is the difference between a usable record and a victory lap.
+ *
+ * The reply is treated as CLAIMS. reconcile() stamps only what the harness
+ * itself observed — which files were really written, whether the build really
+ * went green — and marks the rest unverified. A tier cannot write its own
+ * provenance, and cannot delete a failed attempt from the record.
+ */
+async function record(ctx, { frame, tierModel, status, reason, result }) {
+  const observed = {
+    touched: [...(frame.touched ?? [])],
+    diffLines: frame.diff ? frame.diff.split(NEWLINE).length : 0,
+    green: frame.verify?.green ?? null,
+    build: frame.verify ?? null,
+    reason,
+  };
+
+  let claims = {};
+  try {
+    const reply = await ctx.call(tierModel ?? ctx.manifest, {
+      system: REPORT_SYSTEM,
+      messages: [{ role: 'user', content: reportPrompt({ tier: frame.tier, status, reason, observed }) }],
+      maxTokens: 800,
+      temperature: 0,
+    });
+    claims = extractJson(reply.text) ?? {};
+  } catch (e) {
+    // A failed report costs context, not the run. The engine-observed half of
+    // the record still lands, which is the half that cannot be faked anyway.
+    info(c.d(`  handoff report unavailable (${truncate(e.message, 80)})`));
+  }
+
+  reconcile(ctx.ledger, { tier: frame.tier, claims, observed, status });
+  sessionRecord(ctx.session, 'ledger', {
+    tier: frame.tier,
+    status,
+    decisions: ctx.ledger.decisions.length,
+    failed: ctx.ledger.failed.length,
+    artifacts: ctx.ledger.artifacts.length,
+  });
+}
+
+/** Rebuild a ledger from a prior session, so a resume keeps what it learned. */
+function priorLedger(prior, task) {
+  const ledger = newLedger(task);
+  for (const a of prior.attempts) {
+    if (a.status === 'done') continue;
+    ledger.failed.push({
+      tier: a.tier,
+      approach: `attempt ${a.n}`,
+      why: a.reason ?? 'no reason recorded',
+      diffLines: a.diff ? a.diff.split(NEWLINE).length : 0,
+      recorded_by: 'previous session',
+      recorded_at: new Date().toISOString(),
+      verified: true,
+    });
+  }
+  return ledger;
 }
 
 const NEWLINE = String.fromCharCode(10);

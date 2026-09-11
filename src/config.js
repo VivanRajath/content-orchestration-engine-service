@@ -127,8 +127,57 @@ export function readManifest(file = manifestPath()) {
     source:   doc.source ?? null,
     identity: doc.identity ?? {},
     memory:   doc.memory ?? {},
+    // Per-tier model overrides. Empty for the common case of one model.
+    tiers:    doc.tiers && typeof doc.tiers === 'object' && !Array.isArray(doc.tiers) ? doc.tiers : {},
     raw:      doc,
   };
+}
+
+/**
+ * The manifest as a given tier sees it.
+ *
+ * A ladder whose whole premise is that tiers differ in cost and judgement
+ * should be able to point them at different models: a cheap one for scoped
+ * junior work, an expensive one for architecture. Anything a tier does not
+ * override is inherited, so the common case — one model everywhere — needs no
+ * `tiers:` block at all.
+ *
+ * Returns the same shape readManifest does, because every consumer (provider,
+ * classifier, doctor, the run loop) already speaks it. A second shape would
+ * mean every one of them learning which to expect.
+ */
+export function modelFor(manifest, tier) {
+  const over = manifest.tiers?.[tier]?.model;
+  if (!over || typeof over !== 'object') return manifest;
+
+  const nil = (v) => (v === undefined || v === '' ? null : v);
+  const pick = (key, fallback) => (over[key] === undefined ? fallback : nil(over[key]));
+
+  return {
+    ...manifest,
+    provider: pick('provider', manifest.provider),
+    model:    pick('name', manifest.model),
+    keyEnv:   pick('api_key_env', manifest.keyEnv),
+    // base_url follows the provider unless the tier names its own. Inheriting
+    // a base_url across a provider change points an Anthropic tier at an
+    // OpenAI-compatible endpoint, which fails in a way nobody can read.
+    baseUrl:  over.base_url === undefined
+      ? (over.provider && over.provider !== manifest.provider ? null : manifest.baseUrl)
+      : nil(over.base_url),
+    temperature: pick('temperature', manifest.temperature),
+    maxTokens:   pick('max_tokens', manifest.maxTokens),
+    tier,
+  };
+}
+
+/** Every env var name the manifest references, base and per-tier. */
+export function keyEnvs(manifest) {
+  const names = new Set();
+  if (manifest.keyEnv) names.add(manifest.keyEnv);
+  for (const spec of Object.values(manifest.tiers ?? {})) {
+    if (spec?.model?.api_key_env) names.add(String(spec.model.api_key_env));
+  }
+  return [...names];
 }
 
 export async function config(positional, _flags) {
@@ -142,6 +191,15 @@ export async function config(positional, _flags) {
     info(`name         ${m.model}`);
     info(`api_key_env  ${m.keyEnv}${process.env[m.keyEnv] ? c.g('  (set)') : c.y('  (not set)')}`);
     info(`base_url     ${m.baseUrl ?? '—'}`);
+    if (Object.keys(m.tiers).length) {
+      console.log(c.b('  per tier'));
+      for (const tier of m.agents) {
+        const t = modelFor(m, tier);
+        const overridden = t.model !== m.model || t.provider !== m.provider || t.keyEnv !== m.keyEnv;
+        const set = process.env[t.keyEnv] ? c.g('set') : c.y('not set');
+        info(`${tier.padEnd(14)}${overridden ? `${t.model}  ${c.d(`${t.provider} · ${t.keyEnv} ${set}`)}` : c.d('(inherits)')}`);
+      }
+    }
     console.log(c.b('  routing'));
     info(`entry        ${m.entry}`);
     console.log();

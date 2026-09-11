@@ -20,6 +20,7 @@ src/session.js          session branch, transcript, attempt frames, handoff payl
 src/verify.js           detect and run the project's own build/test command
 src/detect.js           stack / lockfile / verify-command report
 src/env.js              .gitagent/.env loading and the `key` command
+src/context.js          the ledger: claims -> records, and the handoff compiler
 src/personas.js         list / add / remove tiers, --from <git-url> pull
 src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
 src/classify.js         one model call -> {tier, confidence, reason}
@@ -43,7 +44,9 @@ build-doctor, verify, commit to a session branch, streaming its output.
 `run --resume` continues a stopped session on its original branch. `detect`
 reports the stack. `personas add|remove` wires the tier into agent.yaml and
 DUTIES.md rather than telling the user to. `key` stores a provider key without
-ever asking anyone to type `export`. 311 tests, `node --test`.
+ever asking anyone to type `export`. Tiers can each name their own model and
+key, and context crosses between them as a compiled record. 338 tests,
+`node --test`.
 
 Not yet exercised against a live model — the ladder is tested with an injected
 scripted model, not a real one. Whoever has a key first should run it on a
@@ -141,6 +144,37 @@ repo. A resume rebuilds the same brief a handoff carries: the original task,
 the tier history, and the failed diffs. That is what DUTIES.md already says an
 escalation needs, so a resumed tier reads its history in a format it knows.
 
+**A handoff carries a record, not a transcript.** `src/context.js` keeps
+canonical execution state and compiles a bounded brief from it. Replaying the
+conversation costs tokens quadratically in the number of handoffs and cannot
+cross providers at all — tool-call ids and message shapes are provider-specific,
+and the successor may be a different model. Summarising instead loses exactly
+what a successor needs. So the ledger records decisions with rationale, files
+the harness saw written, open issues, and failed approaches, and the compiler
+renders them in priority order within `routing.context_budget`. A junior→senior
+handoff compiles to ~700 characters.
+
+**A worker emits claims; only the engine writes records.** Four invariants, each
+because a model asked nicely will break it: an unverified claim never closes an
+issue; a file named only in prose is recorded unverified; failed attempts are
+append-only; provenance is stamped by the engine, never self-reported. The third
+matters most — a senior that can drop the junior's failed approach will
+re-attempt it.
+
+**The handoff report is a second model call.** Asking for the work and the
+report in one prompt biases both toward the same tone: a model mid-task writes
+an optimistic report. It costs one small call per handoff.
+
+**`task` and `objective` are never trimmed.** A brief that loses the task is not
+a smaller brief, it is a different task. Everything else trims before it drops,
+and whatever was cut is named in the package — a successor that does not know a
+section was omitted assumes the record is complete.
+
+**Per-tier models inherit, and a provider change drops an inherited base_url.**
+`modelFor()` returns the same shape `readManifest` does, so every consumer keeps
+one shape to speak. Carrying a base_url across a provider change points an
+Anthropic tier at an OpenAI-compatible endpoint and fails unreadably.
+
 **`doctor` fails at setup, not mid-task.** The tier ladder needs strict JSON and
 tool calling. Small local models often give neither and the ladder degrades into
 retry thrash that reads as a bug in this tool. Probe, then tell the user to drop
@@ -216,9 +250,10 @@ Two repos:
 
 ## Next
 
-1. A live-model run on a throwaway repo. Everything below is speculation until
-   that happens.
-2. `run --resume <session-id>`, using the transcript already being written.
-4. Stack detection, ported from `sandbox-engine-cli`, as `jr-arch detect`.
-5. `personas add` should offer to patch `agent.yaml` and `DUTIES.md` rather than
-   printing a reminder to do it by hand.
+1. **A live-model run on a throwaway repo.** Nothing here has met a real model;
+   the ladder is exercised with an injected scripted one.
+2. `doctor` should probe every key in `keyEnvs(manifest)`, not only the default
+   one — a per-tier key that is missing currently fails mid-run.
+3. `jr-arch sessions` to list and inspect past runs.
+4. Token accounting per attempt, per model, in the transcript. With per-tier
+   models the cost question is now "which tier spent it".
