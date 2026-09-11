@@ -63,6 +63,27 @@ jr-arch key                # shows whether one is set, and from where
 jr-arch key remove
 ```
 
+### A different model per tier
+
+The premise of a tier ladder is that tiers differ in cost and judgement, so
+point them at different models. Add a `tiers:` block to `agent.yaml`:
+
+```yaml
+tiers:
+  junior-dev:
+    model:
+      provider: openai
+      name: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY   # jr-arch key --env OPENAI_API_KEY sk-...
+  senior-dev:
+    model:
+      name: claude-opus-4-1         # same provider and key, bigger model
+```
+
+Anything a tier does not name is inherited, so the common case needs no block
+at all. `jr-arch key` then reports every key the manifest needs and which tiers
+use it, rather than just the default one.
+
 An exported shell variable always wins over the file. The `.gitignore` rule is
 verified and repaired *before* anything is written, and the agent itself cannot
 read the file back — `.env*` is a sealed guardrail path, so `read_file` and
@@ -117,8 +138,52 @@ back with `git reset --hard`, and that guard is what keeps the rollback from
 reaching your uncommitted work.
 
 If a run stops and escalates to you, `run --resume` picks it up on the same
-branch, carrying the diffs that already failed so the next tier does not
-repeat them.
+branch, carrying what already failed so the next tier does not repeat it.
+
+## Context between models
+
+A handoff crosses a model boundary, and often a provider boundary. Replaying
+the conversation is not an option: it costs tokens quadratically in the number
+of handoffs, and tool-call ids and message shapes do not survive a change of
+provider. Summarising instead throws away the two things a successor most
+needs — why a decision was made, and what has already been tried and failed.
+
+So execution state is kept as a record and the successor is briefed from it:
+
+```
+## Task (unmodified)
+add json config support
+
+## Why this reached you
+this needs a schema decision I cannot make
+
+## Next action
+decide on a schema shape before writing more parsing
+
+## Decisions made
+- used JSON.parse directly — no schema library in the repo _(claimed, unverified)_
+
+## Files touched
+- index.js
+
+## Approaches already ruled out — do not repeat these
+- junior-dev: parsed the JSON inline in index.js — failed because this needs a
+  schema decision I cannot make
+```
+
+That is the entire brief — about 700 characters instead of a transcript.
+
+Note what is and is not marked. A worker's output is a **claim**; the harness
+records as verified only what it saw itself, so "files touched" is unmarked
+because the write actually happened, while the rationale beside it is flagged
+as the model's word. Failed approaches are append-only: a later tier cannot
+quietly drop the earlier one's failure from the record and re-attempt it.
+
+Budget with `routing.context_budget`. Sections trim before they drop, whatever
+was cut is named in the brief, and the task itself is never trimmed.
+
+Built on the approach in
+[context-orchestration-engine](https://context-orchestration-engine.vercel.app/).
 
 ## Run `doctor` before you trust the tiers
 

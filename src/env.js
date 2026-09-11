@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
+import { keyEnvs, modelFor } from './config.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -154,16 +155,22 @@ export async function key(positional, flags, { manifest }) {
 
   if (!value) {
     console.log();
-    const source = keySource(name);
-    info(`variable   ${c.c(name)}`);
-    info(`provider   ${manifest.provider}${manifest.baseUrl ? c.d(`  ${manifest.baseUrl}`) : ''}`);
-    info(`model      ${manifest.model}`);
-    if (process.env[name]) {
-      ok(`set — ${fingerprint(process.env[name])} from ${source}`);
-    } else {
-      warn('not set');
-      info(`set it:  jr-arch key <your-key>`);
-      info(`or export ${name} in your shell`);
+    // Every variable the manifest references, not just the default one. With
+    // per-tier models a run can need several keys, and "the key is set" is a
+    // useless answer when the tier that fails is the one missing its own.
+    const needed = keyEnvs(manifest);
+    for (const varName of needed) {
+      const tiers = (manifest.agents ?? []).filter((t) => modelFor(manifest, t).keyEnv === varName);
+      const used = tiers.length && needed.length > 1 ? c.d(`  ${tiers.join(', ')}`) : '';
+      if (process.env[varName]) {
+        ok(`${c.c(varName.padEnd(22))}${fingerprint(process.env[varName])} ${c.d(`from ${keySource(varName)}`)}${used}`);
+      } else {
+        warn(`${c.c(varName.padEnd(22))}not set${used}`);
+      }
+    }
+    if (!needed.every((n) => process.env[n])) {
+      console.log();
+      info(`set one:  jr-arch key <your-key>${needed.length > 1 ? '  --env <NAME>' : ''}`);
     }
     console.log();
     return;

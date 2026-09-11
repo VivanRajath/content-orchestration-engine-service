@@ -34,6 +34,20 @@ agents:
   - junior-dev
   - ui-editor
 
+# Per-tier model overrides. Delete this block to run one model everywhere.
+# Anything a tier does not name is inherited from model: above, so a tier can
+# change just the model and keep your provider and key.
+#
+# tiers:
+#   junior-dev:
+#     model:
+#       provider: openai
+#       name: gpt-4o-mini
+#       api_key_env: OPENAI_API_KEY     # jr-arch key --env OPENAI_API_KEY <k>
+#   senior-dev:
+#     model:
+#       name: claude-opus-4-1           # same provider, same key, bigger model
+
 routing:
   entry: auto                  # auto | build-doctor | senior-dev | junior-dev | ui-editor
   junior_retry_limit: 2
@@ -41,6 +55,9 @@ routing:
   diff_line_ceiling: 400
   max_steps: 40                # tool calls per attempt; a loop on a failing
                                # test burns your key quietly without a ceiling
+  context_budget: 6000         # characters of compiled handoff context. The
+                               # successor gets a record, never a transcript —
+                               # task and objective are never trimmed away.
   classifier_confidence_floor: 0.6
   # If the model fails the capability probe, collapse to one agent
   # instead of thrashing through the ladder.

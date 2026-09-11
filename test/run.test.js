@@ -20,10 +20,22 @@ import { TEMPLATES } from '../src/paths.js';
 let seq = 0;
 const nextId = () => `call_${++seq}`;
 
-/** A model that replays a fixed script of turns, one per call. */
-function scripted(turns) {
+/**
+ * A model that replays a fixed script of turns, one per call.
+ *
+ * Handoff-report calls are answered separately and do not consume a scripted
+ * turn: the report is harness infrastructure, not part of the task the test is
+ * describing, and threading a canned report through every script would make
+ * each case unreadable. `reports` records them so a test can assert on them.
+ */
+function scripted(turns, report = {}) {
   const calls = [];
+  const reports = [];
   const fn = async (_manifest, req) => {
+    if (/handing it to someone else/.test(req.system ?? '')) {
+      reports.push({ ...req, messages: [...req.messages] });
+      return { text: JSON.stringify(report), toolCalls: [], stopReason: 'end_turn' };
+    }
     // Snapshot the message list. attempt() mutates one array across turns, so
     // storing the request by reference would make every recorded call show the
     // transcript's final state rather than what this turn actually saw.
@@ -37,6 +49,7 @@ function scripted(turns) {
     };
   };
   fn.calls = calls;
+  fn.reports = reports;
   return fn;
 }
 
@@ -190,21 +203,44 @@ describe('the loop', () => {
     });
   });
 
-  test('the handoff brief carries the failed diff, not just the task', async () => {
+  // The brief is compiled from the ledger, not replayed from the transcript.
+  // Raw diffs deliberately do NOT travel — replaying them is the cost this is
+  // built to avoid. What must travel is whatever rules an approach out.
+  test('the handoff brief is a compiled record, not a transcript', async () => {
     const box = sandbox();
     await inRepo(box, async () => {
       const call = scripted([
         { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 42;\n' })] },
         { tools: [tool('handoff', { to: 'senior-dev', reason: 'out of my depth' })] },
         { tools: [tool('done', { summary: 'handled' })] },
-      ]);
+      ], { approach: 'renamed the export to 42', next: 'try the config layer instead' });
       await run(['do the thing'], {}, { call });
 
       const seniorBrief = call.calls[2].messages[0].content;
       assert.match(seniorBrief, /Task \(unmodified\)/);
+      assert.match(seniorBrief, /do the thing/);
       assert.match(seniorBrief, /out of my depth/);
-      assert.match(seniorBrief, /Diffs already attempted/);
-      assert.match(seniorBrief, /42/, 'the failed diff must travel with the handoff');
+      assert.match(seniorBrief, /ruled out/, 'the failed approach must travel');
+      assert.match(seniorBrief, /renamed the export to 42/);
+      assert.match(seniorBrief, /index\.js/, 'files the harness saw written must travel');
+      assert.ok(!seniorBrief.includes('```diff'), 'raw diffs must not be replayed');
+    });
+  });
+
+  test('the handoff report is a separate call from the task turn', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const call = scripted([
+        { tools: [tool('write_file', { path: 'index.js', content: 'export const a = 7;\n' })] },
+        { tools: [tool('handoff', { to: 'senior-dev', reason: 'not mine' })] },
+        { tools: [tool('done', { summary: 'ok' })] },
+      ]);
+      await run(['a task'], {}, { call });
+
+      assert.equal(call.reports.length, 1, 'exactly one handoff report per handoff');
+      // Asking for the work and the report in one prompt biases both.
+      assert.ok(!call.reports[0].tools, 'the report call must not carry tools');
+      assert.match(call.reports[0].messages[0].content, /junior-dev/);
     });
   });
 
