@@ -24,11 +24,38 @@ import { globToRegExp, normalizePath } from './hooks.js';
  *   priority: 2                  lower numbers claim work first
  *   owns: ["**\/*.test.js"]       glob scope; omitted means "anything"
  *   parallel: true               may run alongside other agents
+ *   escalates_to: senior-dev     who takes over when it runs out of attempts
+ *   terminal: true               instead: stop and ask the human
+ *   fixes_build: true            a red build routes here before anything else
+ *   attempts: 2                  tries before it escalates
  *   model: gpt-4o-mini           optional, overrides agent.yaml for this agent
  *   ---
  */
 
 const DEFAULTS = { priority: 50, parallel: false, owns: [], model: null };
+
+/**
+ * Who an agent hands to when it is out of attempts.
+ *
+ * Declared by the agent (`escalates_to`), not by the harness. The old version
+ * of this was a lookup table of the four names this scaffold happens to ship,
+ * which meant a user's own agent could never be escalated to — it was not in
+ * the table. An agent that declares `terminal: true` escalates to the human.
+ *
+ * With neither declared the next agent by priority takes it, which is the
+ * behaviour someone gets for free by ordering their agents sensibly.
+ */
+export function escalatesTo(agent, agents) {
+  if (agent.terminal) return null;
+  if (agent.escalatesTo) {
+    const named = agents.find((a) => a.name === agent.escalatesTo);
+    // A named successor that is not installed is a dead end, not a silent
+    // fallthrough to somebody else's agent.
+    return named && named.name !== agent.name ? named.name : null;
+  }
+  const after = agents.filter((a) => a.priority > agent.priority);
+  return after.length ? after[0].name : null;
+}
 
 /** Split `---` front matter off a Markdown file. Returns {meta, body}. */
 export function frontMatter(text, source = 'SOUL.md') {
@@ -73,6 +100,13 @@ export function readAgents(dir = agentDir()) {
       parallel: meta.parallel === true,
       owns: list(meta.owns),
       model: str(meta.model) || null,
+      escalatesTo: str(meta.escalates_to) || null,
+      terminal: meta.terminal === true,
+      // Declared, not inferred from a name. DUTIES entry rule 1 routes a red
+      // build here, and "the agent called build-doctor" only works for repos
+      // that happen to use the default pack's names.
+      fixesBuild: meta.fixes_build === true,
+      attempts: num(meta.attempts, null),
       provider: str(meta.provider) || null,
       keyEnv: str(meta.api_key_env) || null,
       hasRules: existsSync(join(base, entry.name, 'RULES.md')),
@@ -90,6 +124,11 @@ const list = (v) => (Array.isArray(v) ? v.map(String) : typeof v === 'string' ? 
 
 export function findAgent(name, agents) {
   return agents.find((a) => a.name === name) ?? null;
+}
+
+/** The agent a red build routes to, if any is installed that claims to fix them. */
+export function buildFixer(agents) {
+  return agents.find((a) => a.fixesBuild) ?? null;
 }
 
 // ---------------------------------------------------------------------------

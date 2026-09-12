@@ -1,16 +1,19 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, realpathSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, realpathSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { personas } from '../src/personas.js';
+import { readAgents } from '../src/agents.js';
 import { readManifest } from '../src/config.js';
 import { TEMPLATES } from '../src/paths.js';
 
 /**
- * A persona directory on its own does nothing: agent.yaml decides which tiers
- * exist, and DUTIES.md is the contract the loop reads back to the model. These
- * tests are about the wiring, not the files.
+ * Adding and removing agents.
+ *
+ * The directory is the only thing that installs an agent. There is no manifest
+ * list and no DUTIES table to keep in step — those were a second source of
+ * truth, and two sources drift.
  */
 async function inRepo(fn) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'jra-personas-')));
@@ -26,78 +29,93 @@ async function inRepo(fn) {
   }
 }
 
-const manifestOf = (root) => readManifest(join(root, '.gitagent', 'agent.yaml'));
-const dutiesOf = (root) => readFileSync(join(root, '.gitagent', 'DUTIES.md'), 'utf8');
-const tierRows = (text) => text.split('\n').filter((l) => /^\| `/.test(l));
+const names = () => readAgents().map((a) => a.name);
+const agentDirOf = (root, name) => join(root, '.gitagent', 'agents', name);
 
 describe('personas add', () => {
-  test('adds the tier to agent.yaml', async () => {
+  test('creating the folder is what installs the agent', async () => {
     await inRepo(async (root) => {
       await personas(['add', 'reviewer'], {});
-      assert.ok(manifestOf(root).agents.includes('reviewer'));
+      assert.ok(existsSync(join(agentDirOf(root, 'reviewer'), 'SOUL.md')));
+      assert.ok(names().includes('reviewer'));
     });
   });
 
-  test('adds a row to the DUTIES.md tier table', async () => {
+  // The list in agent.yaml was removed; readAgents reads the directory.
+  test('the manifest is not touched', async () => {
     await inRepo(async (root) => {
+      const file = join(root, '.gitagent', 'agent.yaml');
+      const before = readFileSync(file, 'utf8');
       await personas(['add', 'reviewer'], {});
-      const rows = tierRows(dutiesOf(root));
-      assert.equal(rows.length, 5);
-      assert.match(rows.at(-1), /^\| `reviewer` \|/);
+      assert.equal(readFileSync(file, 'utf8'), before);
+      assert.deepEqual(readManifest(file).agents, []);
     });
   });
 
-  // The tier name also appears in the escalation prose below the table. A
-  // file-wide replace would rewrite the sentences defining the handoff graph.
-  test('leaves the escalation prose untouched', async () => {
+  test('DUTIES.md is not touched', async () => {
     await inRepo(async (root) => {
-      const before = dutiesOf(root);
+      const file = join(root, '.gitagent', 'DUTIES.md');
+      const before = readFileSync(file, 'utf8');
       await personas(['add', 'reviewer'], {});
-      const after = dutiesOf(root);
-      for (const line of before.split('\n').filter((l) => l.startsWith('- **'))) {
-        assert.ok(after.includes(line), `escalation rule was altered: ${line}`);
-      }
+      assert.equal(readFileSync(file, 'utf8'), before);
     });
   });
 
-  test('adding twice does not duplicate the entry', async () => {
-    await inRepo(async (root) => {
+  test('the blank agent declares the fields the loop reads', async () => {
+    await inRepo(async () => {
       await personas(['add', 'reviewer'], {});
-      await personas(['add', 'reviewer'], { force: true });
-      const agents = manifestOf(root).agents.filter((a) => a === 'reviewer');
-      assert.equal(agents.length, 1);
-      assert.equal(tierRows(dutiesOf(root)).filter((r) => r.includes('reviewer')).length, 1);
+      const [made] = readAgents().filter((a) => a.name === 'reviewer');
+      assert.equal(made.priority, 50);
+      assert.equal(made.parallel, false);
+      assert.deepEqual(made.owns, []);
+      assert.equal(made.terminal, false);
+    });
+  });
+
+  test('an existing agent is not clobbered without --force', async () => {
+    await inRepo(async () => {
+      await assert.rejects(() => personas(['add', 'junior-dev'], {}), /already exists/);
     });
   });
 });
 
 describe('personas remove', () => {
-  test('removes from both files', async () => {
+  test('deleting the folder uninstalls the agent', async () => {
     await inRepo(async (root) => {
       await personas(['add', 'reviewer'], {});
       await personas(['remove', 'reviewer'], {});
-      assert.ok(!manifestOf(root).agents.includes('reviewer'));
-      assert.equal(tierRows(dutiesOf(root)).length, 4);
+      assert.ok(!existsSync(agentDirOf(root, 'reviewer')));
+      assert.ok(!names().includes('reviewer'));
     });
   });
 
-  test('a full add/remove round trip restores the tier table', async () => {
+  test('a full add/remove round trip leaves the scaffold as it was', async () => {
     await inRepo(async (root) => {
-      const before = dutiesOf(root);
+      const manifest = join(root, '.gitagent', 'agent.yaml');
+      const duties = join(root, '.gitagent', 'DUTIES.md');
+      const before = [readFileSync(manifest, 'utf8'), readFileSync(duties, 'utf8'), names()];
+
       await personas(['add', 'reviewer'], {});
       await personas(['remove', 'reviewer'], {});
-      assert.equal(dutiesOf(root), before);
+
+      assert.equal(readFileSync(manifest, 'utf8'), before[0]);
+      assert.equal(readFileSync(duties, 'utf8'), before[1]);
+      assert.deepEqual(names(), before[2]);
     });
   });
 
-  // An agents list with nothing in it would leave the classifier no tier to
-  // route to at all.
-  test('refuses to empty the agents list', async () => {
-    await inRepo(async (root) => {
-      for (const t of ['build-doctor', 'senior-dev', 'junior-dev', 'ui-editor']) {
-        await personas(['remove', t], {});
-      }
-      assert.ok(manifestOf(root).agents.length >= 1, 'agent.yaml was left with no agents');
+  // Zero agents is a real state the loop refuses to run in, not something to
+  // paper over by pretending the defaults are still there.
+  test('every agent can be removed, leaving none', async () => {
+    await inRepo(async () => {
+      for (const name of names()) await personas(['remove', name], {});
+      assert.deepEqual(names(), []);
+    });
+  });
+
+  test('removing something absent is an error, not a silent pass', async () => {
+    await inRepo(async () => {
+      await assert.rejects(() => personas(['remove', 'ghost'], {}), /No persona/);
     });
   });
 });

@@ -55,7 +55,7 @@ function scripted(turns, report = {}) {
 
 const tool = (name, input) => [name, input];
 
-function sandbox({ scripts = { test: 'node -e "process.exit(0)"' }, files = {}, manifest = {} } = {}) {
+function sandbox({ scripts = { test: 'node -e "process.exit(0)"' }, files = {}, manifest = {}, agentEdits = {} } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'jra-run-')));
   const git = (...a) => execFileSync('git', a, { cwd: root, stdio: 'pipe' });
 
@@ -77,6 +77,13 @@ function sandbox({ scripts = { test: 'node -e "process.exit(0)"' }, files = {}, 
   let text = readFileSync(file, 'utf8').replace('entry: auto', 'entry: junior-dev');
   for (const [from, to] of Object.entries(manifest)) text = text.replace(from, to);
   writeFileSync(file, text);
+
+  // An agent's attempt budget, scope and escalation live in its own front
+  // matter now, so a test that needs a different budget edits the agent.
+  for (const [name, [from, to]] of Object.entries(agentEdits)) {
+    const soul = join(dir, 'agents', name, 'SOUL.md');
+    writeFileSync(soul, readFileSync(soul, 'utf8').replace(from, to));
+  }
 
   // What init writes. Without it .gitagent/.session/ is untracked, and the
   // dirty-tree guard would fire on the agent's own transcript.
@@ -101,23 +108,48 @@ async function inRepo(box, fn) {
 }
 
 describe('escalate', () => {
-  const all = ['build-doctor', 'junior-dev', 'ui-editor', 'senior-dev'];
+  // The agent decides, in its own front matter. Nothing in the harness knows
+  // the default names, so a user's own agent can be escalated to.
+  const agent = (name, priority, over = {}) => ({ name, priority, owns: [], parallel: false, ...over });
+  const defaults = [
+    agent('build-doctor', 0, { terminal: true }),
+    agent('junior-dev', 20, { escalatesTo: 'senior-dev' }),
+    agent('ui-editor', 20, { escalatesTo: 'junior-dev' }),
+    agent('senior-dev', 40, { terminal: true }),
+  ];
 
-  test('ui-editor hands sideways to its peer, not up to senior', () => {
-    assert.equal(escalate('ui-editor', all), 'junior-dev');
+  test('an agent hands to whoever it names', () => {
+    assert.equal(escalate('ui-editor', defaults), 'junior-dev');
+    assert.equal(escalate('junior-dev', defaults), 'senior-dev');
   });
 
-  test('junior-dev escalates to senior-dev', () => {
-    assert.equal(escalate('junior-dev', all), 'senior-dev');
+  // There is nothing above it, and looping is worse than asking.
+  test('terminal: true escalates to the human', () => {
+    assert.equal(escalate('senior-dev', defaults), null);
+    assert.equal(escalate('build-doctor', defaults), null);
   });
 
-  // There is nothing above senior, and looping is worse than asking.
-  test('senior-dev is terminal', () => {
-    assert.equal(escalate('senior-dev', all), null);
+  test('with nothing declared, the next agent by priority takes it', () => {
+    const plain = [agent('first', 10), agent('second', 20), agent('third', 30)];
+    assert.equal(escalate('first', plain), 'second');
+    assert.equal(escalate('second', plain), 'third');
+    assert.equal(escalate('third', plain), null, 'the last agent has nobody above it');
   });
 
-  test('an uninstalled next tier falls back to senior-dev', () => {
-    assert.equal(escalate('ui-editor', ['ui-editor', 'senior-dev']), 'senior-dev');
+  // A name that is not installed is a dead end, not a silent fallthrough to
+  // somebody else's agent.
+  test('naming an uninstalled agent stops rather than guessing', () => {
+    const one = [agent('solo', 10, { escalatesTo: 'ghost' })];
+    assert.equal(escalate('solo', one), null);
+  });
+
+  test('a user agent nobody hard-coded can be escalated to', () => {
+    const mine = [agent('scout', 10, { escalatesTo: 'archivist' }), agent('archivist', 90)];
+    assert.equal(escalate('scout', mine), 'archivist');
+  });
+
+  test('an unknown agent name routes nowhere', () => {
+    assert.equal(escalate('nobody', defaults), null);
   });
 });
 
@@ -380,7 +412,8 @@ describe('the idle guard', () => {
     // One attempt only, so `detail` reports this failure rather than the
     // retry's.
     const box = sandbox({
-      manifest: { 'entry: junior-dev': 'entry: senior-dev', 'senior_retry_limit: 2': 'senior_retry_limit: 1' },
+      manifest: { 'entry: junior-dev': 'entry: senior-dev' },
+      agentEdits: { 'senior-dev': ['terminal: true', ['attempts: 1', 'terminal: true'].join('\n')] },
     });
     await inRepo(box, async () => {
       const call = scripted([

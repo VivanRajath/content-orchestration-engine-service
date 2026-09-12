@@ -3,7 +3,6 @@ import { join } from 'node:path';
 import { agentDir } from './paths.js';
 import { fetchPack, confine } from './pack.js';
 import { readAgents } from './agents.js';
-import { readManifest, patchSequence } from './config.js';
 import { c, ok, info, warn } from './util.js';
 
 function tiersDir() {
@@ -14,13 +13,17 @@ function tiersDir() {
 
 const BLANK_SOUL = (name) => `---
 name: ${name}
-tier: 1
 role: TODO — one line
+priority: 50              # lower numbers claim work first
+parallel: false           # true only if \`owns\` is set and does not overlap
+owns: []                  # globs this agent claims; empty means anything
+# escalates_to: other-agent   who takes over when this one runs out of attempts
+# terminal: true              instead: stop and ask the human
 ---
 
 # ${name}
 
-What this tier owns, and why it exists as its own tier.
+What this agent owns, and why it exists separately from the others.
 
 ## How you work
 
@@ -28,7 +31,7 @@ What this tier owns, and why it exists as its own tier.
 
 ## Boundary
 
-When to hand off, and to whom. Add the matching entry to ../../DUTIES.md.
+When to hand off, and to whom.
 `;
 
 const BLANK_RULES = (name) => `# Rules — ${name}
@@ -102,12 +105,11 @@ export async function personas(positional, flags) {
       ok(`Created ${c.c(name)}`);
     }
 
+    // Nothing else to wire. The directory is what installs an agent, and its
+    // own front matter is where priority, scope and escalation live — there is
+    // no manifest list and no table to keep in step.
     console.log();
-    wire(name, 'add', roleOf(dest));
-    // The table row is mechanical; the escalation rule is a decision about who
-    // this tier hands to and when, and writing a guess into the contract file
-    // would be worse than leaving the gap visible.
-    info(`write its escalation rule in ${c.c('.gitagent/DUTIES.md')} — who does it hand to, and when?`);
+    info(`set its priority, owns and escalates_to in ${c.c(`agents/${name}/SOUL.md`)}`);
     console.log();
     return;
   }
@@ -118,108 +120,8 @@ export async function personas(positional, flags) {
     if (!existsSync(dest)) throw new Error(`No persona "${name}".`);
     rmSync(dest, { recursive: true, force: true });
     ok(`Removed ${name}`);
-    console.log();
-    wire(name, 'remove');
-    console.log();
     return;
   }
 
   throw new Error(`Unknown personas action "${action}". Use list, add, or remove.`);
-}
-
-// ---------------------------------------------------------------------------
-// Wiring a persona into the manifest and the contract
-// ---------------------------------------------------------------------------
-
-/**
- * A persona directory on its own does nothing.
- *
- * `agent.yaml` decides which tiers exist — the classifier refuses to route to
- * one that is not listed — and `DUTIES.md` is the contract the run loop reads
- * back to the model. Printing "now go and edit these two files" left a persona
- * that looked installed and was not, which is the worst of both.
- */
-export function wire(name, action, role = '') {
-  const dir = agentDir();
-  patchAgents(join(dir, 'agent.yaml'), name, action);
-  patchDuties(join(dir, 'DUTIES.md'), name, action, role);
-}
-
-function patchAgents(file, name, action) {
-  if (!existsSync(file)) return;
-  const text = readFileSync(file, 'utf8');
-  const current = readManifest(file).agents.map(String);
-  const next = action === 'add'
-    ? (current.includes(name) ? current : [...current, name])
-    : current.filter((a) => a !== name);
-
-  if (next.length === current.length && action === 'add') {
-    info(`${c.d('agent.yaml')}  already lists ${name}`);
-    return;
-  }
-  if (!next.length) {
-    warn('agent.yaml would be left with no agents — leaving it alone.');
-    return;
-  }
-  writeFileSync(file, patchSequence(text, 'agents', next));
-  ok(`${c.d('agent.yaml')}  ${action === 'add' ? 'added' : 'removed'} ${c.c(name)}`);
-}
-
-/**
- * Insert or drop the tier's row in the DUTIES.md table.
- *
- * Scoped to the table under `## Tiers` rather than matched file-wide: the tier
- * name also appears in the escalation prose below it, and a loose replace
- * would rewrite the sentences that define the handoff graph. Same failure the
- * `metadata:`/`model:` bug had, in a different file.
- */
-function patchDuties(file, name, action, role) {
-  if (!existsSync(file)) return;
-  const lines = readFileSync(file, 'utf8').split('\n');
-
-  // DUTIES.md is a default, not a requirement, so a repo that rewrote or
-  // deleted it is normal rather than broken. Nothing to patch and nothing to
-  // warn about — an agent's scope really lives in its own SOUL.md.
-  const head = lines.findIndex((l) => /^##\s+(Agents|Tiers)\b/.test(l));
-  if (head === -1) return;
-  const end = lines.findIndex((l, i) => i > head && /^##\s/.test(l));
-  const stop = end === -1 ? lines.length : end;
-
-  const isRow = (l) => /^\|/.test(l.trim()) && !/^\|\s*-+/.test(l.trim());
-  const rows = [];
-  for (let i = head + 1; i < stop; i++) if (isRow(lines[i])) rows.push(i);
-  if (rows.length < 2) {
-    warn('DUTIES.md tier table not recognised — add the row yourself.');
-    return;
-  }
-
-  // A persona name is user input; escape it before it becomes a pattern.
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const owns = new RegExp(String.raw`^\|\s*` + '`?' + escaped + '`?' + String.raw`\s*\|`);
-  const existing = rows.find((i) => owns.test(lines[i].trim()));
-
-  if (action === 'remove') {
-    if (existing === undefined) return;
-    lines.splice(existing, 1);
-    writeFileSync(file, lines.join('\n'));
-    ok(`${c.d('DUTIES.md')}   removed the ${c.c(name)} row`);
-    return;
-  }
-
-  if (existing !== undefined) {
-    info(`${c.d('DUTIES.md')}   already describes ${name}`);
-    return;
-  }
-  const row = `| \`${name}\` | ${role || 'TODO — what this tier owns'} | TODO — what it never does |`;
-  lines.splice(rows[rows.length - 1] + 1, 0, row);
-  writeFileSync(file, lines.join('\n'));
-  ok(`${c.d('DUTIES.md')}   added the ${c.c(name)} row`);
-}
-
-/** The one-line role from a persona's SOUL.md front matter, if it has one. */
-function roleOf(dir) {
-  const soul = join(dir, 'SOUL.md');
-  if (!existsSync(soul)) return '';
-  const m = readFileSync(soul, 'utf8').match(/^role:\s*(.+)$/m);
-  return m ? m[1].trim() : '';
 }

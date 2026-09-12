@@ -57,6 +57,14 @@ throwaway repo before trusting it on anything else.
 
 ## Decisions already made — do not relitigate without reason
 
+**No default agent name appears in executable code.** Not in `classify.js`, not
+in `run.js`, not in `DUTIES.md`, not in `agent.yaml`. Every routing decision an
+agent used to be looked up for is now something the agent DECLARES, in its own
+front matter: `priority`, `owns`, `parallel`, `escalates_to`, `terminal`,
+`fixes_build`, `attempts`. `test/custom-agents.test.js` is a repo whose agents
+are called medic / scout / archivist, and it exists to keep it that way — if a
+name creeps back into the code, that file fails.
+
 **The four tiers are a DEFAULT PACK, not the product.** Users install whatever
 agents they want from wherever they want. Nothing may assume a fixed set, a
 fixed count, or a fixed ladder. `readAgents()` reads the directory; twelve
@@ -69,10 +77,16 @@ stops a pulled agent's own file from being the thing that defines it. Shared
 constraints live in `hooks/`, which is enforced rather than suggested. This was
 a deliberate removal, not an oversight — do not add a root identity file back.
 
-**An agent describes itself.** Priority, scope (`owns`), and appetite for
-parallelism are front matter in the agent's own SOUL.md, not harness config.
-The directory is what installs it: no registry entry, no manifest list to keep
-in sync, and deleting the folder uninstalls it.
+**An agent describes itself.** Priority, scope, parallelism, who it escalates
+to, whether it is terminal, whether it repairs builds, and how many attempts it
+gets are all front matter in the agent's own SOUL.md — not harness config. The
+directory is what installs it: no registry entry, no manifest list to keep in
+sync, and deleting the folder uninstalls it.
+
+**There is no `agents:` list in `agent.yaml`.** `readAgents()` reads the
+directory. A manifest list that has to agree with the filesystem is a second
+source of truth and the two drift — which is exactly what happened once the run
+loop started reading the directory and everything else kept reading the list.
 
 **A failed agent rolls back its own files and nothing else.** `revertAttempt`
 restores only what the attempt touched — `git checkout <sha> -- <path>` for
@@ -229,11 +243,11 @@ section was omitted assumes the record is complete.
 one shape to speak. Carrying a base_url across a provider change points an
 Anthropic tier at an OpenAI-compatible endpoint and fails unreadably.
 
-**DUTIES.md is a default, not a requirement.** It describes the four agents
-this scaffold ships with. The loop passes whatever is there and passes nothing
-when the file is gone — what an agent owns and when it hands off really lives
-in its own SOUL.md and RULES.md. Code that treats a missing or rewritten
-DUTIES.md as an error is wrong.
+**DUTIES.md names no agent.** It is the protocol — entry, escalation, what
+travels with a handoff, what a human checkpoint is — and nothing else. Which
+agents exist and what each one does is theirs to declare. The loop passes
+whatever is there and passes nothing when the file is gone, so code that treats
+a missing or rewritten DUTIES.md as an error is wrong.
 
 **`doctor` fails at setup, not mid-task.** The tier ladder needs strict JSON and
 tool calling. Small local models often give neither and the ladder degrades into
@@ -265,11 +279,6 @@ Templates are copied wholesale by `cpSync(TEMPLATES, dir, {recursive:true})`
 except under `--minimal` and `--from`. Adding a template file automatically
 ships it; the `MINIMAL` array in `init.js` is the only place needing a manual
 update.
-
-`personas` patches the DUTIES.md tier table scoped to the `## Tiers` section.
-The tier name also appears in the escalation prose below it, and a file-wide
-replace would rewrite the sentences defining the handoff graph — the
-`metadata:`/`model:` bug again, in a different file.
 
 A resumed run reuses the prior session's branch. Branching again would strand
 the earlier attempts on a branch nobody looks at, which is the opposite of why
@@ -311,6 +320,8 @@ Two repos:
 ## Next
 
 1. **A live-model run on a throwaway repo.** Nothing here has met a real model.
+2. `routing.entry` still names one agent, so a repo that renames its agents has
+   to update it. Everything else routes by declaration now.
 2. Swarm currently fans out to one group and does not escalate: a failed agent
    rolls back and stops rather than handing to another. The ladder and the
    swarm are still two paths through `run()`. Nothing here has met a real model;

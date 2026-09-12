@@ -3,6 +3,9 @@ name: build-doctor
 role: Diagnose and repair broken builds
 priority: 0
 parallel: false
+fixes_build: true       # a red build routes here before anything else
+attempts: 3
+terminal: true          # a build it cannot fix is the human's call, not another agent's
 ---
 
 # Build Doctor

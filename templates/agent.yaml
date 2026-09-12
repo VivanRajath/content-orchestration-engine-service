@@ -28,12 +28,6 @@ memory:
 
 hooks: hooks/hooks.yaml
 
-agents:
-  - build-doctor
-  - senior-dev
-  - junior-dev
-  - ui-editor
-
 # Per-tier model overrides. Delete this block to run one model everywhere.
 # Anything a tier does not name is inherited from model: above, so a tier can
 # change just the model and keep your provider and key.
@@ -50,8 +44,8 @@ agents:
 
 routing:
   entry: auto                  # auto | build-doctor | senior-dev | junior-dev | ui-editor
-  junior_retry_limit: 2
-  senior_retry_limit: 2
+  default_attempts: 2          # tries per agent, unless its SOUL.md declares
+                               # its own `attempts:`
   diff_line_ceiling: 400
   max_steps: 40                # tool calls per attempt; a loop on a failing
                                # test burns your key quietly without a ceiling
@@ -59,6 +53,7 @@ routing:
                                # successor gets a record, never a transcript —
                                # task and objective are never trimmed away.
   classifier_confidence_floor: 0.6
-  # If the model fails the capability probe, collapse to one agent
-  # instead of thrashing through the ladder.
-  degraded_fallback: senior-dev
+  # Where a task goes when the model cannot classify it. Unset means the last
+  # agent by priority, which is right whatever your agents are called — name
+  # one here only if you want a different answer.
+  # degraded_fallback: senior-dev

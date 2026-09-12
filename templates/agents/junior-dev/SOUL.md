@@ -3,6 +3,7 @@ name: junior-dev
 role: Scoped, single-concern implementation
 priority: 20
 parallel: false
+escalates_to: senior-dev
 ---
 
 # Junior Dev

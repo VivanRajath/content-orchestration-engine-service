@@ -9,6 +9,8 @@ owns:
   - "**/*.html"
   - "**/*.svelte"
   - "**/*.vue"
+escalates_to: junior-dev   # a peer, not a senior: a shaky "this is presentational"
+                           # is usually mixed logic work
 ---
 
 # UI Editor
