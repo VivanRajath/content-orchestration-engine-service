@@ -284,6 +284,11 @@ A resumed run reuses the prior session's branch. Branching again would strand
 the earlier attempts on a branch nobody looks at, which is the opposite of why
 someone resumes.
 
+The version is read from `package.json` at startup, never typed into
+`bin/jr-arch.js`. The two drifted the first time the package was bumped, and
+0.1.1 shipped reporting `--version 0.1.0`. npm always includes package.json in
+the tarball, so the read works in an installed copy.
+
 Boolean flags live in a `BOOLEAN` set in `bin/jr-arch.js`. Without it the
 parser reads the next token as the flag's value, so `run --dry-run "add a
 thing"` silently loses the task. A hand-rolled parser cannot infer arity — new

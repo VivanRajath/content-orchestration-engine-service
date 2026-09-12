@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { init } from '../src/init.js';
 import { config, readManifest } from '../src/config.js';
 import { personas } from '../src/personas.js';
@@ -10,6 +13,22 @@ import { loadEnv, key } from '../src/env.js';
 import { addAgent, addGuard } from '../src/add.js';
 import { chat } from '../src/chat.js';
 import { c } from '../src/util.js';
+
+/**
+ * The one place the version lives is package.json.
+ *
+ * It used to be typed here as well, and the two drifted the first time the
+ * package was bumped — a published 0.1.1 whose `--version` still said 0.1.0.
+ * npm always ships package.json, so this resolves in an installed copy too.
+ */
+const VERSION = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')).version;
+  } catch {
+    return 'unknown';
+  }
+})();
 
 const HELP = `
 ${c.b('jr-arch')} — Jr Architect coding agent in your terminal
@@ -93,23 +112,23 @@ loadEnv();
 
 try {
   switch (cmd) {
-    case 'init':     await init(flags); break;
-    case 'config':   await config(positional, flags); break;
-    case 'agents':     await personas(['list', ...positional], flags); break;
-    case 'personas':   await personas(positional, flags); break;
-    case 'run':        await run(positional, flags); break;
-    case 'add-agent':  await addAgent(positional, flags); break;
-    case 'add-guard':  await addGuard(positional, flags); break;
-    case 'chat':       await chat(positional, flags); break;
-    case 'detect':   await detect(positional, flags); break;
-    case 'key':      await key(positional, flags, { manifest: readManifest() }); break;
-    case 'pull':     await pull(positional, flags); break;
-    case 'doctor':   await doctor(flags); break;
+    case 'init':      await init(flags); break;
+    case 'run':       await run(positional, flags); break;
+    case 'chat':      await chat(positional, flags); break;
+    case 'add-agent': await addAgent(positional, flags); break;
+    case 'add-guard': await addGuard(positional, flags); break;
+    case 'agents':    await personas(['list', ...positional], flags); break;
+    case 'personas':  await personas(positional, flags); break;
+    case 'key':       await key(positional, flags, { manifest: readManifest() }); break;
+    case 'config':    await config(positional, flags); break;
+    case 'detect':    await detect(positional, flags); break;
+    case 'pull':      await pull(positional, flags); break;
+    case 'doctor':    await doctor(flags); break;
     case '-v':
-    case '--version': console.log('0.1.0'); break;
-    case undefined:  await chat(positional, flags); break;
+    case '--version': console.log(VERSION); break;
+    case undefined:   await chat(positional, flags); break;
     case '-h':
-    case '--help':   console.log(HELP); break;
+    case '--help':    console.log(HELP); break;
     default:
       console.error(c.r(`Unknown command: ${cmd}`));
       console.log(HELP);
