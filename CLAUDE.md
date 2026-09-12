@@ -319,15 +319,15 @@ Two repos:
 
 ## Next
 
-1. **A live-model run on a throwaway repo.** Nothing here has met a real model.
+1. **A live-model run on a throwaway repo.** Nothing here has met a real model;
+   every path is exercised with an injected scripted one.
 2. `routing.entry` still names one agent, so a repo that renames its agents has
    to update it. Everything else routes by declaration now.
-2. Swarm currently fans out to one group and does not escalate: a failed agent
-   rolls back and stops rather than handing to another. The ladder and the
-   swarm are still two paths through `run()`. Nothing here has met a real model;
-   the ladder is exercised with an injected scripted one.
-2. `doctor` should probe every key in `keyEnvs(manifest)`, not only the default
-   one — a per-tier key that is missing currently fails mid-run.
-3. `jr-arch sessions` to list and inspect past runs.
-4. Token accounting per attempt, per model, in the transcript. With per-tier
-   models the cost question is now "which tier spent it".
+3. Swarm fans out to one group and does not escalate: a failed agent rolls back
+   and stops rather than handing to another. The ladder and the swarm are still
+   two paths through `run()`.
+4. `doctor` probes only the default key, not every name in `keyEnvs(manifest)`,
+   so a missing per-agent key fails mid-run instead of at setup.
+5. `jr-arch sessions` to list and inspect past runs.
+6. Token accounting per attempt, per model, in the transcript. With per-agent
+   models the cost question is now "which agent spent it".
