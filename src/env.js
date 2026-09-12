@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { keyEnvs, modelFor } from './config.js';
+import { readAgents } from './agents.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -160,7 +161,7 @@ export async function key(positional, flags, { manifest }) {
     // useless answer when the tier that fails is the one missing its own.
     const needed = keyEnvs(manifest);
     for (const varName of needed) {
-      const tiers = (manifest.agents ?? []).filter((t) => modelFor(manifest, t).keyEnv === varName);
+      const tiers = readAgents().map((a) => a.name).filter((t) => modelFor(manifest, t).keyEnv === varName);
       const used = tiers.length && needed.length > 1 ? c.d(`  ${tiers.join(', ')}`) : '';
       if (process.env[varName]) {
         ok(`${c.c(varName.padEnd(22))}${fingerprint(process.env[varName])} ${c.d(`from ${keySource(varName)}`)}${used}`);

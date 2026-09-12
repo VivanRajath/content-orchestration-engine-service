@@ -14,7 +14,7 @@ import {
   record as sessionRecord,
 } from './session.js';
 import { newLedger, reconcile, compile, REPORT_SYSTEM, reportPrompt } from './context.js';
-import { readAgents, findAgent, frontMatter, swarmable, partition } from './agents.js';
+import { readAgents, findAgent, frontMatter, swarmable, partition, escalatesTo, buildFixer } from './agents.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -103,6 +103,7 @@ export async function run(positional, flags, { call = callModel } = {}) {
     buildGreen: build.green,
     files: repoFiles(root),
     manifest,
+    agents,
     dir,
     call,
   });
@@ -193,12 +194,12 @@ export async function run(positional, flags, { call = callModel } = {}) {
  * asking.
  */
 export async function ladder(ctx, { tier, task, brief: initial = null }) {
-  const limits = {
-    'junior-dev': ctx.manifest.juniorRetryLimit ?? 2,
-    'ui-editor': ctx.manifest.juniorRetryLimit ?? 2,
-    'senior-dev': ctx.manifest.seniorRetryLimit ?? 2,
-    'build-doctor': 3,
-  };
+  // How many tries an agent gets is the agent's own declaration, falling back
+  // to a single routing default. The old version was a table of the four names
+  // this scaffold ships, so a user's own agent silently got someone else's
+  // budget — or the default, whichever the name happened to miss.
+  const attemptsFor = (name) =>
+    findAgent(name, ctx.agents)?.attempts ?? ctx.manifest.defaultAttempts ?? 2;
   const used = {};
   let current = tier;
   let brief = initial ?? task;
@@ -206,7 +207,7 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
 
   while (current) {
     used[current] = (used[current] ?? 0) + 1;
-    const limit = limits[current] ?? 2;
+    const limit = attemptsFor(current);
 
     const tierModel = modelFor(ctx.manifest, current);
     const differs = tierModel.model !== ctx.manifest.model || tierModel.provider !== ctx.manifest.provider;
@@ -255,7 +256,7 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
     }
 
     if (used[current] >= limit) {
-      const next = escalate(current, ctx.tiers);
+      const next = escalate(current, ctx.agents);
       if (!next) {
         return {
           status: 'stopped',
@@ -276,16 +277,16 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
 }
 
 /**
- * Where a tier goes when it is out of attempts.
+ * Where an agent goes when it is out of attempts.
  *
- * ui-editor escalates to junior-dev, its peer, because a ui task that will not
- * resolve is usually logic work wearing a stylesheet. senior-dev returns null:
- * terminal means the human hears about it.
+ * The agent decides, in its own front matter. This used to be a lookup table
+ * of the four names the scaffold ships, which meant a user's own agent could
+ * never be escalated to — it simply was not in the table.
  */
-export function escalate(tier, tiers) {
-  const next = { 'ui-editor': 'junior-dev', 'junior-dev': 'senior-dev', 'build-doctor': 'senior-dev' }[tier] ?? null;
-  if (!next) return null;
-  return tiers.includes(next) ? next : tiers.includes('senior-dev') ? 'senior-dev' : null;
+export function escalate(name, agents) {
+  const agent = Array.isArray(agents) ? agents.find((a) => a.name === name) : null;
+  if (!agent) return null;
+  return escalatesTo(agent, agents);
 }
 
 
@@ -489,9 +490,12 @@ async function verifyAndGate(ctx) {
  * the parent frame is untouched underneath it.
  */
 async function callBuildDoctor(ctx, parent, build) {
-  if (!ctx.tiers.includes('build-doctor')) return { ok: false, build };
+  // Whichever agent declares `fixes_build`, not whichever is called
+  // "build-doctor". A repo with no such agent simply has nobody to delegate to.
+  const fixer = buildFixer(ctx.agents);
+  if (!fixer) return { ok: false, build };
 
-  console.log(c.b('▸ build-doctor') + c.d('  (nested — returns control)'));
+  console.log(c.b(`▸ ${fixer.name}`) + c.d('  (nested — returns control)'));
   const brief = [
     'The build is red. Get it green. That is the entire job.',
     '\nYou were called from a feature task in progress. Do NOT implement any part of it.',
@@ -499,13 +503,13 @@ async function callBuildDoctor(ctx, parent, build) {
     `\n## Output\n\n\`\`\`\n${build.output}\n\`\`\``,
   ].join('\n');
 
-  const frame = openAttempt(ctx.session, { tier: 'build-doctor', task: brief, parent, reason: 'red build', owns: agentOf(ctx, 'build-doctor').owns });
-  const result = await attempt(ctx, frame, brief);
+  const frame = openAttempt(ctx.session, { tier: fixer.name, task: brief, parent, reason: 'red build', owns: fixer.owns });
+  const result = await attempt({ ...ctx, agent: fixer, tierModel: modelFor(ctx.manifest, fixer.name) }, frame, brief);
   const after = verify({ root: ctx.root });
   closeAttempt(ctx.session, frame, { status: after.green ? 'done' : 'failed', verify: after });
 
-  if (after.green) ok('build-doctor: green — control returns to the calling tier');
-  else warn('build-doctor could not reach a green build');
+  if (after.green) ok(`${fixer.name}: green — control returns to the calling agent`);
+  else warn(`${fixer.name} could not reach a green build`);
   return { ok: Boolean(after.green), build: after, result };
 }
 

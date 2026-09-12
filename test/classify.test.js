@@ -5,10 +5,15 @@ import { join } from 'node:path';
 import { classify } from '../src/classify.js';
 import { readManifest } from '../src/config.js';
 import { extractJson } from '../src/provider.js';
+import { readAgents } from '../src/agents.js';
 import { TEMPLATES } from '../src/paths.js';
 
 const DUTIES = readFileSync(join(TEMPLATES, 'DUTIES.md'), 'utf8');
 const BASE = readManifest(join(TEMPLATES, 'agent.yaml'));
+
+// The roster comes from the agents directory, never from a list in the
+// manifest. Read the shipped default pack the same way the loop does.
+const AGENTS = readAgents(TEMPLATES);
 
 const manifest = (over = {}) => ({ ...BASE, ...over });
 
@@ -26,7 +31,7 @@ function stub(text) {
 const reply = (tier, confidence, reason = 'because') => JSON.stringify({ tier, confidence, reason });
 
 const run = (over, text, args = {}) =>
-  classify({ task: 'add a button', manifest: manifest(over), duties: DUTIES, call: stub(text), ...args });
+  classify({ task: 'add a button', manifest: manifest(over), agents: AGENTS, duties: DUTIES, call: stub(text), ...args });
 
 describe('readManifest reads the routing block', () => {
   test('the keys the run loop needs', () => {
@@ -39,16 +44,26 @@ describe('readManifest reads the routing block', () => {
     assert.equal(BASE.maxTokens, 8192);
     assert.equal(BASE.confidenceFloor, 0.6);
     assert.equal(BASE.diffCeiling, 400);
-    assert.equal(BASE.juniorRetryLimit, 2);
-    assert.equal(BASE.degradedFallback, 'senior-dev');
-    assert.deepEqual(BASE.agents, ['build-doctor', 'senior-dev', 'junior-dev', 'ui-editor']);
+    assert.equal(BASE.defaultAttempts, 2);
+    // No default fallback NAME. pickFallback uses the last agent by priority,
+    // which works whatever the installed agents are called.
+    assert.equal(BASE.degradedFallback, null);
+  });
+
+  // Which agents exist is the directory's answer, not the manifest's.
+  test('the manifest no longer lists agents', () => {
+    assert.deepEqual(BASE.agents, []);
+    assert.deepEqual(
+      AGENTS.map((a) => a.name),
+      ['build-doctor', 'junior-dev', 'ui-editor', 'senior-dev'],
+    );
   });
 });
 
 describe('routing.entry', () => {
   test('a pinned tier skips the model call entirely', async () => {
     const call = stub(reply('junior-dev', 0.9));
-    const out = await classify({ task: 't', manifest: manifest({ entry: 'senior-dev' }), duties: DUTIES, call });
+    const out = await classify({ task: 't', agents: AGENTS, manifest: manifest({ entry: 'senior-dev' }), duties: DUTIES, call });
     assert.equal(out.tier, 'senior-dev');
     assert.equal(out.source, 'config');
     assert.equal(call.calls.length, 0, 'a pinned entry must not cost a call');
@@ -56,14 +71,14 @@ describe('routing.entry', () => {
 
   test('a pinned tier that is not a declared agent is a setup error', async () => {
     await assert.rejects(
-      () => classify({ task: 't', manifest: manifest({ entry: 'nope' }), duties: DUTIES, call: stub('') }),
+      () => classify({ task: 't', agents: AGENTS, manifest: manifest({ entry: 'nope' }), duties: DUTIES, call: stub('') }),
       /not in the agents list/,
     );
   });
 
   test('auto asks the model', async () => {
     const call = stub(reply('junior-dev', 0.9));
-    const out = await classify({ task: 't', manifest: manifest(), duties: DUTIES, call });
+    const out = await classify({ task: 't', agents: AGENTS, manifest: manifest(), duties: DUTIES, call });
     assert.equal(out.source, 'model');
     assert.equal(call.calls.length, 1);
   });
@@ -73,7 +88,7 @@ describe('repo state', () => {
   test('a red build routes to build-doctor without a call', async () => {
     // DUTIES.md entry rule 1 is deterministic; nothing else runs until green.
     const call = stub(reply('senior-dev', 0.9));
-    const out = await classify({ task: 't', manifest: manifest(), duties: DUTIES, buildGreen: false, call });
+    const out = await classify({ task: 't', agents: AGENTS, manifest: manifest(), duties: DUTIES, buildGreen: false, call });
     assert.equal(out.tier, 'build-doctor');
     assert.equal(out.source, 'repo-state');
     assert.equal(call.calls.length, 0);
@@ -168,7 +183,7 @@ describe('a model that cannot hold the shape does not pick the tier', () => {
 describe('the prompt', () => {
   test('carries the user own DUTIES.md, not a baked-in copy', async () => {
     const call = stub(reply('junior-dev', 0.9));
-    await classify({ task: 't', manifest: manifest(), duties: 'MY CUSTOM RULES', call });
+    await classify({ task: 't', agents: AGENTS, manifest: manifest(), duties: 'MY CUSTOM RULES', call });
     assert.match(call.calls[0].system, /MY CUSTOM RULES/);
   });
 
@@ -176,6 +191,7 @@ describe('the prompt', () => {
     const call = stub(reply('junior-dev', 0.9));
     await classify({
       task: 'make the header sticky',
+      agents: AGENTS,
       manifest: manifest(),
       duties: DUTIES,
       buildGreen: true,
@@ -191,7 +207,7 @@ describe('the prompt', () => {
   test('caps the file list rather than sending a whole monorepo', async () => {
     const call = stub(reply('junior-dev', 0.9));
     const files = Array.from({ length: 900 }, (_, i) => `src/file${i}.ts`);
-    await classify({ task: 't', manifest: manifest(), duties: DUTIES, files, call });
+    await classify({ task: 't', agents: AGENTS, manifest: manifest(), duties: DUTIES, files, call });
     const sent = call.calls[0].messages[0].content;
     assert.match(sent, /and 600 more files/);
     assert.ok(!sent.includes('src/file400.ts'));
@@ -199,7 +215,7 @@ describe('the prompt', () => {
 
   test('asks for one cheap deterministic call', async () => {
     const call = stub(reply('junior-dev', 0.9));
-    await classify({ task: 't', manifest: manifest(), duties: DUTIES, call });
+    await classify({ task: 't', agents: AGENTS, manifest: manifest(), duties: DUTIES, call });
     assert.equal(call.calls[0].temperature, 0);
     assert.equal(call.calls[0].maxTokens, 256);
     assert.equal(call.calls[0].tools, undefined, 'classification needs no tools');

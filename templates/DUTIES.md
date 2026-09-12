@@ -1,66 +1,88 @@
-# Duties and Escalation
+# Duties
 
-Who picks up a task, who they hand it to, and what travels with the handoff.
+How agents hand work to each other. Every installed agent is given this file,
+so it is where they agree on the protocol.
 
-**This file is a default, not a requirement.** It describes the four agents
-this scaffold happens to ship with. Delete it, rewrite it, or replace it the
-moment your set of agents stops looking like this one — the loop reads whatever
-is here and passes it to every agent, and reads nothing at all if the file is
-gone. What each agent owns and when it hands off is really declared in its own
-`SOUL.md` and `RULES.md`; this file exists so the agents agree on one story.
+**No agent is named here, on purpose.** Which agents exist, what each one owns,
+and who it hands to are declared by the agents themselves, in the front matter
+of their own `SOUL.md`:
 
-What is NOT optional, and is not in this file: `hooks/`. Those are enforced by
-the harness whatever any agent believes.
+```yaml
+---
+name: reviewer
+role: Reviews diffs before they land
+priority: 20              # lower numbers claim work first
+owns: ["**/*.test.js"]    # globs it claims; omit to claim anything
+parallel: true            # may run beside agents with non-overlapping scope
+escalates_to: architect   # who takes over when it runs out of attempts
+# terminal: true          # instead: stop and ask the human
+---
+```
 
-## Agents
-
-| Tier | Owns | Never does |
-|---|---|---|
-| `build-doctor` | Getting the build green | Feature work, refactors, design decisions |
-| `junior-dev` | Scoped single-concern changes | Cross-cutting edits, dependency changes, schema changes |
-| `senior-dev` | Architectural and multi-file work | Silent scope expansion without a stated plan |
-| `ui-editor` | Presentational layer only | Business logic, data fetching, state architecture |
+Edit this file freely, or delete it. The loop passes whatever is here and
+passes nothing when it is gone. What is **not** optional, and is not in this
+file, is `hooks/` — those are enforced by the harness whatever any agent
+believes about them.
 
 ## Entry
 
-Entry agent is chosen from repo state and task shape, never from language or
-framework. Priority order comes from each agent's own front matter.
+The first agent is chosen from repo state and the shape of the task, never from
+the language or framework the repo is written in. A CSS change in a Go repo is
+still presentational work.
 
-1. Build fails, dependencies missing, or no lockfile → `build-doctor`. Nothing else runs until the build is green.
-2. Task is presentational (styling, layout, copy, component markup) → `ui-editor`.
-3. Task is single-concern, well-specified, bounded to roughly one file → `junior-dev`.
-4. Task is cross-cutting, ambiguous, or touches more than three files → `senior-dev`.
+1. If the build is red, the lowest-priority agent that repairs builds takes it,
+   and nothing else runs until it is green.
+2. Otherwise the task goes to the agent whose declared scope covers it, lowest
+   `priority` first.
+3. A task no agent's scope covers goes to the agent with no scope, or failing
+   that, to the last agent by priority.
 
-Classification returns strict JSON: `{tier, confidence, reason}`. Below the
-confidence floor, route one step higher. Over-qualifying costs tokens;
+Classification returns strict JSON: `{tier, confidence, reason}`. Below
+`classifier_confidence_floor`, the task is routed one step up — to whatever the
+classified agent declares as its successor. Over-qualifying costs tokens;
 under-qualifying costs a thrash loop and the user's trust.
 
 ## Escalation
 
-- **`junior-dev` fails twice** → `senior-dev`. Both failed diffs travel with the handoff, plus the error output. Without them the senior repeats the junior's first attempt.
-- **`ui-editor` reaches non-presentational code** → `junior-dev`. Stop at the boundary, do not "just quickly" edit the handler.
-- **Any tier hits a build error** → `build-doctor`, then resume the *original* tier at the *same step*. Build doctor returns control; it does not inherit the task.
-- **`senior-dev` fails twice** → stop and escalate to the human. Senior is terminal. There is no tier above it, and looping is worse than asking.
+An agent hands off in one of two ways.
 
-## Handoff payload
+**Sideways, immediately** — by calling `handoff()` the moment the task turns out
+not to be its job. This is the design working, not a failure. Stop at the
+boundary rather than "just quickly" reaching past it.
 
-Every handoff carries, at minimum:
+**Upward, on exhaustion** — when it has used its attempts. The successor is
+whatever the agent's `escalates_to` names, or the next agent by priority. An
+agent declaring `terminal: true` has nobody above it: it stops and reports to
+the human, because looping is worse than asking.
 
-- original task text, unmodified
-- tier history with attempt counts
-- diffs already attempted, including reverted ones
-- last build or test output
-- the specific reason for the handoff
+A delegated agent returns control rather than inheriting the task. An agent
+called in to fix something for another agent finishes that job and hands back
+at the same step; it does not continue into work it was not given.
 
-Truncate file contents before truncating this. An escalation without failure
-context is just a slower retry.
+## What travels with a handoff
+
+The harness compiles this and the successor may be a different model from a
+different provider, so it is a record rather than a transcript:
+
+- the original task, unmodified
+- the decisions made so far, with the reason for each
+- the files the harness actually saw written
+- open issues
+- approaches already tried and ruled out
+- the single most useful next action
+
+Failed approaches are append-only. No later agent can remove one, because a
+successor that cannot see what failed will try it again.
+
+Anything the harness did not observe itself is marked as the agent's claim
+rather than as fact. Naming a file in prose is not evidence it was written.
 
 ## Human checkpoints
 
-Always stop and ask, regardless of tier:
+Always stop and ask, whichever agent is acting:
 
-- dependency added, removed, or version-bumped
-- database schema or migration touched
-- auth, permissions, or crypto touched
+- a dependency added, removed, or version-bumped
+- a database schema or migration touched
+- auth, permissions, or cryptographic code touched
 - more than `diff_line_ceiling` lines in a single edit
-- anything under `hooks/hooks.yaml` protected paths
+- anything matching a protected path in `hooks/`

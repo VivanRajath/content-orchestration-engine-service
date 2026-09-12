@@ -31,7 +31,10 @@ describe('the shipped files parse', () => {
     assert.equal(doc.model.base_url, null);
     assert.equal(doc.model.temperature, 0.2);
     assert.equal(doc.routing.classifier_confidence_floor, 0.6);
-    assert.deepEqual(doc.agents, ['build-doctor', 'senior-dev', 'junior-dev', 'ui-editor']);
+    // No `agents:` list: the agents/ directory is what installs an agent, and
+    // a manifest list that has to agree with the filesystem is a second source
+    // of truth that drifts.
+    assert.equal(doc.agents, undefined);
   });
 
   test('default.yaml keeps booleans as booleans', () => {

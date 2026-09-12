@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir } from './paths.js';
 import { callModel, extractJson } from './provider.js';
+import { readAgents, escalatesTo, buildFixer } from './agents.js';
 
 /**
  * Tier selection. One model call returning strict JSON {tier, confidence,
@@ -17,17 +18,14 @@ import { callModel, extractJson } from './provider.js';
  * Where a low-confidence classification goes. Over-qualifying costs tokens;
  * under-qualifying costs a thrash loop, so the bump is always upward.
  *
- * ui-editor bumps to junior-dev, not senior-dev: they are peers split by
- * domain, and a low-confidence "this is presentational" most likely means
- * mixed logic work, which is junior's. build-doctor does not bump at all —
- * routing out of it on a red build contradicts DUTIES.md entry rule 1.
+ * Where a low-confidence classification goes is the AGENT's decision, read
+ * from its `escalates_to`. An agent that declares itself terminal does not bump
+ * at all, which is also what keeps a build-fixer from being routed out of a red
+ * build — that would contradict DUTIES entry rule 1.
  */
-const LADDER = {
-  'build-doctor': 'build-doctor',
-  'ui-editor': 'junior-dev',
-  'junior-dev': 'senior-dev',
-  'senior-dev': 'senior-dev',
-};
+// Nothing here knows the default agent names. A low-confidence result is
+// bumped to whatever the classified agent declares as its successor, which is
+// the same routing the ladder uses when an agent runs out of attempts.
 
 const MAX_FILES = 300;
 
@@ -48,10 +46,13 @@ export async function classify({
   files = [],
   manifest,
   duties,
+  agents = [],
   dir = agentDir(),
   call = callModel,
 } = {}) {
-  const tiers = manifest.agents?.length ? manifest.agents : Object.keys(LADDER);
+  const roster = agents.length ? agents : readAgents(dir);
+  const tiers = roster.map((a) => a.name);
+  if (!tiers.length) throw new Error('No agents installed to classify between.');
   const fallback = pickFallback(manifest, tiers);
 
   // 1. A pinned entry tier skips the call entirely. Zero network traffic.
@@ -68,8 +69,9 @@ export async function classify({
   // 2. DUTIES.md entry rule 1 is deterministic: a red build routes to
   //    build-doctor and nothing else runs until it is green. No point paying
   //    for a model call to rediscover that. Unknown (null) is not red.
-  if (buildGreen === false && tiers.includes('build-doctor')) {
-    return { tier: 'build-doctor', confidence: 1, reason: 'the build is red; nothing else runs until it is green', source: 'repo-state' };
+  const fixer = buildFixer(roster);
+  if (buildGreen === false && fixer) {
+    return { tier: fixer.name, confidence: 1, reason: 'the build is red; nothing else runs until it is green', source: 'repo-state' };
   }
 
   const rules = duties ?? readDuties(dir);
@@ -102,7 +104,7 @@ export async function classify({
 
   // 4. Below the floor, route one tier UP.
   if (confidence < floor) {
-    const bumped = bump(tier, tiers, fallback);
+    const bumped = bump(tier, roster, fallback);
     if (bumped !== tier) {
       return {
         tier: bumped,
@@ -117,17 +119,32 @@ export async function classify({
   return { tier, confidence, reason, source: 'model' };
 }
 
-function bump(tier, tiers, fallback) {
-  // A persona the ladder does not know about routes to the terminal tier
-  // rather than being guessed at.
-  const next = LADDER[tier] ?? fallback;
-  return tiers.includes(next) ? next : tier;
+/**
+ * One step up, as the agent itself defines it.
+ *
+ * An agent with nowhere to escalate stays where it is: bumping it to a
+ * "terminal" the harness picked would route work to an agent the user never
+ * said should receive it.
+ */
+function bump(tier, roster, fallback) {
+  const agent = roster.find((a) => a.name === tier);
+  const next = agent ? escalatesTo(agent, roster) : fallback;
+  return next ?? tier;
 }
 
+/**
+ * Where a model that cannot classify sends the task.
+ *
+ * `routing.degraded_fallback` when the user named one and it is installed;
+ * otherwise the LAST agent by priority, which is the most senior one present.
+ * The previous version fell back to the literal name `senior-dev`, which meant
+ * a repo whose agents are called something else degraded to a tier that does
+ * not exist.
+ */
 function pickFallback(manifest, tiers) {
-  const declared = manifest.degradedFallback ?? 'senior-dev';
-  if (tiers.includes(declared)) return declared;
-  return tiers.includes('senior-dev') ? 'senior-dev' : tiers[tiers.length - 1];
+  const declared = manifest.degradedFallback;
+  if (declared && tiers.includes(declared)) return declared;
+  return tiers[tiers.length - 1];
 }
 
 function clamp(value) {

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir } from './paths.js';
 import { parseYaml } from './yaml.js';
+import { readAgents } from './agents.js';
 import { c, ok, info } from './util.js';
 
 function manifestPath() {
@@ -115,11 +116,14 @@ export function readManifest(file = manifestPath()) {
     temperature: nil(model.temperature),
     maxTokens:   nil(model.max_tokens),
 
-    juniorRetryLimit: routing.junior_retry_limit ?? 2,
-    seniorRetryLimit: routing.senior_retry_limit ?? 2,
+    // One number, not one per agent name. An agent that wants a different
+    // budget declares `attempts:` in its own front matter.
+    defaultAttempts: routing.default_attempts ?? routing.junior_retry_limit ?? 2,
     diffCeiling:      routing.diff_line_ceiling ?? 400,
     confidenceFloor:  routing.classifier_confidence_floor ?? 0.6,
-    degradedFallback: nil(routing.degraded_fallback) ?? 'senior-dev',
+    // No default name. pickFallback uses the last agent by priority when this
+    // is unset, which works whatever the installed agents are called.
+    degradedFallback: nil(routing.degraded_fallback),
 
     agents:   Array.isArray(doc.agents) ? doc.agents : [],
     // Absent until a pack is installed; `pull` reads it to know where to go
@@ -193,7 +197,7 @@ export async function config(positional, _flags) {
     info(`base_url     ${m.baseUrl ?? '—'}`);
     if (Object.keys(m.tiers).length) {
       console.log(c.b('  per tier'));
-      for (const tier of m.agents) {
+      for (const tier of readAgents().map((a) => a.name)) {
         const t = modelFor(m, tier);
         const overridden = t.model !== m.model || t.provider !== m.provider || t.keyEnv !== m.keyEnv;
         const set = process.env[t.keyEnv] ? c.g('set') : c.y('not set');

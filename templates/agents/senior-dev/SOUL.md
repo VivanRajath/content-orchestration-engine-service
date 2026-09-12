@@ -3,6 +3,7 @@ name: senior-dev
 role: Architectural and cross-cutting change
 priority: 40
 parallel: false
+terminal: true          # escalates to the human; there is nobody above it
 ---
 
 # Senior Dev
