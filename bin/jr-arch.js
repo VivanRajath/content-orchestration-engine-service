@@ -12,6 +12,7 @@ import { detect } from '../src/detect.js';
 import { loadEnv, key } from '../src/env.js';
 import { addAgent, addGuard } from '../src/add.js';
 import { chat } from '../src/chat.js';
+import { smoke } from '../src/smoke.js';
 import { c } from '../src/util.js';
 
 /**
@@ -40,15 +41,24 @@ ${c.b('jr-arch')} — Jr Architect coding agent in your terminal
 ${c.b('USAGE')}
   npx jr-arch <command> [options]
 
+${c.b('START HERE')}
+  npx jr-arch            ${c.d('Sets everything up, one step at a time, then opens the chat')}
+
+${c.b('IN THE CHAT')}
+  /prompt               Describe what you need — agents are written for you
+  /dev                  Write your own agents and guardrails
+  /chat                 Type a task and an agent edits the code
+  /help                 Everything else
+
 ${c.b('COMMANDS')}
-  ${c.d('(no command)')}         Open the chat and start editing this repo
-  init                  Scaffold .gitagent/ into this repo
   run "<task>"          Run one task without opening the chat
+  smoke [agent]         Check an agent actually works
   add-agent <git-url>   Install an agent
   add-guard <git-url>   Install a guardrail file
   agents                List installed agents
-  key [<value>]         Store your API key, or show whether one is set
+  key [<value>]         Store an API key, or show which are set
   config                Show or change model, provider, and routing
+  init                  Scaffold .gitagent/ without the guided setup
   detect                Report the stack, verify command, and lockfile state
   pull                  Update an installed pack, keeping your edits
   doctor                Check your model can drive the agents
@@ -62,12 +72,13 @@ ${c.b('OPTIONS')}
   --as <name>           Install under a different name
   --ref <branch|sha>    Pin to a branch, tag, or commit
   --model <name>        Model for init
-  --provider <name>     anthropic | openai | ollama | openai-compatible
+  --provider <name>     anthropic | groq | openai | openrouter | xai | ollama | openai-compatible
   --base-url <url>      For ollama, vLLM, OpenRouter, LM Studio
   --env <NAME>          Which variable the key command writes
   --yes                 Approve human checkpoints without asking
   --force               Overwrite what is already there
   --json                Machine-readable output where it applies
+  --offline             For smoke: check files and keys, skip the model call
 
 ${c.b('EXAMPLES')}
   npx jr-arch init
@@ -91,7 +102,7 @@ const cmd = argv[0];
  */
 const BOOLEAN = new Set([
   'dry-run', 'force', 'minimal', 'yes', 'no-stream',
-  'allow-dirty', 'skip-verify', 'help', 'version', 'json', 'swarm',
+  'allow-dirty', 'skip-verify', 'help', 'version', 'json', 'swarm', 'offline',
 ]);
 
 const flags = {};
@@ -123,6 +134,7 @@ try {
     case 'config':    await config(positional, flags); break;
     case 'detect':    await detect(positional, flags); break;
     case 'pull':      await pull(positional, flags); break;
+    case 'smoke':     await smoke(positional, flags); break;
     case 'doctor':    await doctor(flags); break;
     case '-v':
     case '--version': console.log(VERSION); break;
