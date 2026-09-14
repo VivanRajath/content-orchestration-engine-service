@@ -14,8 +14,7 @@
  * rather than trusting every call site to remember.
  */
 
-const DEFAULT_ANTHROPIC = 'https://api.anthropic.com';
-const DEFAULT_OPENAI = 'https://api.openai.com/v1';
+import { baseUrlFor, wireFor, providerFor } from './providers.js';
 
 export function apiKey(manifest) {
   return process.env[manifest.keyEnv] || '';
@@ -43,12 +42,31 @@ export function redact(text, key) {
 }
 
 export function isAnthropic(manifest) {
-  return manifest.provider === 'anthropic';
+  return wireFor(manifest.provider) === 'anthropic';
 }
 
-/** ollama and other openai-compatible endpoints often need no key at all. */
+/** Local endpoints like ollama take no key at all. */
 export function requiresKey(manifest) {
-  return manifest.provider !== 'ollama';
+  return !providerFor(manifest.provider)?.noKey;
+}
+
+/**
+ * The endpoint for a manifest, never a guess.
+ *
+ * This used to be `baseUrl || 'https://api.openai.com/v1'` for everything that
+ * was not Anthropic, so a Groq or OpenRouter key with no base_url configured
+ * was sent to OpenAI. Resolving through the provider table means a key only
+ * ever goes to the provider it belongs to.
+ */
+function endpoint(manifest) {
+  const base = baseUrlFor(manifest.provider, manifest.baseUrl);
+  if (!base) {
+    throw new Error([
+      `No base_url for provider "${manifest.provider}". Set one:`,
+      '  jr-arch config set model.base_url <url>',
+    ].join('\n'));
+  }
+  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +334,7 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
   const temp = temperature ?? manifest.temperature ?? 0.2;
 
   if (isAnthropic(manifest)) {
-    const url = `${(manifest.baseUrl || DEFAULT_ANTHROPIC).replace(/\/$/, '')}/v1/messages`;
+    const url = `${endpoint(manifest)}/v1/messages`;
     const headers = { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' };
     const payload = {
       model: manifest.model,
@@ -342,7 +360,7 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
     };
   }
 
-  const url = `${(manifest.baseUrl || DEFAULT_OPENAI).replace(/\/$/, '')}/chat/completions`;
+  const url = `${endpoint(manifest)}/chat/completions`;
   const headers = { 'content-type': 'application/json', authorization: `Bearer ${key}` };
   const payload = {
     model: manifest.model,

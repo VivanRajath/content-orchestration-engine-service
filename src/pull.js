@@ -1,7 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { agentDir } from './paths.js';
-import { readManifest, patchSection, patchSequence, upsertSection } from './config.js';
+import { readManifest, patchSection, upsertSection } from './config.js';
 import { fetchPack, readPack, inspectHooks, planUpdate, readLock, writeLock } from './pack.js';
 import { c, ok, info, warn } from './util.js';
 
@@ -123,7 +123,7 @@ function apply(dir, next, plan, flags) {
 }
 
 /**
- * Re-apply the pack's tier list and routing to the user's agent.yaml.
+ * Re-apply the pack's routing to the user's agent.yaml.
  *
  * The model block is never touched — provider, key env var, and base url are
  * the user's, and an update that quietly re-pointed them at a different model
@@ -133,7 +133,8 @@ function rewriteManifest(dir, next) {
   const file = join(dir, 'agent.yaml');
   let text = readFileSync(file, 'utf8');
 
-  text = patchSequence(text, 'agents', next.agents.map((a) => a.name));
+  // The agents list is no longer written: the directory the merge just
+  // updated is the only record of which agents are installed.
   for (const [key, value] of Object.entries(next.routing ?? {})) {
     // Only keys already present are updated. A routing key the user deleted
     // was deleted on purpose, and one we do not ship is the pack's invention.

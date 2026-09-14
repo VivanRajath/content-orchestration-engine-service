@@ -257,7 +257,13 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
 
     if (used[current] >= limit) {
       const next = escalate(current, ctx.agents);
-      if (!next) {
+      // An agent that already spent its attempts is not a place to escalate
+      // to. Without this, hand-written agents that name each other in a loop —
+      // A escalates to B, B escalates to A — pass the task round forever, each
+      // one getting "one more" attempt past its limit.
+      const spent = next && (used[next] ?? 0) >= attemptsFor(next);
+      if (!next || spent) {
+        if (spent) warn(`${current} escalates to ${next}, which already used its attempts — stopping`);
         return {
           status: 'stopped',
           tier: current,
