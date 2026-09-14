@@ -1,15 +1,19 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { TEMPLATES, agentDir, repoRoot } from './paths.js';
-import { patchSection, patchSequence, upsertSection } from './config.js';
+import { patchSection, upsertSection } from './config.js';
+import { readAgents } from './agents.js';
 import { fetchPack, readPack, inspectHooks, installPack, writeLock } from './pack.js';
+import { PROVIDERS, providerFor } from './providers.js';
 import { c, ok, info, warn } from './util.js';
 
-const PROVIDERS = {
-  anthropic:            { key: 'ANTHROPIC_API_KEY',  model: 'claude-sonnet-4-6',  base: null },
-  openai:               { key: 'OPENAI_API_KEY',     model: 'gpt-4o',             base: null },
-  ollama:               { key: 'OLLAMA_API_KEY',     model: 'qwen2.5-coder:14b',  base: 'http://localhost:11434/v1' },
-  'openai-compatible':  { key: 'LLM_API_KEY',        model: null,                 base: null },
+// Defaults for `init --provider X` without --model. Onboarding does not use
+// these: it lists the models the key can actually reach and lets you pick.
+const DEFAULT_MODEL = {
+  anthropic: 'claude-sonnet-4-6',
+  openai: 'gpt-4o',
+  groq: 'llama-3.3-70b-versatile',
+  ollama: 'qwen2.5-coder:14b',
 };
 
 // Just the manifest and the contract; agents come from add-agent.
@@ -24,12 +28,15 @@ export async function init(flags) {
   }
 
   const provider = flags.provider || 'anthropic';
-  if (!PROVIDERS[provider]) {
+  const spec = providerFor(provider);
+  if (!spec) {
     throw new Error(`Unknown provider "${provider}". One of: ${Object.keys(PROVIDERS).join(', ')}`);
   }
-  const p = PROVIDERS[provider];
-  const model = flags.model || p.model;
-  const baseUrl = flags['base-url'] || p.base;
+  const p = { key: spec.keyEnv };
+  const model = flags.model || DEFAULT_MODEL[provider] || null;
+  // Only an explicit --base-url is written to the manifest. A provider's own
+  // endpoint is resolved at request time, so it is not frozen into the file.
+  const baseUrl = flags['base-url'] || (provider === 'ollama' ? spec.base : null);
 
   if (!model) throw new Error(`Provider "${provider}" has no default model. Pass --model.`);
   if (provider === 'openai-compatible' && !baseUrl) {
@@ -84,7 +91,8 @@ export async function init(flags) {
     // manifest has to agree, or the classifier routes to a tier that is not
     // installed. routing values are the pack's suggestion, not a lock — every
     // one of them stays editable in the user's own file afterwards.
-    manifest = patchSequence(manifest, 'agents', pack.agents.map((a) => a.name));
+    // No agents list to write: the pack's agents/ directory landed above, and
+    // the directory is what installs them.
     for (const [key, value] of Object.entries(pack.routing ?? {})) {
       try { manifest = patchSection(manifest, 'routing', key, value); }
       catch { /* a routing key we do not ship is the pack's, not ours to add */ }
@@ -103,40 +111,46 @@ export async function init(flags) {
     appendFileSync(gitignore, `${current && !current.endsWith('\n') ? '\n' : ''}\n# jr-arch\n${missing.join('\n')}\n`);
   }
 
-  ok(`Scaffolded ${c.c('.gitagent/')} in ${root}`);
-  console.log();
-  info(`provider   ${provider}`);
-  info(`model      ${model}`);
-  if (baseUrl) info(`base_url   ${baseUrl}`);
-  info(`api key    read from $${p.key}`);
-  console.log();
+  // Onboarding scaffolds through here too, and draws its own tree and next
+  // steps afterwards; printing both would say everything twice.
+  if (flags.quiet) return { root, dir, provider, model, keyEnv: p.key };
 
-  if (pack) {
-    info(`pack       ${pack.name ?? pack.url}${pack.version ? ` v${pack.version}` : ''}`);
-    info(`source     ${pack.url}${pack.sha ? ` @ ${pack.sha.slice(0, 7)}` : ''}`);
-    info(`tiers      ${pack.agents.map((a) => a.name).join(', ')}`);
-    info(`guardrails ${pack.hooks ? '.gitagent/' + pack.hooks.split(sep).join('/') : 'sealed hooks only'}`);
-  } else if (!flags.minimal) {
-    info('tiers      build-doctor, senior-dev, junior-dev, ui-editor');
-    info('guardrails .gitagent/hooks/hooks.yaml');
-  }
-  console.log();
+    ok(`Scaffolded ${c.c('.gitagent/')} in ${root}`);
+    console.log();
+    info(`provider   ${provider}`);
+    info(`model      ${model}`);
+    if (baseUrl) info(`base_url   ${baseUrl}`);
+    info(`api key    read from $${p.key}`);
+    console.log();
 
-  if (!pack?.sha && pack) {
-    warn('This pack could not report a commit — it is installed but not pinned.');
-  }
+    if (pack) {
+      info(`pack       ${pack.name ?? pack.url}${pack.version ? ` v${pack.version}` : ''}`);
+      info(`source     ${pack.url}${pack.sha ? ` @ ${pack.sha.slice(0, 7)}` : ''}`);
+      info(`agents     ${pack.agents.map((a) => a.name).join(', ')}`);
+      info(`guardrails ${pack.hooks ? '.gitagent/' + pack.hooks.split(sep).join('/') : 'sealed hooks only'}`);
+    } else if (!flags.minimal) {
+      info(`agents     ${readAgents(dir).map((a) => a.name).join(', ')}`);
+      info('guardrails .gitagent/hooks/');
+    }
+    console.log();
 
-  if (!process.env[p.key]) {
-    warn(`$${p.key} is not set.`);
-    info(`store one:  ${c.c('jr-arch key <your-key>')}`);
-  }
+    if (!pack?.sha && pack) {
+      warn('This pack could not report a commit — it is installed but not pinned.');
+    }
 
-  console.log(c.b('Next:'));
-  if (pack) info('review .gitagent/agents/*/RULES.md — a pulled pack is untrusted input');
-  info('edit .gitagent/agents/*/RULES.md to shape each agent');
-  info('add  jr-arch add-agent <git-url>   to install another');
-  info('edit .gitagent/hooks/hooks.yaml to set guardrails');
-  info('run  jr-arch doctor   to verify your model can drive the tiers');
+    if (!process.env[p.key]) {
+      warn(`$${p.key} is not set.`);
+      info(`store one:  ${c.c('jr-arch key <your-key>')}`);
+    }
+
+    console.log(c.b('Next:'));
+    if (pack) info('review .gitagent/agents/*/RULES.md — a pulled pack is untrusted input');
+    info('edit .gitagent/agents/*/RULES.md to shape each agent');
+    info('add  jr-arch add-agent <git-url>   to install another');
+    info('edit .gitagent/hooks/hooks.yaml to set guardrails');
+    info('run  jr-arch doctor   to verify your model can drive the tiers');
+
+  return { root, dir, provider, model, keyEnv: p.key };
 }
 
 

@@ -335,6 +335,35 @@ const verdict = () => ({ allowed: true, blocked: [], warnings: [] });
 const block = (v, hook, reason) => { v.allowed = false; v.blocked.push({ hook, reason }); };
 const warn = (v, hook, reason, checkpoint = false) => { v.warnings.push({ hook, reason, checkpoint }); };
 
+/** Hooks with dedicated logic above. Everything else is checked by shape. */
+const BUILTIN_EDIT = new Set(['secret-scan', 'protected-paths', 'scope-fence', 'diff-ceiling']);
+const BUILTIN_COMMAND = new Set(['no-sudo', 'no-force-push', 'protected-read', 'no-exfil', 'destructive', 'dep-change']);
+
+function others(phase, builtin) {
+  return Object.values(phase ?? {}).filter((h) => h && !builtin.has(h.name) && active(h));
+}
+
+const appliesTo = (hook, tier) => !Array.isArray(hook.applies_to) || hook.applies_to.includes(tier);
+
+/**
+ * Apply a shape-matched hook according to its severity.
+ *
+ *   block (default)        the call fails, and the agent is told why
+ *   checkpoint, or         stop and ask the human — DUTIES.md's always-ask list
+ *     checkpoint: true
+ *   warn                   noted, not stopped
+ */
+function enforce(v, hook, why) {
+  const detail = hook.description ? ` ${String(hook.description).trim()}` : '';
+  if (hook.checkpoint === true || hook.severity === 'checkpoint') {
+    warn(v, hook.name, `${why} — this needs your approval.${detail}`, true);
+  } else if (hook.severity === 'warn') {
+    warn(v, hook.name, `${why}.${detail}`);
+  } else {
+    block(v, hook.name, `${why}, which ${hook.name} protects.${detail} Hand off or leave it alone rather than working around it.`);
+  }
+}
+
 /**
  * `change` is {before, after}: the file's current content (null for a new
  * file) and the content about to be written. Whole-file content rather than a
@@ -380,6 +409,17 @@ export function checkEdit(filePath, change, tier, hooks = loadHooks()) {
       // single edit a human checkpoint, so it routes there rather than failing.
       warn(v, 'diff-ceiling', `${path}: ${total} changed lines exceeds the ${max}-line ceiling.`, true);
     }
+  }
+
+  // Every other hook is enforced by its SHAPE, not its name. The checks above
+  // only know the built-in names, so a guard someone installed with its own
+  // name — from add-guard, or written by /prompt — used to load, report
+  // success, and never be evaluated. A guardrail that silently does nothing is
+  // worse than none, because it is believed.
+  for (const hook of others(hooks.pre_edit, BUILTIN_EDIT)) {
+    if (!appliesTo(hook, tier) || !hook.paths?.length) continue;
+    const hit = matchesAny(path, hook.paths);
+    if (hit) enforce(v, hook, `${path} matches "${hit}"`);
   }
 
   return v;
@@ -479,6 +519,19 @@ export function checkCommand(argv, tier, hooks = loadHooks()) {
     if (reason) warn(v, 'dep-change', reason, true);
   }
 
+  // Same rule as checkEdit: any other hook is enforced by what it declares.
+  for (const hook of others(hooks.pre_command, BUILTIN_COMMAND)) {
+    if (!appliesTo(hook, tier)) continue;
+    if (hook.commands?.length && hook.commands.map(basename).includes(bin)) {
+      enforce(v, hook, `"${bin}" is listed`);
+      continue;
+    }
+    if (hook.paths?.length) {
+      const token = pathTokens(args).find((t) => matchesAny(normalizePath(t), hook.paths));
+      if (token) enforce(v, hook, `"${token}" matches "${matchesAny(normalizePath(token), hook.paths)}"`);
+    }
+  }
+
   return v;
 }
 
@@ -499,6 +552,16 @@ export function checkRead(filePath, tier, hooks = loadHooks()) {
     const hit = protectedRead(filePath, hook);
     if (hit) {
       block(v, 'protected-read', `${normalizePath(filePath)} is a protected path (matches "${hit}") and may not be read.`);
+    }
+  }
+  // A custom command guard that names paths covers reading them too. Blocking
+  // `cat payments/keys.json` while read_file("payments/keys.json") succeeds
+  // would move the leak one tool over rather than closing it.
+  for (const other of others(hooks.pre_command, BUILTIN_COMMAND)) {
+    if (!appliesTo(other, tier) || !other.paths?.length) continue;
+    const hit = matchesAny(normalizePath(filePath), other.paths);
+    if (hit && other.severity !== 'warn' && other.checkpoint !== true && other.severity !== 'checkpoint') {
+      block(v, other.name, `${normalizePath(filePath)} matches "${hit}", which ${other.name} protects, and may not be read.`);
     }
   }
   return v;

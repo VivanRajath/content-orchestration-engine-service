@@ -28,11 +28,15 @@ import { globToRegExp, normalizePath } from './hooks.js';
  *   terminal: true               instead: stop and ask the human
  *   fixes_build: true            a red build routes here before anything else
  *   attempts: 2                  tries before it escalates
- *   model: gpt-4o-mini           optional, overrides agent.yaml for this agent
  *   ---
+ *
+ * What an agent may NOT declare is its model, provider or key. An agent can be
+ * pulled from any URL, and an agent choosing where the user's source code gets
+ * sent is the privacy claim inverted. Model assignment lives in the user's own
+ * agent.yaml under `tiers:`, and front-matter `model:` is ignored.
  */
 
-const DEFAULTS = { priority: 50, parallel: false, owns: [], model: null };
+const DEFAULTS = { priority: 50, parallel: false, owns: [] };
 
 /**
  * Who an agent hands to when it is out of attempts.
@@ -99,7 +103,6 @@ export function readAgents(dir = agentDir()) {
       priority: num(meta.priority, DEFAULTS.priority),
       parallel: meta.parallel === true,
       owns: list(meta.owns),
-      model: str(meta.model) || null,
       escalatesTo: str(meta.escalates_to) || null,
       terminal: meta.terminal === true,
       // Declared, not inferred from a name. DUTIES entry rule 1 routes a red
@@ -107,8 +110,6 @@ export function readAgents(dir = agentDir()) {
       // that happen to use the default pack's names.
       fixesBuild: meta.fixes_build === true,
       attempts: num(meta.attempts, null),
-      provider: str(meta.provider) || null,
-      keyEnv: str(meta.api_key_env) || null,
       hasRules: existsSync(join(base, entry.name, 'RULES.md')),
     });
   }
@@ -124,6 +125,27 @@ const list = (v) => (Array.isArray(v) ? v.map(String) : typeof v === 'string' ? 
 
 export function findAgent(name, agents) {
   return agents.find((a) => a.name === name) ?? null;
+}
+
+/**
+ * An escalation loop among the installed agents, as a list of names, or null.
+ *
+ * The ladder refuses to escalate into an agent that has already spent its
+ * attempts, so a loop can no longer hang a run — but it still means a task can
+ * never reach a human, which is worth telling someone before they find out.
+ */
+export function escalationCycle(agents) {
+  const next = new Map(agents.map((a) => [a.name, a.terminal ? null : escalatesTo(a, agents)]));
+  for (const start of next.keys()) {
+    const path = [];
+    let at = start;
+    while (at && !path.includes(at)) {
+      path.push(at);
+      at = next.get(at);
+    }
+    if (at) return path.slice(path.indexOf(at));
+  }
+  return null;
 }
 
 /** The agent a red build routes to, if any is installed that claims to fix them. */
