@@ -87,8 +87,8 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
       if (!result) return;
       models = result.models ?? [];
       if (result.mode === 'prompt') {
-        await promptMode(prompter, { call: call ?? undefined, fetchImpl, models, root });
-        mode = 'chat';
+        const made = await promptMode(prompter, { call: call ?? undefined, fetchImpl, models, root });
+        mode = made?.mode ?? 'chat';
       } else {
         mode = result.mode;
       }
@@ -180,9 +180,10 @@ async function command(line, ctx) {
       console.log(DEV_HELP);
       return { mode: 'dev' };
 
-    case 'prompt':
-      await promptMode(prompter, { call: ctx.call ?? undefined, fetchImpl: ctx.fetchImpl, models: ctx.models, root });
-      return { mode: 'chat' };
+    case 'prompt': {
+      const made = await promptMode(prompter, { call: ctx.call ?? undefined, fetchImpl: ctx.fetchImpl, models: ctx.models, root });
+      return { mode: made?.mode ?? 'chat' };
+    }
 
     // --- setup --------------------------------------------------------------
     case 'key': {

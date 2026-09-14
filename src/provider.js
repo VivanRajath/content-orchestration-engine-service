@@ -136,29 +136,225 @@ const toOpenAITools = (tools) =>
 
 const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
-async function post(url, headers, body, key, { retries = 2 } = {}) {
+/** Longest the CLI will sit out a rate limit before giving up and saying so. */
+export const MAX_WAIT_MS = 90000;
+/** Below this, a shrunken reply budget is too small to do any real work in. */
+const MIN_OUTPUT = 400;
+
+/**
+ * An error from the provider, already turned into something a person can act on.
+ *
+ * The raw body used to be printed as-is — four hundred characters of JSON with
+ * an organisation id and an upgrade link in it, cut off mid-sentence. `kind` is
+ * what the retry logic branches on:
+ *
+ *   too-large   this one request exceeds a per-minute token limit. Waiting will
+ *               not help; asking for fewer output tokens might.
+ *   rate-limit  the minute's (or day's) budget is spent. Waiting helps.
+ *   auth        the key was refused.
+ *   model       the model does not exist, or cannot do what was asked.
+ *   server      the provider is having trouble.
+ */
+export class ProviderError extends Error {
+  constructor(message, fields = {}) {
+    super(message);
+    Object.assign(this, fields);
+  }
+}
+
+/**
+ * Output-token ceilings learned from the provider during this process, keyed by
+ * provider and model. Groq's free tier caps some models at 1,000 output tokens a
+ * minute and rejects any request that merely ASKS for more — so the first
+ * rejection teaches the cap, and every later call starts under it instead of
+ * failing the same way first.
+ */
+const learnedCaps = new Map();
+const capKey = (manifest) => `${manifest.provider}|${manifest.model}`;
+export const outputCap = (manifest) => learnedCaps.get(capKey(manifest)) ?? null;
+export const forgetCaps = () => learnedCaps.clear();
+
+export function parseProviderError(status, text, headers) {
+  let body = null;
+  try { body = JSON.parse(text); } catch { /* not JSON */ }
+  const raw = String(body?.error?.message ?? body?.message ?? (typeof body?.error === 'string' ? body.error : '') ?? '')
+    || String(text ?? '').slice(0, 300);
+  const code = String(body?.error?.code ?? body?.error?.type ?? '');
+
+  // "... tokens per minute (TPM): Limit 6000, Requested 7120" — Groq, OpenAI.
+  const limits = raw.match(/\((\w+)\):\s*Limit\s*([\d,]+),\s*(?:Used\s*([\d,]+),\s*)?Requested\s*([\d,]+)/i);
+  const num = (s) => (s ? Number(s.replace(/,/g, '')) : null);
+  const unit = limits?.[1]?.toUpperCase() ?? null;
+  const limit = num(limits?.[2]);
+  const requested = num(limits?.[4]);
+
+  const retryAfter = retryAfterMs(headers, raw);
+  const tooLarge = /request too large|exceeds? the (?:enforced )?limit|context_length_exceeded|maximum context length|too many tokens/i.test(raw)
+    || code === 'context_length_exceeded' || status === 413;
+
+  let kind = 'other';
+  if (tooLarge) kind = 'too-large';
+  else if (status === 429) kind = 'rate-limit';
+  else if (status === 401 || status === 403) kind = 'auth';
+  else if (status === 404 || /model_not_found|does not exist|not supported|decommissioned/i.test(raw + code)) kind = 'model';
+  else if (status >= 500) kind = 'server';
+
+  return { kind, status, unit, limit, requested, retryAfter, raw: tidy(raw) };
+}
+
+/** The provider's sentence without the organisation id and the sales pitch. */
+function tidy(message) {
+  return message
+    .replace(/\s*in organization `[^`]*`/gi, '')
+    .replace(/\s*service tier `[^`]*`/gi, '')
+    .replace(/\s*Need more tokens\?.*$/is, '')
+    .replace(/\s*Visit https?:\S+.*$/is, '')
+    .trim();
+}
+
+/** Milliseconds to wait, from Retry-After or from "try again in 1m2.5s". */
+function retryAfterMs(headers, message) {
+  const header = Number(headers?.get?.('retry-after'));
+  if (Number.isFinite(header) && header > 0) return header * 1000;
+  const m = String(message).match(/try again in\s*((?:[\d.]+h)?(?:[\d.]+m(?!s))?(?:[\d.]+s)?(?:[\d.]+ms)?)/i);
+  if (!m || !m[1]) return null;
+  let ms = 0;
+  for (const [, n, u] of m[1].matchAll(/([\d.]+)(h|ms|m|s)/g)) {
+    ms += Number(n) * { h: 3600000, m: 60000, s: 1000, ms: 1 }[u];
+  }
+  return ms || null;
+}
+
+const UNIT_NAMES = {
+  OTPM: 'output tokens a minute', TPM: 'tokens a minute', RPM: 'requests a minute',
+  TPD: 'tokens a day', RPD: 'requests a day', ITPM: 'input tokens a minute',
+};
+
+function describeError(info, manifest) {
+  const who = providerFor(manifest.provider)?.label ?? manifest.provider;
+  const model = manifest.model;
+  const per = UNIT_NAMES[info.unit] ?? 'tokens';
+  const wait = info.retryAfter ? ` (about ${humanWait(info.retryAfter)})` : '';
+
+  switch (info.kind) {
+    case 'too-large':
+      return info.limit
+        ? `${who} allows ${model} ${info.limit.toLocaleString()} ${per} on your plan, and this request needs ${info.requested?.toLocaleString() ?? 'more'}.\n` +
+          `  Pick a model with higher limits (/models), or upgrade your ${who} plan.`
+        : `The request is too large for ${model}: ${info.raw}`;
+    case 'rate-limit':
+      return `${who} rate limit reached for ${model}${info.unit ? ` — ${per}` : ''}${wait}.\n` +
+        `  Wait and try again, or pick another model (/models).${info.raw ? `\n  ${who} said: ${info.raw}` : ''}`;
+    case 'auth':
+      return `${who} refused the API key (${info.status}). Add a working one with /key.`;
+    case 'model':
+      return `${who} cannot use ${model} for this: ${info.raw}\n  Pick another model with /models.`;
+    case 'server':
+      return `${who} is having trouble (${info.status}) — try again in a moment.${info.raw ? ` ${info.raw}` : ''}`;
+    default:
+      return `${who} returned ${info.status}: ${info.raw}`;
+  }
+}
+
+const humanWait = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Math.ceil(ms / 1000)}s`);
+
+/**
+ * Send one request, recovering from what can be recovered.
+ *
+ *   - too large, with a number to aim for: shrink max_tokens under the limit,
+ *     remember the cap, and resend at once. That is the Groq free tier's
+ *     "Limit 1000, Requested 2581" — the request was fine except for asking.
+ *   - rate limited: wait as long as the provider says, up to MAX_WAIT_MS, and
+ *     say so on screen, so a pause does not read as a hang.
+ *   - network errors and 5xx: short backoff, as before.
+ *
+ * Streaming stops retrying at the first byte: `stream` only ever retries
+ * responses that never produced a body.
+ */
+async function request(manifest, url, headers, body, key, { stream = false, retries = 2, notice = defaultNotice } = {}) {
   let lastError;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  let limitRetries = 0;
+  const payload = { ...body };
+  const cap = outputCap(manifest);
+  if (cap && payload.max_tokens > cap) payload.max_tokens = cap;
+
+  for (let attempt = 0; attempt <= retries + limitRetries; attempt++) {
     let res;
     try {
-      res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+      res = await fetch(url, stream
+        ? { method: 'POST', headers: { ...headers, accept: 'text/event-stream' }, body: JSON.stringify({ ...payload, stream: true }) }
+        : { method: 'POST', headers, body: JSON.stringify(payload) });
     } catch (err) {
       lastError = new Error(redact(err.message, key));
-      if (attempt === retries) throw lastError;
+      if (attempt >= retries + limitRetries) throw lastError;
       await sleep(backoff(attempt));
       continue;
     }
-    if (res.ok) return res.json();
 
-    const text = redact((await res.text()).slice(0, 400), key);
-    lastError = new Error(`${res.status} ${text}`);
-    if (!RETRY_STATUS.has(res.status) || attempt === retries) throw lastError;
-    // A long Retry-After is the provider telling us to stop, not to wait it out.
-    const after = Number(res.headers.get('retry-after'));
-    const wait = Number.isFinite(after) && after > 0 ? Math.min(after * 1000, 15000) : backoff(attempt);
-    await sleep(wait);
+    if (res.ok) {
+      if (!stream) return { json: await res.json() };
+      // Some OpenAI-compatible servers ignore `stream: true` and answer with one
+      // JSON body. Fed to the SSE parser that has no `data:` lines, so it read
+      // as an empty reply — and every task failed with "the model called no
+      // tool" even though the model had called one. Read it as JSON instead.
+      const type = String(res.headers?.get?.('content-type') ?? '');
+      if (/json/i.test(type) && !/event-stream/i.test(type)) return { json: await res.json() };
+      if (!res.body) throw new Error('the provider returned no response body to stream');
+      return { stream: res.body };
+    }
+
+    const text = redact(await res.text(), key);
+    const info = parseProviderError(res.status, text, res.headers);
+    lastError = new ProviderError(redact(describeError(info, manifest), key), { ...info, provider: manifest.provider, model: manifest.model });
+
+    // Limit recoveries get their own small allowance, so a shrink followed by a
+    // wait for the minute to roll over does not use up the network retries.
+    if (info.kind === 'too-large') {
+      const smaller = shrink(payload.max_tokens, info);
+      if (!smaller || limitRetries >= 2) throw lastError;
+      learnedCaps.set(capKey(manifest), smaller);
+      notice(`${manifest.model} allows ${info.limit.toLocaleString()} ${UNIT_NAMES[info.unit] ?? 'tokens'} on this plan — replies capped at ${smaller.toLocaleString()} tokens.`);
+      payload.max_tokens = smaller;
+      limitRetries++;
+      continue;
+    }
+
+    if (info.kind === 'rate-limit') {
+      const wait = info.retryAfter ?? backoff(attempt) * 4;
+      // A daily limit, or a wait longer than anyone would sit through, is an
+      // answer rather than a pause.
+      if (wait > MAX_WAIT_MS || limitRetries >= 3 || /day|TPD|RPD/i.test(info.unit ?? '')) throw lastError;
+      notice(`${manifest.model} is rate limited — waiting ${humanWait(wait)} and trying again…`);
+      await sleep(wait + 250);
+      limitRetries++;
+      continue;
+    }
+
+    if (!RETRY_STATUS.has(res.status) || attempt >= retries + limitRetries) throw lastError;
+    await sleep(info.retryAfter ? Math.min(info.retryAfter, 15000) : backoff(attempt));
   }
   throw lastError;
+}
+
+/**
+ * A max_tokens that fits under the limit the provider named, or null.
+ *
+ * For an output limit the answer is just under the limit. For a combined limit
+ * (TPM counts input too) it is the current ask minus the overshoot.
+ */
+function shrink(current, { unit, limit, requested }) {
+  if (!limit || !requested || !current) return null;
+  let next;
+  if (unit === 'OTPM') next = Math.floor(limit * 0.9);
+  else next = Math.floor(current - (requested - limit) - 100);
+  next = Math.min(next, current - 1);
+  return next >= MIN_OUTPUT ? next : null;
+}
+
+function defaultNotice(message) {
+  // stderr, and on its own line: this can land while a "Designing agents…"
+  // line is still open, and must never end up inside piped stdout.
+  process.stderr.write(`\n  \x1b[33m…\x1b[0m ${message}\n`);
 }
 
 const backoff = (attempt) => Math.min(1000 * 2 ** attempt, 8000);
@@ -172,48 +368,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * Streaming exists for one reason: without it a long attempt prints nothing
  * until the model finishes, which reads as a hang rather than as work.
  *
- * Retries stop at the first byte. `post` can safely replay a request that
- * never produced a response, but once tokens have been handed to the caller
- * and printed to a terminal, replaying would duplicate them — so a mid-stream
+ * Retries stop at the first byte — see request(). Once tokens have been handed
+ * to the caller and printed, replaying would duplicate them, so a mid-stream
  * failure is an error, not a retry.
- */
-async function postStream(url, headers, body, key, { retries = 2 } = {}) {
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    let res;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { ...headers, accept: 'text/event-stream' },
-        body: JSON.stringify({ ...body, stream: true }),
-      });
-    } catch (err) {
-      lastError = new Error(redact(err.message, key));
-      if (attempt === retries) throw lastError;
-      await sleep(backoff(attempt));
-      continue;
-    }
-    if (res.ok) {
-      // Some OpenAI-compatible servers ignore `stream: true` and answer with one
-      // JSON body. Fed to the SSE parser that has no `data:` lines, so it read
-      // as an empty reply — and every task failed with "the model called no
-      // tool" even though the model had called one. Read it as JSON instead.
-      const type = String(res.headers?.get?.('content-type') ?? '');
-      if (/json/i.test(type) && !/event-stream/i.test(type)) return { json: await res.json() };
-      if (!res.body) throw new Error('the provider returned no response body to stream');
-      return { stream: res.body };
-    }
-
-    const text = redact((await res.text()).slice(0, 400), key);
-    lastError = new Error(`${res.status} ${text}`);
-    if (!RETRY_STATUS.has(res.status) || attempt === retries) throw lastError;
-    const after = Number(res.headers.get('retry-after'));
-    await sleep(Number.isFinite(after) && after > 0 ? Math.min(after * 1000, 15000) : backoff(attempt));
-  }
-  throw lastError;
-}
-
-/**
+ *
  * Server-sent events out of a byte stream.
  *
  * Buffers across chunk boundaries: a network chunk splits wherever TCP decided
@@ -331,7 +489,8 @@ export async function readOpenAIStream(events, onDelta) {
  * progress pass nothing and get the buffered path, which is one request and
  * one JSON parse rather than a stream to drain.
  */
-export async function callModel(manifest, { system, messages = [], tools, maxTokens, temperature, onDelta } = {}) {
+export async function callModel(manifest, { system, messages = [], tools, maxTokens, temperature, onDelta, onNotice } = {}) {
+  const opts = onNotice ? { notice: onNotice } : {};
   const key = apiKey(manifest);
   if (!key && requiresKey(manifest)) {
     throw new Error(missingKey(manifest.keyEnv));
@@ -352,12 +511,12 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
     };
 
     if (onDelta) {
-      const res = await postStream(url, headers, payload, key);
+      const res = await request(manifest, url, headers, payload, key, { ...opts, stream: true });
       if (res.stream) return readAnthropicStream(parseSSE(res.stream), (t) => onDelta(redact(t, key)));
       return shown(anthropicResult(res.json), onDelta, key);
     }
 
-    return anthropicResult(await post(url, headers, payload, key));
+    return anthropicResult((await request(manifest, url, headers, payload, key, opts)).json);
   }
 
   const url = `${endpoint(manifest)}/chat/completions`;
@@ -371,12 +530,12 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
   };
 
   if (onDelta) {
-    const res = await postStream(url, headers, payload, key);
+    const res = await request(manifest, url, headers, payload, key, { ...opts, stream: true });
     if (res.stream) return readOpenAIStream(parseSSE(res.stream), (t) => onDelta(redact(t, key)));
     return shown(openAIResult(res.json), onDelta, key);
   }
 
-  return openAIResult(await post(url, headers, payload, key));
+  return openAIResult((await request(manifest, url, headers, payload, key, opts)).json);
 }
 
 function anthropicResult(data) {
@@ -421,7 +580,12 @@ function safeParse(text) {
 
 /** Pull a JSON object out of a reply that may be fenced or prefaced with prose. */
 export function extractJson(text) {
-  const cleaned = String(text ?? '').replace(/```(?:json)?/gi, '').trim();
+  // Reasoning models (Qwen, DeepSeek) put their thinking in <think> tags ahead
+  // of the answer, and it often contains a brace or two of its own.
+  const cleaned = String(text ?? '')
+    .replace(/<think>[\s\S]*?(<\/think>|$)/gi, '')
+    .replace(/```(?:json)?/gi, '')
+    .trim();
   try {
     return JSON.parse(cleaned);
   } catch {

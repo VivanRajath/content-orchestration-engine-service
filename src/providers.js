@@ -186,5 +186,6 @@ export class KeyRejected extends Error {}
  * as the model for a coding agent is offering a guaranteed failure.
  */
 export function isChatModel(id) {
-  return !/whisper|tts|embed|moderation|guard|dall-e|image|audio|transcri|realtime|search-preview|playai/i.test(id);
+  // orpheus is Groq's text-to-speech model; its id has no "tts" in it.
+  return !/whisper|tts|embed|moderation|guard|dall-e|image|audio|transcri|realtime|search-preview|playai|orpheus/i.test(id);
 }
