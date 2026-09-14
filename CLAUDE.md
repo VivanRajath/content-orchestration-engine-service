@@ -49,7 +49,7 @@ Phase 1 is built: `npx jr-arch` onboards interactively (paste a key, the
 provider is detected, the key is checked by listing its models, pick one,
 scaffold, pick a mode), then opens a chat with `/prompt`, `/dev` and `/chat`.
 Providers: Anthropic, Groq, OpenAI, OpenRouter, xAI, Ollama, any
-OpenAI-compatible endpoint. 484 tests, `node --test`, no runner.
+OpenAI-compatible endpoint. 499 tests, `node --test`, no runner.
 
 The key and model-listing path has been exercised against the real Groq API.
 The agent loop itself has still only met a scripted model — whoever has a key
@@ -237,6 +237,13 @@ commit. The model only ever reaches `tools.js`.
 a person. A dependency change waved through because the run happened to be in CI
 is precisely what the DUTIES.md checkpoint list exists to prevent.
 
+**A checkpoint is asked before the action, and "no" is a tool error.**
+`tools.js` calls `ctx.approve` between the hook check and the write or command.
+It used to return checkpoints alongside the result, so `npm install` had already
+run when "Allow?" appeared. A decline goes back to the model like a block, and
+is remembered for the attempt so the same question is not asked twice. Swarm
+prompts queue on `ctx.askLock` so two agents never ask at once.
+
 **Streaming stops retrying at the first byte.** `post` can safely replay a
 request that never produced a response; `postStream` cannot, because tokens
 already handed to the caller are already on the user's screen. A mid-stream
@@ -331,6 +338,23 @@ In a numbered menu, an option that is only sometimes present goes LAST. The
 per-agent model menu had "another model on the same key" in the middle; when
 the model list was not loaded it vanished and every later option renumbered, so
 the same keypress picked something different.
+
+Test the prompter in TERMINAL mode (`test/terminal.test.js`, a fake TTY). Plain
+streams put readline in non-terminal mode, a different code path, and every bug
+a user hit at the keyboard lived in the part those tests never reached: a secret
+prompt whose label was wiped by readline's redraw and whose echo was off, so it
+looked dead; Ctrl+V arriving as a literal ^V in a raw Windows console; and a
+second readline interface in `checkpoint()` that paused stdin when it closed,
+leaving the chat deaf. There is ONE interface — the chat passes its prompter
+down through `run()`. For a real console, drive `bin/jr-arch.js` under
+`winpty -Xallow-non-tty -Xplain` with Enter sent as `\r`.
+
+Some OpenAI-compatible servers ignore `stream: true` and answer JSON.
+`postStream` checks the content type; before that, the body went to the SSE
+parser, read as empty, and every task failed with "called no tool".
+
+Chat reuses the current `jr-arch/session-*` branch. Without it every message cut
+a new branch.
 
 The prompter removes each question's `close` listener once it is answered.
 Leaving them attached leaked one per prompt and Node printed a memory-leak

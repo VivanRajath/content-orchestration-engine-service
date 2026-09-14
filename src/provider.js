@@ -194,8 +194,14 @@ async function postStream(url, headers, body, key, { retries = 2 } = {}) {
       continue;
     }
     if (res.ok) {
+      // Some OpenAI-compatible servers ignore `stream: true` and answer with one
+      // JSON body. Fed to the SSE parser that has no `data:` lines, so it read
+      // as an empty reply — and every task failed with "the model called no
+      // tool" even though the model had called one. Read it as JSON instead.
+      const type = String(res.headers?.get?.('content-type') ?? '');
+      if (/json/i.test(type) && !/event-stream/i.test(type)) return { json: await res.json() };
       if (!res.body) throw new Error('the provider returned no response body to stream');
-      return res.body;
+      return { stream: res.body };
     }
 
     const text = redact((await res.text()).slice(0, 400), key);
@@ -346,18 +352,12 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
     };
 
     if (onDelta) {
-      const body = await postStream(url, headers, payload, key);
-      return readAnthropicStream(parseSSE(body), (t) => onDelta(redact(t, key)));
+      const res = await postStream(url, headers, payload, key);
+      if (res.stream) return readAnthropicStream(parseSSE(res.stream), (t) => onDelta(redact(t, key)));
+      return shown(anthropicResult(res.json), onDelta, key);
     }
 
-    const data = await post(url, headers, payload, key);
-    const blocks = data.content ?? [];
-    return {
-      text: blocks.filter((b) => b.type === 'text').map((b) => b.text).join(''),
-      toolCalls: blocks.filter((b) => b.type === 'tool_use').map((b) => ({ id: b.id, name: b.name, input: b.input ?? {} })),
-      stopReason: data.stop_reason ?? null,
-      raw: data,
-    };
+    return anthropicResult(await post(url, headers, payload, key));
   }
 
   const url = `${endpoint(manifest)}/chat/completions`;
@@ -371,12 +371,26 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
   };
 
   if (onDelta) {
-    const body = await postStream(url, headers, payload, key);
-    return readOpenAIStream(parseSSE(body), (t) => onDelta(redact(t, key)));
+    const res = await postStream(url, headers, payload, key);
+    if (res.stream) return readOpenAIStream(parseSSE(res.stream), (t) => onDelta(redact(t, key)));
+    return shown(openAIResult(res.json), onDelta, key);
   }
 
-  const data = await post(url, headers, payload, key);
-  const message = data.choices?.[0]?.message ?? {};
+  return openAIResult(await post(url, headers, payload, key));
+}
+
+function anthropicResult(data) {
+  const blocks = data?.content ?? [];
+  return {
+    text: blocks.filter((b) => b.type === 'text').map((b) => b.text).join(''),
+    toolCalls: blocks.filter((b) => b.type === 'tool_use').map((b) => ({ id: b.id, name: b.name, input: b.input ?? {} })),
+    stopReason: data?.stop_reason ?? null,
+    raw: data,
+  };
+}
+
+function openAIResult(data) {
+  const message = data?.choices?.[0]?.message ?? {};
   return {
     text: message.content ?? '',
     toolCalls: (message.tool_calls ?? []).map((call) => ({
@@ -384,9 +398,15 @@ export async function callModel(manifest, { system, messages = [], tools, maxTok
       name: call.function?.name,
       input: safeParse(call.function?.arguments),
     })),
-    stopReason: data.choices?.[0]?.finish_reason ?? null,
+    stopReason: data?.choices?.[0]?.finish_reason ?? null,
     raw: data,
   };
+}
+
+/** A buffered reply that stood in for a stream: show its text once, then return it. */
+function shown(result, onDelta, key) {
+  if (result.text) onDelta(redact(result.text, key));
+  return result;
 }
 
 function safeParse(text) {

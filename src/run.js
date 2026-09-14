@@ -1,6 +1,5 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { createInterface } from 'node:readline/promises';
 import { agentDir, repoRoot } from './paths.js';
 import { readManifest, modelFor } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
@@ -10,11 +9,12 @@ import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
 import {
   openSession, openAttempt, closeAttempt, closeSession, commitAttempt,
-  revertAttempt, dirtyFiles, isRepo, listSessions, readSession, resumeBrief,
+  revertAttempt, dirtyFiles, isRepo, listSessions, readSession, resumeBrief, git,
   record as sessionRecord,
 } from './session.js';
 import { newLedger, reconcile, compile, REPORT_SYSTEM, reportPrompt } from './context.js';
 import { readAgents, findAgent, frontMatter, swarmable, partition, escalatesTo, buildFixer } from './agents.js';
+import { createPrompter } from './prompter.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -32,7 +32,7 @@ const DEFAULT_MAX_STEPS = 40;
 /** Consecutive tool-free replies before an attempt is declared stalled. */
 const IDLE_LIMIT = 3;
 
-export async function run(positional, flags, { call = callModel } = {}) {
+export async function run(positional, flags, { call = callModel, prompter = null } = {}) {
   const root = repoRoot();
   const dir = agentDir();
   const task = (positional ?? []).join(' ').trim() || (typeof flags.task === 'string' ? flags.task : '');
@@ -125,7 +125,10 @@ export async function run(positional, flags, { call = callModel } = {}) {
     task: subject,
     // A resumed run stays on the branch the first one made. Branching again
     // would strand the earlier attempts on a branch nobody looks at.
-    reuseBranch: prior?.branch ?? null,
+    // The chat is one conversation, so it stays on one branch. Branching per
+    // message stacked a new session branch on top of the last for every task —
+    // ten messages, ten chained branches to clean up.
+    reuseBranch: prior?.branch ?? (flags.quiet ? sessionBranchInUse(root, manifest) : null),
     branch: manifest.raw?.git?.session_branch !== false && isRepo(root),
     prefix: manifest.raw?.git?.branch_prefix ?? 'jr-arch',
   });
@@ -143,6 +146,10 @@ export async function run(positional, flags, { call = callModel } = {}) {
     // arrive, and --no-stream exists for a run whose log is being captured.
     stream: Boolean(process.stdout.isTTY) && !flags['no-stream'],
     autoApprove: Boolean(flags.yes),
+    // The caller's prompter, when there is one. The chat passes its own so a
+    // checkpoint asks through the SAME readline interface — see checkpoint().
+    prompter,
+    askLock: { tail: Promise.resolve() },
     contextBudget: manifest.raw?.routing?.context_budget ?? 6000,
     // Canonical execution state, owned by the loop and never by a tier. This
     // is what makes a handoff survive a change of model.
@@ -394,6 +401,17 @@ async function attempt(ctx, frame, brief) {
   const messages = [{ role: 'user', content: brief }];
   const system = prompt(ctx, ctx.agent ?? findAgent(frame.tier, ctx.agents) ?? { name: frame.tier, dir: join(ctx.dir, 'agents', frame.tier), owns: [] });
   const toolCtx = { ...ctx, tier: frame.tier, touched: new Set() };
+  // Checkpoints are asked by tools.js BEFORE the write or command, through this.
+  // A "no" is remembered for the attempt, so a model retrying the same thing
+  // gets the same answer instead of asking the human again and again.
+  const refused = new Set();
+  toolCtx.approve = async (cp) => {
+    const key = `${cp.hook}\n${cp.reason}`;
+    if (refused.has(key)) return false;
+    const yes = await checkpoint(ctx, cp);
+    if (!yes) refused.add(key);
+    return yes;
+  };
   let idle = 0;
   // commit() gates on the files this attempt actually wrote, so the set has to
   // live on the frame, not only in the tool context that closes over it.
@@ -452,13 +470,8 @@ async function attempt(ctx, frame, brief) {
         results.push({ id: call.id, name: call.name, content: 'Skipped — the attempt already ended.', isError: true });
         continue;
       }
-      const out = dispatch(call, toolCtx);
+      const out = await dispatch(call, toolCtx);
       info(`  ${out.isError ? c.y('✗') : c.g('✓')} ${call.name}${describe(call)}`);
-
-      for (const cp of out.checkpoints ?? []) {
-        const approved = await checkpoint(ctx, cp);
-        if (!approved) return { kind: 'failed', reason: `human checkpoint declined: ${cp.reason}` };
-      }
       results.push({ id: call.id, name: call.name, content: out.content, isError: out.isError });
       if (out.control) control = out.control;
     }
@@ -543,18 +556,36 @@ function commit(ctx, frame, summary) {
  * checkpoint list exists to prevent, and --yes has to be typed by a person.
  */
 async function checkpoint(ctx, cp) {
+  // Agents in a swarm run concurrently; two "Allow?" prompts at once would
+  // interleave on one terminal and one answer would go to the wrong question.
+  // Every attempt shares ctx.askLock (an object, so the spread keeps it shared).
+  const lock = ctx.askLock ?? { tail: Promise.resolve() };
+  const turn = lock.tail.then(() => ask(ctx, cp));
+  lock.tail = turn.catch(() => {});
+  return turn;
+}
+
+async function ask(ctx, cp) {
   warn(`checkpoint — ${cp.hook}: ${cp.reason}`);
   if (ctx.autoApprove) { info('  approved by --yes'); return true; }
+
+  // Inside the chat, ask through the chat's own prompter. Opening a second
+  // readline interface on stdin here is what made the chat stop accepting
+  // input: closing this one paused stdin and switched raw mode off underneath
+  // the chat's interface, which then never saw another keystroke.
+  if (ctx.prompter) return ctx.prompter.confirm(c.b('Allow?'), false);
+
   if (!ctx.interactive) {
     info('  not a terminal, and --yes was not passed — declining');
     return false;
   }
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  // A standalone `jr-arch run` has no prompter of its own, so it makes one for
+  // this question and closes it — nothing else is reading stdin at that point.
+  const own = createPrompter();
   try {
-    const answer = (await rl.question(`  ${c.b('Allow?')} [y/N] `)).trim().toLowerCase();
-    return answer === 'y' || answer === 'yes';
+    return await own.confirm(c.b('Allow?'), false);
   } finally {
-    rl.close();
+    own.close();
   }
 }
 
@@ -740,6 +771,14 @@ function priorLedger(prior, task) {
     });
   }
   return ledger;
+}
+
+/** The current branch, if it is already one of our session branches. */
+function sessionBranchInUse(root, manifest) {
+  if (!isRepo(root)) return null;
+  const prefix = manifest.raw?.git?.branch_prefix ?? 'jr-arch';
+  const current = git(['rev-parse', '--abbrev-ref', 'HEAD'], { root, check: false });
+  return current && current.startsWith(`${prefix}/session-`) ? current : null;
 }
 
 const NEWLINE = String.fromCharCode(10);
