@@ -102,13 +102,16 @@ const ok = (content) => ({ content: String(content), isError: false });
 const err = (content) => ({ content: String(content), isError: true });
 
 /**
- * Run one tool call. Returns {content, isError, checkpoints, control}.
+ * Run one tool call. Returns {content, isError, control}.
  *
- * `checkpoints` are warnings hooks.js marked checkpoint:true — DUTIES.md says
- * those stop and ask the human rather than failing the step, so they travel up
- * to run.js rather than being answered here.
+ * Checkpoints — warnings hooks.js marks checkpoint:true — are asked through
+ * `ctx.approve` BEFORE the action happens. They used to travel back to run.js
+ * alongside the result, which meant `npm install` had already run by the time
+ * anyone was asked "Allow?": the question was decoration on something already
+ * done. A declined checkpoint is a tool error, like a blocked hook, so the model
+ * can take another approach or hand off.
  */
-export function dispatch(call, ctx) {
+export async function dispatch(call, ctx) {
   const { name, input = {} } = call;
   const handler = HANDLERS[name];
   if (!handler) return err(`No tool named "${name}". Available: ${TOOLS.map((t) => t.name).join(', ')}`);
@@ -120,7 +123,7 @@ export function dispatch(call, ctx) {
   }
 
   try {
-    const result = handler(input, ctx);
+    const result = await handler(input, ctx);
     record(ctx.session, 'tool', {
       tool: name, tier: ctx.tier,
       path: input.path ?? null,
@@ -167,7 +170,7 @@ const HANDLERS = {
     return ok(shown.join('\n') + (found.length > shown.length ? `\n… and ${found.length - shown.length} more` : ''));
   },
 
-  write_file(input, ctx) {
+  async write_file(input, ctx) {
     const rel = inside(ctx.root, input.path);
     if (rel.error) return err(rel.error);
     if (typeof input.content !== 'string') return err('write_file needs `content` as a string.');
@@ -178,19 +181,17 @@ const HANDLERS = {
     const before = existsSync(abs) && !statSync(abs).isDirectory() ? readFileSync(abs, 'utf8') : null;
     const gate = checkEdit(rel.path, { before, after: input.content }, ctx.tier, ctx.hooks);
     if (!gate.allowed) return err(blocked(gate));
+    if (!(await approved(gate, ctx))) return err(declined(gate));
 
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, input.content);
     ctx.touched?.add(rel.path);
 
     const lines = input.content.split('\n').length;
-    return {
-      ...ok(`Wrote ${rel.path} (${lines} lines).`),
-      checkpoints: checkpoints(gate),
-    };
+    return ok(`Wrote ${rel.path} (${lines} lines).`);
   },
 
-  run_command(input, ctx) {
+  async run_command(input, ctx) {
     const argv = input.command;
     if (!Array.isArray(argv) || !argv.length || !argv.every((a) => typeof a === 'string')) {
       return err('run_command needs `command` as an array of strings, e.g. ["npm","test"].');
@@ -198,6 +199,7 @@ const HANDLERS = {
 
     const gate = checkCommand(argv, ctx.tier, ctx.hooks);
     if (!gate.allowed) return err(blocked(gate));
+    if (!(await approved(gate, ctx))) return err(declined(gate));
 
     let bin, args;
     try {
@@ -210,14 +212,14 @@ const HANDLERS = {
       const out = execFileSync(bin, args, {
         cwd: ctx.root, timeout: COMMAND_TIMEOUT, encoding: 'utf8', stdio: 'pipe',
       });
-      return { ...ok(tail(out) || '(no output)'), checkpoints: checkpoints(gate) };
+      return ok(tail(out) || '(no output)');
     } catch (e) {
       if (e.code === 'ENOENT') return err(`${argv[0]} is not installed or not on PATH.`);
       if (e.killed) return err(`Timed out after ${COMMAND_TIMEOUT / 1000}s.\n${tail(e.stdout ?? '')}`);
       // A non-zero exit is information the model needs, not a harness failure —
       // a failing test IS the answer to "run the tests".
       const output = tail(`${e.stdout ?? ''}${e.stderr ?? ''}`) || e.message;
-      return { ...err(`Exit ${e.status}.\n${output}`), checkpoints: checkpoints(gate) };
+      return err(`Exit ${e.status}.\n${output}`);
     }
   },
 
@@ -290,3 +292,29 @@ function blocked(gate) {
 }
 
 const checkpoints = (gate) => (gate.warnings ?? []).filter((w) => w.checkpoint);
+
+/**
+ * Ask every checkpoint on a gate, in order, before anything happens.
+ *
+ * With no one to ask — no `ctx.approve` — the answer is no. A checkpoint exists
+ * because a human must decide, and a caller that cannot reach one must not be
+ * the thing that decides yes.
+ */
+async function approved(gate, ctx) {
+  const cps = checkpoints(gate);
+  if (!cps.length) return true;
+  if (typeof ctx.approve !== 'function') return false;
+  for (const cp of cps) {
+    if (!(await ctx.approve(cp))) return false;
+  }
+  return true;
+}
+
+function declined(gate) {
+  return [
+    'Not done — this needs human approval, and it was not given:',
+    ...checkpoints(gate).map((w) => `  - ${w.hook}: ${w.reason}`),
+    '',
+    'Nothing was changed. Find another way that avoids it, or hand off and say why it is needed.',
+  ].join('\n');
+}

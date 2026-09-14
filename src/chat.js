@@ -129,7 +129,7 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
         continue;
       }
 
-      await turn({ task, agent, call, flags });
+      await turn({ task, agent, call, flags, prompter });
     }
   } finally {
     prompter.close();
@@ -144,14 +144,14 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
  * work. NOT `--yes`: a human checkpoint still stops and asks, even here. Chat
  * is a faster way to reach the loop, not a way around its rules.
  */
-async function turn({ task, agent, call, flags }) {
+async function turn({ task, agent, call, flags, prompter }) {
   try {
     await run([task], {
       ...flags,
       'allow-dirty': true,
       quiet: true,
       ...(agent ? { agent: agent.name } : {}),
-    }, call ? { call } : undefined);
+    }, { ...(call ? { call } : {}), prompter });
   } catch (e) {
     warn(e.message);
   }

@@ -1,6 +1,6 @@
 {
   "name": "jr-arch",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Coding agent in your terminal. Scaffolds a GAP-format .gitagent/ folder with editable personas and harness-enforced guardrails. Bring your own model and key.",
   "type": "module",
   "bin": { "jr-arch": "./bin/jr-arch.js", "jra": "./bin/jr-arch.js" },
