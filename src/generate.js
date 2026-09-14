@@ -4,12 +4,14 @@ import { agentDir, repoRoot } from './paths.js';
 import { readManifest, upsertSection } from './config.js';
 import { readAgents } from './agents.js';
 import { inspect } from './detect.js';
-import { callModel, extractJson } from './provider.js';
+import { callModel, extractJson, outputCap } from './provider.js';
 import { writeKey, ensureIgnored } from './env.js';
 import { obtainKey, pickModel } from './onboard.js';
 import { listModels } from './providers.js';
 import { printTree } from './tree.js';
 import { c, ok, info, warn } from './util.js';
+
+const DEV_HINT = `  ${c.b('/dev')} — /new <name> creates an agent, /guard <name> a guardrail, /check validates, /smoke tests.`;
 
 /**
  * /prompt — describe what you need, and the agents are written for you.
@@ -144,7 +146,7 @@ export function planPrompt(answers) {
  * model told "try again" usually produces the same mistake.
  */
 export async function generatePlan(answers, manifest, { call = callModel, onProgress = () => {} } = {}) {
-  const messages = [{ role: 'user', content: planPrompt(answers) }];
+  const messages = [{ role: 'user', content: planPrompt(answers) + brevity(outputCap(manifest)) }];
 
   for (let round = 0; round < 2; round++) {
     onProgress(round === 0 ? 'designing agents' : 'fixing the plan');
@@ -153,17 +155,39 @@ export async function generatePlan(answers, manifest, { call = callModel, onProg
     const { plan, errors } = validatePlan(parsed, answers);
     if (plan) return { plan, errors: [], rounds: round + 1 };
 
+    // A reply cut off at the output limit is not a model that misunderstood.
+    // Listing validation errors against half a JSON object just gets the same
+    // half again; what it needs to hear is "shorter".
+    const cut = /^(length|max_tokens)$/.test(String(reply.stopReason ?? ''));
     if (round === 0) {
-      messages.push({ role: 'assistant', text: reply.text });
+      messages.push({ role: 'assistant', text: cut ? '(reply cut off)' : reply.text });
       messages.push({
         role: 'user',
-        content: `That plan cannot be used:\n${errors.map((e) => `- ${e}`).join('\n')}\n\nReply with the corrected JSON object only.`,
+        content: cut
+          ? `Your reply was cut off at the output limit, so the JSON was incomplete. Reply again with a much shorter plan, JSON only, no thinking out loud.${brevity(outputCap(manifest) ?? 1000)}`
+          : `That plan cannot be used:\n${errors.map((e) => `- ${e}`).join('\n')}\n\nReply with the corrected JSON object only.`,
       });
+    } else if (cut) {
+      return { plan: null, errors: [`the model's replies were cut off at its output limit (${outputCap(manifest) ?? reply.stopReason}) before the plan was complete`], rounds: 2, cutOff: true };
     } else {
       return { plan: null, errors, rounds: 2 };
     }
   }
   return { plan: null, errors: ['no plan produced'], rounds: 2 };
+}
+
+/**
+ * Tighter word limits when the model can only return a short reply.
+ *
+ * The default limits (250-word souls, 200-word rules, up to six agents) need
+ * several thousand output tokens. A free-tier model capped at ~1,000 cannot
+ * return that however well it understands the task.
+ */
+export function brevity(cap) {
+  if (!cap || cap >= 4000) return '';
+  const words = Math.max(40, Math.floor(cap / 12));
+  return `\n\n## Length\nYour reply is limited to about ${cap} tokens. At most ${cap < 1500 ? 2 : 3} agents. ` +
+    `Each soul under ${words} words, each rules under ${Math.floor(words * 0.7)} words. Output the JSON and nothing else.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -523,26 +547,57 @@ export async function promptMode(prompter, { call = callModel, fetchImpl = fetch
   const answers = await interview(prompter, { root });
   if (!answers) return null;
 
-  console.log();
-  process.stdout.write(`  ${c.d(`Designing agents with ${manifest.model}…`)} `);
-  let result;
-  try {
-    result = await generatePlan(answers, manifest, { call });
-  } catch (e) {
-    console.log(c.r('failed'));
-    warn(e.message);
-    return null;
-  }
-  if (!result.plan) {
-    console.log(c.r('failed'));
-    warn('The model could not produce a usable plan:');
-    for (const e of result.errors.slice(0, 6)) info(`  ${e}`);
-    info('Try again with more detail, or use /dev to write the agents yourself.');
-    return null;
-  }
-  console.log(c.g('done'));
+  // The interview is the expensive part for the person, so a failed design
+  // never throws their answers away: it offers another go, another model, or
+  // the default agents — instead of dropping them back at the chat prompt with
+  // a provider error and nothing to do about it.
+  let designer = manifest;
+  let plan = null;
+  for (;;) {
+    console.log();
+    process.stdout.write(`  ${c.d(`Designing agents with ${designer.model}…`)} `);
+    let result;
+    try {
+      result = await generatePlan(answers, designer, { call });
+    } catch (e) {
+      result = { plan: null, error: e };
+    }
+    if (result.plan) {
+      console.log(c.g('done'));
+      plan = result.plan;
+      break;
+    }
 
-  const { plan } = result;
+    console.log(c.r('failed'));
+    if (result.error) {
+      warn(result.error.message);
+    } else {
+      warn('The model could not produce a usable plan:');
+      for (const e of result.errors.slice(0, 6)) info(`  ${e}`);
+    }
+    console.log();
+
+    const next = await prompter.choose('What now?', [
+      { value: 'retry', label: 'Try again', note: result.error?.kind === 'rate-limit' ? 'after the limit resets' : '' },
+      { value: 'defaults', label: 'Keep the default agents', note: 'and start chatting — /prompt again any time' },
+      { value: 'dev', label: 'Write the agents yourself', note: '/dev' },
+      // Only offered with a list to pick from; kept last so its absence never
+      // renumbers the options above it.
+      ...(models?.length > 1 ? [{ value: 'model', label: 'Try a different model', note: 'for designing only' }] : []),
+    ]);
+    if (next === 'retry') continue;
+    if (next === 'model') {
+      const id = await pickModel(prompter, { models: models.filter((m) => m.id !== designer.model), provider: manifest.provider });
+      if (id) designer = { ...manifest, model: id };
+      continue;
+    }
+    if (next === 'dev') {
+      console.log(DEV_HINT);
+      return { mode: 'dev' };
+    }
+    info(`Using the default agents. ${c.d('Type a task, or /agents to see them.')}`);
+    return null;
+  }
   preview(plan);
 
   if (!(await prompter.confirm('Write these agents?', true))) {

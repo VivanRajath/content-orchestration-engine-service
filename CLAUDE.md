@@ -49,7 +49,7 @@ Phase 1 is built: `npx jr-arch` onboards interactively (paste a key, the
 provider is detected, the key is checked by listing its models, pick one,
 scaffold, pick a mode), then opens a chat with `/prompt`, `/dev` and `/chat`.
 Providers: Anthropic, Groq, OpenAI, OpenRouter, xAI, Ollama, any
-OpenAI-compatible endpoint. 499 tests, `node --test`, no runner.
+OpenAI-compatible endpoint. 512 tests, `node --test`, no runner.
 
 The key and model-listing path has been exercised against the real Groq API.
 The agent loop itself has still only met a scripted model — whoever has a key
@@ -243,6 +243,15 @@ It used to return checkpoints alongside the result, so `npm install` had already
 run when "Allow?" appeared. A decline goes back to the model like a block, and
 is remembered for the attempt so the same question is not asked twice. Swarm
 prompts queue on `ctx.askLock` so two agents never ask at once.
+
+**Provider limits are recovered from, and explained when they cannot be.**
+`request()` in provider.js parses the error into a `ProviderError` with a
+`kind`. "Request too large … (OTPM): Limit 1000, Requested 2581" (Groq free
+tier) resends with a smaller `max_tokens` and remembers the cap per model;
+a short rate limit is waited out (up to 90s) with a notice on stderr; a daily
+limit or an unshrinkable request is reported in a sentence that names what to
+do. Raw provider JSON never reaches the screen. `/prompt` keeps the interview
+answers when design fails and offers retry / defaults / /dev / another model.
 
 **Streaming stops retrying at the first byte.** `post` can safely replay a
 request that never produced a response; `postStream` cannot, because tokens
