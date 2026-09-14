@@ -23,7 +23,14 @@ src/env.js              .gitagent/.env loading and the `key` command
 src/context.js          the ledger: claims -> records, and the handoff compiler
 src/agents.js           the installed agents, read from their own front matter
 src/add.js              add-agent / add-guard
-src/chat.js             the default command: a chat that edits the repo
+src/chat.js             the default command: onboarding, then /chat /prompt /dev
+src/onboard.js          first run: key -> models -> scaffold -> mode
+src/providers.js        provider registry, key detection, live model listing
+src/generate.js         /prompt: interview -> plan -> validate -> write
+src/dev.js              /dev: scaffold agents and guards, /check
+src/smoke.js            per-agent smoke test
+src/prompter.js         every question the CLI asks, scriptable in tests
+src/tree.js             .gitagent/ drawn with what each file is for
 src/personas.js         list / add / remove tiers, --from <git-url> pull
 src/hooks.js            guardrail engine; sealed hooks live here, not in yaml
 src/classify.js         one model call -> {tier, confidence, reason}
@@ -38,24 +45,53 @@ test/                   node --test, no runner
 
 ## Status
 
-Working, tested: `init` (bundled and `--from <git-url>`), `pull`, `config`,
-`config set`, `personas list|add|remove`, `doctor`, the guardrail engine, the
-tier classifier, and the error paths. `node --test`, 180 tests, no runner.
+Phase 1 is built: `npx jr-arch` onboards interactively (paste a key, the
+provider is detected, the key is checked by listing its models, pick one,
+scaffold, pick a mode), then opens a chat with `/prompt`, `/dev` and `/chat`.
+Providers: Anthropic, Groq, OpenAI, OpenRouter, xAI, Ollama, any
+OpenAI-compatible endpoint. 484 tests, `node --test`, no runner.
 
-`run` drives the full ladder: classify, attempt, block, hand off, nest
-build-doctor, verify, commit to a session branch, streaming its output.
-`run --resume` continues a stopped session on its original branch. `detect`
-reports the stack. `personas add|remove` wires the tier into agent.yaml and
-DUTIES.md rather than telling the user to. `key` stores a provider key without
-ever asking anyone to type `export`. Tiers can each name their own model and
-key, and context crosses between them as a compiled record. 338 tests,
-`node --test`.
-
-Not yet exercised against a live model — the ladder is tested with an injected
-scripted model, not a real one. Whoever has a key first should run it on a
-throwaway repo before trusting it on anything else.
+The key and model-listing path has been exercised against the real Groq API.
+The agent loop itself has still only met a scripted model — whoever has a key
+first should run a real task on a throwaway repo before trusting it.
 
 ## Decisions already made — do not relitigate without reason
+
+**In /prompt, the model proposes and the harness writes.** The model returns a
+plan as JSON; `validatePlan` checks every field and `soulFile`/`guardFile` build
+the files from the validated values. Only the prose bodies of SOUL.md and
+RULES.md are written as the model produced them. Model-authored front matter
+could declare `fixes_build` on every agent or an escalation loop; model-authored
+guard YAML could try to switch a guard off. The user always sees the plan
+before it is written.
+
+**A guard is enforced by what it declares, not by its name.** `checkEdit` and
+`checkCommand` have dedicated logic for the built-in hooks, then enforce every
+other hook by shape: `paths`, `commands`, `severity`, `applies_to`. Before this,
+a hook with its own name — from `add-guard` or `/prompt` — loaded, reported
+success, and was never evaluated. A guardrail that silently does nothing is
+worse than none, because it is believed. `test/regressions.test.js` pins it.
+
+**A command guard that names a path also covers `read_file`.** An edit guard
+does not: agents need to read code they may not change.
+
+**Listing models is the key check.** Onboarding proves a key works by listing
+what it can reach, so a wrong key is caught at setup rather than as a 401 on
+the first task. Model IDs are never hard-coded — a list is stale the week it
+ships and would offer models the key cannot use. `isChatModel` drops speech,
+embedding, moderation and guard models, none of which can call a tool.
+
+**A key only ever goes to its own provider.** `endpoint()` resolves through the
+registry in `providers.js`. The request layer used to fall back to
+`api.openai.com` for anything that was not Anthropic, so a Groq key with no
+base_url would have been sent to OpenAI. `openai-compatible` with no base_url
+now refuses rather than guessing.
+
+**Setup does not ask questions nobody can answer.** With no TTY, `jr-arch`
+explains what to run instead of hanging on a prompt. Every interactive flow
+takes a prompter, so tests drive it with `scriptedPrompter` and never need a
+terminal — and a scripted prompter throws when it runs out, so a flow that asks
+one question too many fails instead of silently taking a default.
 
 **No default agent name appears in executable code.** Not in `classify.js`, not
 in `run.js`, not in `DUTIES.md`, not in `agent.yaml`. Every routing decision an
@@ -280,6 +316,32 @@ except under `--minimal` and `--from`. Adding a template file automatically
 ships it; the `MINIMAL` array in `init.js` is the only place needing a manual
 update.
 
+Single-line fields written into front matter are collapsed to one line first
+(`line()` in generate.js). A newline in a generated `role` was once written raw
+into a quoted scalar; the strict parser rejected it, `frontMatter` returned no
+metadata, and the agent silently ran unscoped, non-terminal, at default
+priority — claiming every file and never stopping to ask.
+
+The ladder refuses to escalate into an agent that already spent its attempts.
+Hand-written agents naming each other in a loop used to pass a task round
+forever, each getting one more attempt past its limit. `/check` also reports the
+loop up front via `escalationCycle()`.
+
+In a numbered menu, an option that is only sometimes present goes LAST. The
+per-agent model menu had "another model on the same key" in the middle; when
+the model list was not loaded it vanished and every later option renumbered, so
+the same keypress picked something different.
+
+The prompter removes each question's `close` listener once it is answered.
+Leaving them attached leaked one per prompt and Node printed a memory-leak
+warning into the chat after eleven questions.
+
+Do not edit JS containing backslashes through a Python heredoc with ordinary
+string literals — a backslash-n or backslash-s gets halved into a real newline
+or a bare letter, and it broke builds repeatedly while building phase 1. Use the
+Edit tool, or Python raw strings. (This note was itself mangled that way the
+first time it was written.)
+
 A resumed run reuses the prior session's branch. Branching again would strand
 the earlier attempts on a branch nobody looks at, which is the opposite of why
 someone resumes.
@@ -324,15 +386,13 @@ Two repos:
 
 ## Next
 
-1. **A live-model run on a throwaway repo.** Nothing here has met a real model;
-   every path is exercised with an injected scripted one.
-2. `routing.entry` still names one agent, so a repo that renames its agents has
-   to update it. Everything else routes by declaration now.
-3. Swarm fans out to one group and does not escalate: a failed agent rolls back
-   and stops rather than handing to another. The ladder and the swarm are still
-   two paths through `run()`.
-4. `doctor` probes only the default key, not every name in `keyEnvs(manifest)`,
-   so a missing per-agent key fails mid-run instead of at setup.
-5. `jr-arch sessions` to list and inspect past runs.
-6. Token accounting per attempt, per model, in the transcript. With per-agent
-   models the cost question is now "which agent spent it".
+1. **A real task against a real model.** The loop, handoff reports, swarm and
+   `/prompt` generation are all verified with scripted models only.
+2. Publish 0.1.2 — the npm listing predates everything since 0.1.1, and 0.1.1
+   ships with `--version` reporting 0.1.0.
+3. Bring `gitagent-default` to the current format: its agents lack front-matter
+   routing, and it still ships root SOUL.md/RULES.md.
+4. `routing.entry` still names one agent.
+5. Swarm does not escalate; ladder and swarm are two paths through `run()`.
+6. `doctor` probes only the default key, not every name in `keyEnvs`.
+7. Token accounting per agent and per model.

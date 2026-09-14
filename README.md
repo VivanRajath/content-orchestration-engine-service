@@ -1,154 +1,190 @@
 # jr-arch
 
-Jr Architect coding agent in your terminal.
-
-Scaffolds a GAP-format `.gitagent/` folder into your repo, pre-filled with four
-coding personas and guardrails. Point it at any model you want — your provider,
-your key, your rules.
+A coding agent that lives in your repo. Bring your own model and key — it edits
+your code under guardrails you control, and nothing leaves your machine except
+calls to the AI provider you choose.
 
 ```bash
-npx jr-arch init
+npx jr-arch
 ```
 
-## What it does
+That's the whole install. It asks you what it needs, one step at a time.
 
-Creates `.gitagent/` in your repo root:
+## What happens when you run it
 
 ```
-.gitagent/
-├── agent.yaml              # model, provider, routing config
-├── SOUL.md                 # global identity
-├── RULES.md                # global constraints
-├── DUTIES.md               # escalation ladder between tiers
-├── agents/
-│   ├── build-doctor/       # SOUL.md + RULES.md
-│   ├── senior-dev/
-│   ├── junior-dev/
-│   └── ui-editor/
-├── hooks/hooks.yaml        # guardrails
-├── memory/MEMORY.md        # git-committed agent memory
-└── config/default.yaml     # sandbox, git, telemetry
+  Step 1 of 4  Connect an AI provider
+  API key: ✓ That looks like a Groq key gsk_… (56 chars)
+  Checking the key… works
+✓ 18 models available
+
+  Step 2 of 4  Choose a model
+    1  openai/gpt-oss-120b
+    2  qwen/qwen3-32b
+    3  llama-3.3-70b-versatile
+    …
+
+  Step 3 of 4  Create your agent folder
+✓ Created .gitagent/
+    agents/  hooks/  agent.yaml  DUTIES.md  .env
+
+  Step 4 of 4  How do you want to start?
+    1  /prompt  describe what you need      agents are written for you
+    2  /dev     write your own agents       and set guardrails by hand
+    3  /chat    start with the default agents
 ```
 
-Every file is plain text in git. Edit it, diff it, branch a variant per repo,
-review persona changes in a PR like any other code.
+Your key is **checked by listing the models it can reach** — so a wrong key is
+caught here, not as an error on your first task, and you only ever pick from
+models your key can actually use. The key is hidden as you type it.
+
+## Three ways to work
+
+Once you're set up, `jr-arch` opens a chat. Switch modes any time.
+
+### `/prompt` — describe it, get agents
+
+Answer a few questions and your model designs a team of agents for this repo:
+
+```
+  What should your coding agents do?
+  › Build and maintain a REST API that takes card payments
+  What kind of project is this?  (Node, Express)
+  Which files or folders must agents never change?
+  › payments/keys/**, .github/**
+  How should agents check their work?  (npm run test)
+  How many agents?  1 Decide for me  2 One agent  3 A team
+
+  Proposed agents
+   api-builder     Builds and changes REST endpoints
+                   priority 20 · owns src/routes/** · parallel · → payments-lead
+   test-writer     Writes and fixes tests
+                   priority 20 · owns test/** · parallel · fixes builds
+   payments-lead   Owns anything touching money
+                   priority 80 · owns anything · asks you
+
+  Never changed  payments/keys/**, .github/**
+  Needs approval migrations/**
+
+  Write these agents? [Y/n]
+```
+
+Then it asks which model each agent should use — and whether any of them should
+run on a **different provider with its own key**. A cheap, fast model for scoped
+work and a stronger one for decisions is exactly what this is for.
+
+You always see the plan before anything is written. The model proposes; jr-arch
+validates every field and writes the files itself, so a bad generation cannot
+sneak in an escalation loop, a guardrail that switches something off, or a model
+choice you didn't make.
+
+### `/dev` — write your own
+
+```
+  /new reviewer      scaffold an agent: SOUL.md + RULES.md
+  /guard strict      scaffold a guard file
+  /edit reviewer     show where its files are
+  /check             find problems before a run does
+  /smoke reviewer    check it actually works
+  @reviewer <task>   give it a task
+```
+
+`/check` catches the mistakes that would otherwise fail silently mid-run: an
+agent escalating to one that isn't installed, two agents handing a task back and
+forth forever, a guard still full of `TODO`s that protects nothing.
+
+`/smoke` runs six checks against one agent, cheapest first:
+
+```
+  smoke test · reviewer
+  ✓ files    SOUL.md parses · Reviews diffs before they land
+  ✓ routing  escalates to payments-lead
+  ✓ guards   2 guard files load
+  ✓ key      $GROQ_API_KEY is set
+  ✓ model    llama-3.3-70b-versatile on groq
+  ✓ tools    the model called a tool with the agent's real prompt
+✓ reviewer is ready
+```
+
+The last check sends the agent's real prompt and asks it to call a tool. Nothing
+is written, so it's safe on any repo. A model that answers in prose instead of
+calling tools can't drive an agent — better to learn that now.
+
+### `/chat` — just give it tasks
+
+```
+  [chat] › add a --json flag to the status command
+  api-builder · single-concern change to one route
+    ✓ read_file   src/routes/status.js
+    ✓ write_file  src/routes/status.js
+    ✓ done
+  ✓ verify passed (npm run test)
+    commit  867b813
+```
+
+Type a task and the right agent picks it up, or send it to one with `@name`.
 
 ## Bring your own model
 
-```bash
-npx jr-arch init --provider anthropic --model claude-sonnet-4-6
-npx jr-arch init --provider openai    --model gpt-4o
-npx jr-arch init --provider ollama    --model qwen2.5-coder:14b \
-    --base-url http://localhost:11434/v1
-npx jr-arch init --provider openai-compatible --model my-model \
-    --base-url https://openrouter.ai/api/v1
+| Provider | Key looks like | |
+|---|---|---|
+| Anthropic | `sk-ant-…` | |
+| Groq | `gsk_…` | |
+| OpenAI | `sk-…` | |
+| OpenRouter | `sk-or-…` | |
+| xAI | `xai-…` | |
+| Ollama | — | type `ollama` instead of a key; runs locally |
+| Anything OpenAI-compatible | — | Together, vLLM, LM Studio… you give the URL |
+
+Paste a key and the provider is recognised from its format. Change it any time:
+
+```
+  /key       add or change a key
+  /models    switch model
 ```
 
-Any provider, any model name, any endpoint. `openai-compatible` covers anything
-speaking the OpenAI API — OpenRouter, Together, Groq, vLLM, LM Studio — and you
-can change all of it later without re-scaffolding:
+or from outside the chat:
 
 ```bash
-jr-arch config set model.name qwen/qwen3-coder
-jr-arch config set model.base_url https://openrouter.ai/api/v1
-jr-arch config set model.api_key_env OPENROUTER_API_KEY
+jr-arch key gsk_...                      # store a key
+jr-arch key                              # which keys are set, and from where
+jr-arch config set model.name qwen/qwen3-32b
 ```
 
-`agent.yaml` names an environment **variable**, never a key. The value comes
-from your shell, or from `.gitagent/.env`:
+**Where your key lives.** `agent.yaml` names an environment *variable*, never a
+key. The value goes in `.gitagent/.env`, which is gitignored before anything is
+written to it. A key you export in your shell always wins over the file. And the
+agents themselves can't read it — `.env*` is a sealed guardrail path, so both
+`read_file` and `cat` are refused.
 
-```bash
-jr-arch key sk-ant-...     # writes .gitagent/.env, 0600, gitignored
-jr-arch key                # shows whether one is set, and from where
-jr-arch key remove
-```
-
-### A different model per tier
-
-The premise of a tier ladder is that tiers differ in cost and judgement, so
-point them at different models. Add a `tiers:` block to `agent.yaml`:
+### A different model per agent
 
 ```yaml
+# .gitagent/agent.yaml
 tiers:
-  junior-dev:
+  api-builder:
     model:
-      provider: openai
-      name: gpt-4o-mini
-      api_key_env: OPENAI_API_KEY   # jr-arch key --env OPENAI_API_KEY sk-...
-  senior-dev:
+      provider: groq
+      name: llama-3.3-70b-versatile
+      api_key_env: GROQ_API_KEY
+  payments-lead:
     model:
-      name: claude-opus-4-1         # same provider and key, bigger model
+      provider: anthropic
+      name: claude-opus-4-1
+      api_key_env: ANTHROPIC_API_KEY
 ```
 
-Anything a tier does not name is inherited, so the common case needs no block
-at all. `jr-arch key` then reports every key the manifest needs and which tiers
-use it, rather than just the default one.
-
-An exported shell variable always wins over the file. The `.gitignore` rule is
-verified and repaired *before* anything is written, and the agent itself cannot
-read the file back — `.env*` is a sealed guardrail path, so `read_file` and
-`cat` are both refused.
-
-This CLI sends nothing anywhere. No telemetry, no analytics, no crash reporting.
-The only network calls are the ones you configure to your own provider, plus an
-explicit `personas add --from <git-url>`.
-
-## Commands
-
-| Command | Does |
-|---|---|
-| `init` | Scaffold `.gitagent/` — `--from <git-url>`, `--ref`, `--provider`, `--model`, `--base-url`, `--minimal`, `--force` |
-| `run "<task>"` | Run the agent — `--dry-run`, `--resume`, `--allow-dirty`, `--yes`, `--no-stream` |
-| `pull` | Update the installed pack, keeping your edits — `--dry-run`, `--ref`, `--force` |
-| `detect` | Report the stack, verify command, and lockfile state — `--json` |
-| `key [<value>]` | Store your API key, or show whether one is set — `key remove` |
-| `config` | Show current model and routing |
-| `config set <section.key> <value>` | Change a setting |
-| `personas list` | List tiers and their roles |
-| `personas add <name>` | New blank persona, or `--from <git-url>` to pull one |
-| `personas remove <name>` | Delete a tier |
-| `doctor` | Probe your model for the capabilities the tiers need |
-
-## Running it
-
-```bash
-npx jr-arch init --from https://github.com/VivanRajath/gitagent-default
-npx jr-arch key sk-ant-...        # or export ANTHROPIC_API_KEY yourself
-npx jr-arch doctor
-npx jr-arch run "add a --json flag to the status command"
-```
-
-A run works on its own branch, so it is reviewable and abandonable:
-
-```
-▸ ui-editor  attempt 1/2
-    ✓ read_file  api/handler.js
-    ✗ write_file  api/handler.js
-    ✓ handoff  → junior-dev
-! handoff → junior-dev: the fix is in the handler, not the presentation
-▸ junior-dev  attempt 1/2
-    ✓ write_file  api/handler.js
-    ✓ done
-✓ verify passed (npm run test)
-  commit     867b813
-```
-
-`run` refuses to start on a dirty working tree — failed attempts are rolled
-back with `git reset --hard`, and that guard is what keeps the rollback from
-reaching your uncommitted work.
-
-If a run stops and escalates to you, `run --resume` picks it up on the same
-branch, carrying what already failed so the next tier does not repeat it.
+`/prompt` writes this for you. Anything an agent doesn't set is inherited.
 
 ## Context between models
 
-A handoff crosses a model boundary, and often a provider boundary. Replaying
-the conversation is not an option: it costs tokens quadratically in the number
-of handoffs, and tool-call ids and message shapes do not survive a change of
-provider. Summarising instead throws away the two things a successor most
-needs — why a decision was made, and what has already been tried and failed.
+When one agent hands work to another — often a different model on a different
+provider — the conversation can't come with it. Replaying it costs tokens that
+grow with every handoff, and one provider's message format means nothing to
+another.
 
-So execution state is kept as a record and the successor is briefed from it:
+So jr-arch keeps a **shared record** of the work and briefs the next agent from
+that:
 
 ```
 ## Task (unmodified)
@@ -157,9 +193,6 @@ add json config support
 ## Why this reached you
 this needs a schema decision I cannot make
 
-## Next action
-decide on a schema shape before writing more parsing
-
 ## Decisions made
 - used JSON.parse directly — no schema library in the repo _(claimed, unverified)_
 
@@ -167,104 +200,175 @@ decide on a schema shape before writing more parsing
 - index.js
 
 ## Approaches already ruled out — do not repeat these
-- junior-dev: parsed the JSON inline in index.js — failed because this needs a
+- api-builder: parsed the JSON inline in index.js — failed because this needs a
   schema decision I cannot make
 ```
 
-That is the entire brief — about 700 characters instead of a transcript.
+That's the whole brief — around 700 characters, not a transcript.
 
-Note what is and is not marked. A worker's output is a **claim**; the harness
-records as verified only what it saw itself, so "files touched" is unmarked
-because the write actually happened, while the rationale beside it is flagged
-as the model's word. Failed approaches are append-only: a later tier cannot
-quietly drop the earlier one's failure from the record and re-attempt it.
-
-Budget with `routing.context_budget`. Sections trim before they drop, whatever
-was cut is named in the brief, and the task itself is never trimmed.
+Notice what's marked. What an agent *says* is a claim; jr-arch only records as
+fact what it saw happen. "Files touched" is unmarked because the write really
+occurred. And failed approaches can't be deleted by a later agent, so nobody
+tries the same dead end twice.
 
 Built on the approach in
 [context-orchestration-engine](https://context-orchestration-engine.vercel.app/).
 
-## Run `doctor` before you trust the tiers
+## Agents
 
-The four-tier ladder assumes reliable structured output and tool calling. Many
-smaller local models provide neither, and escalation then degrades into retry
-thrash that looks like a bug in this tool.
+An agent is a folder with a `SOUL.md` (who it is) and a `RULES.md` (what it must
+and must not do). It describes itself in front matter:
 
-`doctor` makes two real calls against your configured model and tells you whether
-tiered mode will hold. If it won't, set `routing.entry` to a single tier:
-
-```bash
-jr-arch config set routing.entry senior-dev
+```yaml
+---
+name: reviewer
+role: Reviews diffs before they land
+priority: 20              # lower numbers claim work first
+owns: ["**/*.test.js"]    # files it claims; [] means anything
+parallel: true            # may run beside agents with non-overlapping scope
+escalates_to: lead        # who takes over when it runs out of attempts
+terminal: true            # or: stop and ask you instead
+fixes_build: true         # a red build comes here first
+attempts: 2
+---
 ```
 
-Fail at setup, not mid-task.
+The folder *is* the install — create one and the agent exists, delete it and
+it's gone. There's no list to keep in sync.
+
+jr-arch ships four starter agents, but they're a default, not the product.
+Replace them with `/prompt`, write your own with `/dev`, or pull one from GitHub:
+
+```bash
+jr-arch add-agent https://github.com/you/my-reviewer
+jr-arch add-guard https://github.com/you/strict-guards
+```
+
+**One thing an agent can't choose is its model or key.** Agents can be pulled
+from any URL, and one deciding where your code gets sent would defeat the point.
+Model choice stays in your own `agent.yaml`.
+
+### Swarms
+
+Agents that opt in with `parallel: true` and have **non-overlapping** `owns` can
+run at the same time on one task:
+
+```bash
+jr-arch run "update the api and its tests" --swarm
+```
+
+They share the same context record. If one fails, only *its* files are rolled
+back — the others' work stays.
 
 ## Guardrails
 
-`hooks/hooks.yaml` is enforced by the harness, not by prompt text — a model that
-ignores its own `RULES.md` still cannot get past it.
+Guardrails are enforced by jr-arch itself, not by asking the model nicely. A
+model that ignores its own `RULES.md` still can't get past them.
 
-| Phase | Hook | Blocks | Overridable |
+| When | Guard | Stops | Can be turned off |
 |---|---|---|---|
-| edit | `secret-scan` | diffs introducing credential-shaped strings | no |
+| edit | `secret-scan` | code introducing API keys or private keys | **no** |
 | edit | `protected-paths` | `.env*`, `.git/`, lockfiles, CI config | yes |
-| edit | `diff-ceiling` | oversized single edits | yes |
-| edit | `scope-fence` | `ui-editor` reaching into logic | yes |
-| command | `no-force-push` | force push and history rewrites | no |
-| command | `protected-read` | commands naming `.env`, `.git/`, key material | no |
-| command | `no-sudo` | privilege escalation | no |
-| command | `no-exfil` | `curl`/`scp`/`ssh` to a network destination | yes |
-| command | `destructive` | `rm -rf`, `git clean -f`, database drops | yes |
-| command | `dep-change` | routes to a human checkpoint, does not block | yes |
-| commit | `build-gate` | committing a red build | yes |
+| edit | `diff-ceiling` | huge single edits (asks you) | yes |
+| edit | `scope-fence` | an agent editing outside its lane | yes |
+| command | `no-force-push` | force pushes and history rewrites | **no** |
+| command | `protected-read` | reading `.env`, `.git/`, key files | **no** |
+| command | `no-sudo` | privilege escalation | **no** |
+| command | `no-exfil` | `curl`/`scp`/`ssh` sending data out | yes |
+| command | `destructive` | `rm -rf`, `git clean -f`, dropping databases | yes |
+| command | `dep-change` | dependency changes (asks you) | yes |
+| commit | `build-gate` | committing a failing build | yes |
 
-`secret-scan`, `no-force-push`, `protected-read`, and `no-sudo` are sealed in
-code, not merely marked non-overridable in the file they are declared in.
-Editing `hooks.yaml` cannot disable them, downgrade their severity, or shorten
-their lists — it can only widen them. Deleting the file entirely still leaves
-them running. With bring-your-own-key, the one thing a user must not be able to
-switch off is the check that stops a key from leaving the machine.
+The four marked **no** are sealed in code. No guard file — yours, a pulled one,
+or a generated one — can disable them, weaken them, or shorten their lists.
 
-Commands run through `execFile` with `shell:false`, so `run_command` takes an
-argv array and there are no shell metacharacters to smuggle a bypass through.
-Gating a free-form shell string is not reliably possible; gating argv is. The
-write hooks would be theatre without this — blocking edits to `.env` while
-allowing `cat .env` is not a guardrail.
+### Writing your own
 
-## Design notes
+Every YAML file in `.gitagent/hooks/` is loaded, and a guard is enforced by
+what it declares — name it anything:
 
-**Entry tier comes from repo state and task shape, not language or framework.**
-A CSS tweak in a Go repo is still UI work.
+```yaml
+pre_edit:
+  - name: keep-payments-safe
+    severity: block              # block · warn · checkpoint (stops and asks you)
+    paths:
+      - "payments/**"
 
-**Build doctor never owns the feature task.** It is delegated to, fixes the build,
-hands control back to the calling tier at the same step.
-
-**Senior dev is terminal.** It escalates to the human, not to another agent.
-
-**`ui-editor` is a peer of `junior-dev`, not below it.** The split is by domain,
-not seniority, so it hands sideways.
-
-## Customizing
-
-Editing, not configuration. To make the junior tier bolder, raise
-`junior_retry_limit` in `agent.yaml` and loosen the file ceiling in its
-`RULES.md`. To add a fifth tier:
-
-```bash
-jr-arch personas add reviewer
+pre_command:
+  - name: no-terraform
+    severity: checkpoint
+    commands: ["terraform"]
+    applies_to: [api-builder]    # optional: only these agents
 ```
 
-That creates the persona, adds it to the `agents:` list in `agent.yaml`, and
-puts a row in the `DUTIES.md` tier table. What it will not write for you is the
-escalation rule — who this tier hands to, and when. That is a decision, and a
-guess in the contract file is worse than a visible gap.
+An edit guard stops changes but still lets agents *read* the file — they usually
+need to understand code they aren't allowed to touch. To stop reading as well,
+put the path in a `pre_command` guard: that covers both `cat` and the agent's
+read tool, since blocking one and not the other would just move the leak.
+
+## Running tasks safely
+
+- Every run works on its **own git branch**, so you can review it, merge it, or
+  throw it away.
+- `run` won't start with uncommitted changes, because a failed attempt is rolled
+  back and that must never reach your work. Commit or stash first.
+- A failed agent rolls back **only the files it touched**.
+- Dependency changes and very large edits **stop and ask you** — even in
+  automation, unless a person passes `--yes`. Want the same for migrations or
+  auth code? Add a `checkpoint` guard for those paths; `/prompt` offers to write
+  one. (The default agents' rules also *tell* them to ask first, but a rule is
+  a request — only a guard is enforced.)
+- If a run gets stuck, `run --resume` picks it up on the same branch, knowing
+  what already failed.
+
+## Commands
+
+| Command | |
+|---|---|
+| `jr-arch` | Guided setup on first run, then the chat |
+| `jr-arch run "<task>"` | One task, no chat — `--agent`, `--swarm`, `--dry-run`, `--resume`, `--yes` |
+| `jr-arch smoke [agent]` | Check an agent works — `--offline` skips the model call |
+| `jr-arch add-agent <url>` | Install an agent from a git repo |
+| `jr-arch add-guard <url>` | Install a guard file from a git repo |
+| `jr-arch agents` | List installed agents |
+| `jr-arch key [<value>]` | Store a key, or show which are set — `--env <NAME>`, `remove` |
+| `jr-arch config` | Show model and routing — `config set <section.key> <value>` |
+| `jr-arch init` | Scaffold without the guided setup — `--provider`, `--model`, `--from <url>` |
+| `jr-arch detect` | Report the stack, test command, and lockfile |
+| `jr-arch pull` | Update an installed pack, keeping your edits |
+| `jr-arch doctor` | Check your model supports tool calling |
+
+## What's in `.gitagent/`
+
+```
+.gitagent/
+├── agents/
+│   └── <name>/
+│       ├── SOUL.md       who the agent is, what it owns
+│       └── RULES.md      what it must and must not do
+├── hooks/                guardrails — every .yaml here is enforced
+├── agent.yaml            model, provider, per-agent models
+├── DUTIES.md             how agents hand work to each other
+├── config/               sandbox and git settings
+├── memory/               what agents learn about this repo
+└── .env                  your keys — gitignored, unreadable by agents
+```
+
+Everything except `.env` is plain text meant to be committed. Review a change to
+an agent's rules in a pull request like any other code. Type `/tree` in the chat
+to see your own, with the full path to every file.
+
+## Privacy
+
+jr-arch sends nothing anywhere on its own — no telemetry, no analytics, no crash
+reports, no update checks. The only network traffic is to the AI provider you
+configured, plus any `add-agent`, `add-guard`, or `init --from` you run yourself.
 
 ## Format
 
-Files follow the [OpenGAP](https://www.gitagent.sh/) layout, so the folder stays
-portable to other GAP-compatible runtimes. This CLI is an independent project and
-is not affiliated with the OpenGAP maintainers.
+The folder follows the [OpenGAP](https://www.gitagent.sh/) layout, so it stays
+portable to other GAP-compatible tools. jr-arch is independent and not affiliated
+with the OpenGAP maintainers.
 
 ## License
 
