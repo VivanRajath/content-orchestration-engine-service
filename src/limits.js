@@ -1,9 +1,10 @@
 import { join } from 'node:path';
 import { agentDir } from './paths.js';
-import { readManifest, modelFor, setTierMaxTokens, clearTierMaxTokens, setModelMaxTokens } from './config.js';
+import { readManifest, modelFor, setTierMaxTokens, clearTierMaxTokens, setModelMaxTokens, setTokensPerMinute } from './config.js';
 import { readAgents } from './agents.js';
 import { PROVIDERS, providerFor, baseUrlFor, wireFor } from './providers.js';
 import { parseProviderError } from './provider.js';
+import { budgetFor, formatTokens } from './budget.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -359,7 +360,28 @@ export async function showLimits({ dir = agentDir(), fetchImpl = fetch, probe = 
   }
 
   printProviderLimits(limits, { provider: manifest.provider, model: manifest.model });
+
+  // A measured limit is a fact about the key, and the run loop fits every
+  // request against it. Keeping it current is this command's job.
+  const measured = limits.rows?.find((r) => r.key === 'tokens')?.limit
+    ?? limits.rows?.find((r) => r.key === 'input')?.limit
+    ?? null;
+  if (measured && measured !== manifest.tokensPerMinute) {
+    setTokensPerMinute(measured, join(dir, 'agent.yaml'));
+    info(c.d(`  recorded as the per-request budget (was ${manifest.tokensPerMinute ?? 'unset'})`));
+  }
+
+  const budget = budgetFor(measured ? { ...manifest, tokensPerMinute: measured } : manifest);
   console.log();
+  if (budget) {
+    console.log(`  ${c.b('Per request')}  ${c.d('what one step may cost, prompt and reply together')}`);
+    info(`  ${formatTokens(budget).padStart(23)}  ${c.d('requests over this are refused, so the loop trims to fit')}`);
+    console.log();
+  } else {
+    info(c.d('  No per-minute limit recorded, so requests are sent unfitted.'));
+    console.log();
+  }
+
   printAgentCaps(manifest, agents);
 
   const suggested = suggestedCap(limits);

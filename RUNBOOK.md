@@ -9,7 +9,7 @@ them), what changed over time, and what is currently wrong or incomplete.
 - How it fits together: [ARCHITECTURE.md](ARCHITECTURE.md)
 - Agent-facing project notes: [CLAUDE.md](CLAUDE.md)
 
-This file is current as of **0.1.3** (22 commits plus uncommitted work, 535 passing tests).
+This file is current as of **0.1.3** (24 commits plus uncommitted work, 564 passing tests).
 
 ---
 
@@ -92,7 +92,7 @@ decision-log entry in [§6](#6-decisions-log) that explains why.
 ### Commands
 
 ```bash
-npm test                                   # node --test — all 535, ~50s
+npm test                                   # node --test — all 564, ~50s
 node --test test/hooks.test.js             # one file
 node --test --test-name-pattern "sealed"   # by name
 node bin/jr-arch.js --help                 # run from source
@@ -531,6 +531,11 @@ which test pins it. Reverse one only with a new entry here that explains why.
 | **Provider limits are recovered from, or explained** | Groq free tier OTPM, rate limits; raw provider JSON never reaches the user | `request()`, `parseProviderError()`, `describeError()` | `limits.test.js` |
 | **Streaming stops retrying at the first byte** | Tokens already on screen can't be replayed | `request()` stream path | — |
 | **A JSON body in answer to a streaming request is parsed as JSON** | Some OpenAI-compatible servers ignore `stream: true` | `request()` content-type check | `stream.test.js` |
+| **A request is fitted before it is sent** | The loop used to send whatever had accumulated and let the provider judge. On an 8k/min key one 7.3k-token README produced "Limit 8000, Requested 10,664", and the recovery shrank the reply cap — the half that was not too big — so the retry failed larger | `fit()` in `budget.js`, called per request in `attempt()` | `production-fixes.test.js` |
+| **Estimate by characters, not a tokenizer** | A tokenizer is a dependency, and this decision — does it fit, what goes — survives a 15% error. A provider's rejection reports the true count, so `calibrate()` learns the real ratio from it | `estimateRequest()`, `calibrate()` | `budget.test.js` |
+| **The reply cap goes before history does** | A shorter answer still answers; a dropped file has to be read again. What is dropped leaves a note, because a model that cannot see the gap assumes it remembers the file | `fit()` | `budget.test.js` |
+| **`read_file` is sized by the budget** | 200,000 characters is ~50,000 tokens: more than a small key's whole minute, so one read made every later request in the attempt unaffordable | `readCeiling()`, `read_file` | `production-fixes.test.js` |
+| **A prompt over the budget stops before the first request** | It is a fact about the key that no trimming reaches, and four attempts discovering it cost four requests | `fit()` `fits:false`, `run()` | `production-fixes.test.js` |
 | **Limits are read from provider headers, never hard-coded** | Every plan of every provider differs, and a table would be wrong the week it shipped. `{found:false}` when a provider reports nothing is an answer, not an error | `parseRateLimits()`, `listModels` `onHeaders` | `token-limits.test.js` |
 | **The limit probe asks for one token, and reads error responses too** | It must cost nothing, and a throttled key still carries its limit headers on the 429 | `probeLimits()` | `token-limits.test.js` |
 | **Setup fits the reply cap under the key's output allowance** | A provider refuses a request that merely ASKS for more than the allowance, so a too-high cap fails every task until the user finds the number | `suggestedCap()`, `onboard()` | `token-limits.test.js` |
@@ -661,6 +666,7 @@ Commit-by-commit, with what changed and why. All dates are 2026.
 | 09-15 | `340a2fc` | **feat**: phase 1: guided setup, `/prompt`, `/dev`, smoke tests | onboarding via model listing; provider registry; model-proposes/harness-writes; `/check`; `/smoke` |
 | 09-15 | `f5b8c5c` | **fix**: the chat works in a real terminal | single prompter; masked secret echo; Windows Ctrl+V; listener leak; `terminal.test.js` |
 | 09-15 | `ddbabb3` | **fix**: handle provider limits instead of dying on them | `ProviderError` kinds, OTPM shrink + learned caps, rate-limit waits, JSON-for-stream fallback, `/prompt` failure menu, `brevity()` |
+| uncommitted | — | **request budgets**: `src/budget.js`, per-request fitting, budget-sized reads, the pre-flight estimate in chat, `model.tokens_per_minute` measured at setup | a small free tier now works and explains itself instead of failing four times |
 | uncommitted | — | **twelve production fixes**: secret-scan token matching, pathspec commits, the no-commit-repo guard, swarm build gating and task-aware selection, DUTIES-less classification, `/undo` guards, local endpoints without keys, request-parameter adaptation, 64MB output buffers, the empty assistant turn, the chat's build-state handoff; plus templates that only declare what is read | each one failed quietly, which is the kind this project treats as worst |
 | uncommitted | — | **token limits**: `src/limits.js`, `jr-arch limits` / `/limits`, rate-limit headers shown at setup, per-agent `max_tokens` via `patchTierModel`; ENOBUFS and empty-assistant-turn fixes | a key's allowance is visible before the first task, and the reply cap is fitted to it |
 | uncommitted | — | `package.json` 0.1.2 → 0.1.3; `.gitignore` gains `.gitagent/.env` and `.gitagent/.session/` | this repo has been dogfooding itself (`.gitagent/` present, session branch checked out) |
@@ -688,6 +694,7 @@ because each one describes a shape of bug worth recognising again.
 | B9 | **An empty assistant turn** went to Anthropic as `content: []`, which the API rejects — reachable whenever a reply is cut off at a low `max_tokens`. | `toAnthropicMessages` substitutes a `(no reply)` text block. | `token-limits.test.js` |
 | B10 | **OpenAI reasoning models were unusable**: they reject `max_tokens` and a non-default temperature, and both were always sent. | The request layer reads the refusal, adapts the payload, remembers it per provider and model, and resends. No model ids are hard-coded. | `production-fixes.test.js` |
 | B11 | **`--swarm` was not task-aware**: it fanned out to every parallel agent owning any file in the repo, at one model call each. | `selectSwarm()` asks which agents the task spans; ownership is only the fallback. | `swarm.test.js` |
+| B13 | **A request that did not fit was discovered by being refused.** The reply cap was shrunk while the input grew, so the retry failed larger, and the attempt was spent. | Budget measured at setup, every request fitted under it, `read_file` sized to it, and an impossible prompt refused before the first call. | `production-fixes.test.js`, `budget.test.js` |
 | B12 | **The chat ran the project's test suite twice per message** (entry state, then the commit gate). | `run()` accepts the build state the previous turn verified; the post-task verify still runs for real. | `production-fixes.test.js` |
 
 ### 9.2 Fixed: configuration that was written but not read
@@ -774,7 +781,8 @@ From `CLAUDE.md` "Next", plus the gaps above that most need fixing.
 | 4 | `routing.entry` still names one agent | |
 | 5 | Swarm still does not escalate | Ladder and swarm remain two paths through `run()`; selection is now task-aware but a failed swarm agent has nowhere to go |
 | 6 | `doctor` probes only the default key | Iterate `keyEnvs()` / `modelFor` per agent |
-| 7 | Token accounting per agent and per model | `limits` reports the allowance and sets the cap; nothing counts what a run actually spent |
+| 7 | Token accounting per agent and per model | The budget work estimates what a request *will* cost and `limits` reports the allowance; nothing yet records what a finished run actually spent |
+| 7b | A fallback provider chain | `model.fallback:` used on a too-large or rate-limit error. Per-agent models already cover this by hand (see README "Working under a small limit"); a chain would automate it, and must stay explicit config because it decides where code is sent |
 | 8 | Memory is inert | `memory/MEMORY.md` is documentation. Either feed it to agents or drop it |
 | 9 | `post_run` hooks are loaded but never executed | Run them, or stop loading the phase |
 

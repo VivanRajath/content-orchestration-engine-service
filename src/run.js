@@ -5,6 +5,7 @@ import { readManifest, modelFor } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
 import { callModel, extractJson, isFatalProviderError } from './provider.js';
 import { classify, selectSwarm } from './classify.js';
+import { budgetFor, fit, estimateRequest, describeBudget, formatTokens, readCeiling } from './budget.js';
 import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
 import {
@@ -131,6 +132,28 @@ export async function run(positional, flags, { call = callModel, prompter = null
     console.log();
   }
 
+  const budget = budgetFor(manifest);
+  const entryAgent = findAgent(entry.tier, agents);
+  if (entryAgent) {
+    const preflight = fit({
+      system: prompt({ dir, agents }, entryAgent),
+      messages: [{ role: 'user', content: brief }],
+      tools: TOOLS,
+      maxTokens: modelFor(manifest, entry.tier).maxTokens,
+      budget,
+      manifest,
+    });
+    // The cost of a step, before the first one. On a small key this is the
+    // difference between "about 3 steps a minute" and a 429 twenty seconds in.
+    info(c.d(`  ${describeBudget(preflight)}`));
+    if (!preflight.fits) {
+      warn(`This will not fit: ${preflight.reason}`);
+      info('Pick a model with a higher limit (/models), or put this agent on another key.');
+      info(c.d('  jr-arch limits   shows what this key allows'));
+      return { status: 'stopped', tier: entry.tier, reason: preflight.reason, fatal: 'budget' };
+    }
+  }
+
   if (flags['dry-run']) {
     info('Dry run — no session opened, nothing written.');
     return { tier: entry.tier, dryRun: true };
@@ -167,6 +190,9 @@ export async function run(positional, flags, { call = callModel, prompter = null
     prompter,
     askLock: { tail: Promise.resolve() },
     contextBudget: manifest.raw?.routing?.context_budget ?? 6000,
+    // What one request to this key may cost, from the rate-limit headers the
+    // provider gave us at setup. null when unknown, and then nothing is fitted.
+    budget: budgetFor(manifest),
     // Canonical execution state, owned by the loop and never by a tier. This
     // is what makes a handoff survive a change of model.
     ledger: prior ? priorLedger(prior, subject) : newLedger(subject),
@@ -460,7 +486,14 @@ export async function swarmFor(ctx, { task = '', files = [] } = {}) {
 async function attempt(ctx, frame, brief) {
   const messages = [{ role: 'user', content: brief }];
   const system = prompt(ctx, ctx.agent ?? findAgent(frame.tier, ctx.agents) ?? { name: frame.tier, dir: join(ctx.dir, 'agents', frame.tier), owns: [] });
-  const toolCtx = { ...ctx, tier: frame.tier, touched: new Set() };
+  const toolCtx = {
+    ...ctx,
+    tier: frame.tier,
+    touched: new Set(),
+    // A file bigger than the key's per-request allowance cannot be read whole
+    // by anyone, so the tool truncates rather than guaranteeing a refusal.
+    readCeiling: readCeiling(ctx.budget, ctx.tierModel ?? ctx.manifest),
+  };
   // Checkpoints are asked by tools.js BEFORE the write or command, through this.
   // A "no" is remembered for the attempt, so a model retrying the same thing
   // gets the same answer instead of asking the human again and again.
@@ -480,11 +513,28 @@ async function attempt(ctx, frame, brief) {
   while (frame.steps < ctx.maxSteps) {
     frame.steps++;
 
+    // Fit before sending, not after being refused. A reply cap is reduced
+    // first; only when there is no room to answer in does the oldest tool
+    // output go, which is where the weight actually is.
+    const room = fit({
+      system, messages, tools: TOOLS,
+      maxTokens: (ctx.tierModel ?? ctx.manifest).maxTokens,
+      budget: ctx.budget,
+      manifest: ctx.tierModel ?? ctx.manifest,
+    });
+    for (const t of room.trimmed) {
+      warn(`dropped ${formatTokens(t.tokens)} tokens of earlier ${t.name} output to fit this key’s limit`);
+    }
+    if (!room.fits) {
+      return { kind: 'fatal', reason: `this step does not fit the key's budget — ${room.reason}`, fatal: 'budget' };
+    }
+
     let reply;
     const stream = ctx.stream ? streamWriter() : null;
     try {
       reply = await ctx.call(ctx.tierModel ?? ctx.manifest, {
         system, messages, tools: TOOLS,
+        ...(room.budget ? { maxTokens: room.maxTokens } : {}),
         ...(stream ? { onDelta: stream.write } : {}),
       });
     } catch (e) {

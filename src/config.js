@@ -276,6 +276,17 @@ export function setModelMaxTokens(value, file = manifestPath()) {
   writeFileSync(file, upsertScalar(readFileSync(file, 'utf8'), 'model', 'max_tokens', value));
 }
 
+/**
+ * What the provider said this key may spend a minute, as last measured.
+ *
+ * Written from the rate-limit headers rather than typed by anyone: it is a fact
+ * about the key, it changes when the plan changes, and `jr-arch limits`
+ * refreshes it.
+ */
+export function setTokensPerMinute(value, file = manifestPath()) {
+  writeFileSync(file, upsertScalar(readFileSync(file, 'utf8'), 'model', 'tokens_per_minute', value));
+}
+
 /** One agent's own reply cap, in the user's manifest — never in its SOUL.md. */
 export function setTierMaxTokens(agent, value, file = manifestPath()) {
   const { text } = patchTierModel(readFileSync(file, 'utf8'), agent, 'max_tokens', value);
@@ -312,6 +323,8 @@ export function readManifest(file = manifestPath()) {
 
     temperature: nil(model.temperature),
     maxTokens:   nil(model.max_tokens),
+    // What the key allows per minute, measured at setup. Null until it is.
+    tokensPerMinute: nil(model.tokens_per_minute),
 
     // One number, not one per agent name. An agent that wants a different
     // budget declares `attempts:` in its own front matter.
@@ -363,6 +376,10 @@ export function modelFor(manifest, tier) {
       : nil(over.base_url),
     temperature: pick('temperature', manifest.temperature),
     maxTokens:   pick('max_tokens', manifest.maxTokens),
+    // An agent on another provider has that provider's allowance, not this one.
+    tokensPerMinute: over.provider && over.provider !== manifest.provider
+      ? pick('tokens_per_minute', null)
+      : pick('tokens_per_minute', manifest.tokensPerMinute),
     tier,
   };
 }
