@@ -183,6 +183,19 @@ const MIN_OUTPUT = 400;
  *   model       the model does not exist, or cannot do what was asked.
  *   server      the provider is having trouble.
  */
+/**
+ * Will this error be exactly the same on the next attempt?
+ *
+ * A wrong key and a model that cannot do what was asked are settings, not
+ * weather. The ladder used to treat them as ordinary attempt failures: a model
+ * without tool calling burned two attempts at one agent, escalated, burned two
+ * more at the next, and reported the same sentence four times — four paid
+ * requests to learn something the first reply already said.
+ */
+export function isFatalProviderError(err) {
+  return err instanceof ProviderError && (err.kind === 'model' || err.kind === 'auth');
+}
+
 export class ProviderError extends Error {
   constructor(message, fields = {}) {
     super(message);

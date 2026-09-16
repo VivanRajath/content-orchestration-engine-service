@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { readManifest, modelFor } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
-import { callModel, extractJson } from './provider.js';
+import { callModel, extractJson, isFatalProviderError } from './provider.js';
 import { classify, selectSwarm } from './classify.js';
 import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
@@ -199,7 +199,12 @@ export async function run(positional, flags, { call = callModel, prompter = null
             summary: result.done.map((d) => `${d.agent.name}: ${d.result.summary}`).join('; '),
             build,
           }
-        : { status: 'stopped', reason: 'every agent in the swarm failed', detail: result.failed[0]?.result?.reason };
+        : {
+            status: 'stopped',
+            reason: 'every agent in the swarm failed',
+            detail: result.failed[0]?.result?.reason,
+            fatal: result.failed.find((f) => f.result.fatal)?.result.fatal ?? null,
+          };
       if (outcome.status !== 'stopped') {
         for (const d of result.done) commit(ctx, d.frame, d.result.summary);
       }
@@ -253,6 +258,14 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
     );
     const frame = openAttempt(ctx.session, { tier: current, task: brief, reason, owns: agentOf(ctx, current).owns });
     const result = await attempt({ ...ctx, tierModel }, frame, brief);
+
+    if (result.kind === 'fatal') {
+      // No handoff report and no escalation: the report is another call to the
+      // provider that just refused, and the next agent would use the same one.
+      closeAttempt(ctx.session, frame, { status: 'failed', reason: result.reason });
+      revertAttempt(ctx.session, frame);
+      return { status: 'stopped', tier: current, reason: result.reason, fatal: result.fatal };
+    }
 
     if (result.kind === 'done') {
       const check = await verifyAndGate(ctx);
@@ -379,7 +392,11 @@ export async function swarm(ctx, group, { task, brief }) {
     } else {
       await gitLock(ctx, async () => {
         closeAttempt(ctx.session, frame, { status: result.kind, reason: result.reason });
-        await record(ctx, { frame, tierModel, status: result.kind, reason: result.reason, result });
+        // Same rule as the ladder: do not ask a provider that just refused for
+        // a handoff report.
+        if (result.kind !== 'fatal') {
+          await record(ctx, { frame, tierModel, status: result.kind, reason: result.reason, result });
+        }
         // Only this agent's files. Its siblings succeeded on paths it never
         // owned, and a whole-tree reset would throw their work away too.
         revertAttempt(ctx.session, frame);
@@ -472,6 +489,9 @@ async function attempt(ctx, frame, brief) {
       });
     } catch (e) {
       stream?.end();
+      // A wrong key, or a model that cannot do this at all, is the same answer
+      // every time. Retrying it is the loop paying to be told twice.
+      if (isFatalProviderError(e)) return { kind: 'fatal', reason: e.message, fatal: e.kind };
       return { kind: 'failed', reason: `model call failed: ${e.message}` };
     }
     stream?.end();
