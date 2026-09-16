@@ -1,18 +1,37 @@
 {
   "name": "jr-arch",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Coding agent in your terminal. Scaffolds a GAP-format .gitagent/ folder with editable personas and harness-enforced guardrails. Bring your own model and key.",
   "type": "module",
-  "bin": { "jr-arch": "./bin/jr-arch.js", "jra": "./bin/jr-arch.js" },
+  "bin": {
+    "jr-arch": "./bin/jr-arch.js",
+    "jra": "./bin/jr-arch.js"
+  },
   "scripts": {
     "test": "node --test",
     "prepublishOnly": "node --test"
   },
-  "files": ["bin", "src", "templates", "README.md", "LICENSE"],
-  "engines": { "node": ">=18" },
+  "files": [
+    "bin",
+    "src",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "keywords": [
-    "gitagent", "opengap", "coding-agent", "ai-agent", "cli",
-    "llm", "anthropic", "openai", "ollama", "bring-your-own-key"
+    "gitagent",
+    "opengap",
+    "coding-agent",
+    "ai-agent",
+    "cli",
+    "llm",
+    "anthropic",
+    "openai",
+    "ollama",
+    "bring-your-own-key"
   ],
   "author": "Vivan Rajath",
   "license": "MIT",
@@ -21,5 +40,7 @@
     "url": "git+https://github.com/VivanRajath/content-orchestration-engine-service.git"
   },
   "homepage": "https://github.com/VivanRajath/content-orchestration-engine-service#readme",
-  "bugs": { "url": "https://github.com/VivanRajath/content-orchestration-engine-service/issues" }
+  "bugs": {
+    "url": "https://github.com/VivanRajath/content-orchestration-engine-service/issues"
+  }
 }
