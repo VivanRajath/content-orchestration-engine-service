@@ -10,7 +10,9 @@ const p = (s) => parseYaml(s, 'test.yaml');
 describe('the shipped files parse', () => {
   test('hooks.yaml keeps its structure', () => {
     const doc = p(readFileSync(join(TEMPLATES, 'hooks', 'hooks.yaml'), 'utf8'));
-    assert.deepEqual(Object.keys(doc), ['pre_edit', 'pre_command', 'pre_commit', 'post_run']);
+    // No post_run: nothing executes that phase, and a hook that never runs is
+    // the thing this project refuses to ship.
+    assert.deepEqual(Object.keys(doc), ['pre_edit', 'pre_command', 'pre_commit']);
 
     const scan = doc.pre_edit.find((h) => h.name === 'secret-scan');
     assert.equal(scan.overridable, false);
@@ -37,13 +39,17 @@ describe('the shipped files parse', () => {
     assert.equal(doc.agents, undefined);
   });
 
-  test('default.yaml keeps booleans as booleans', () => {
-    const doc = p(readFileSync(join(TEMPLATES, 'config', 'default.yaml'), 'utf8'));
-    assert.equal(doc.sandbox.enabled, false);
-    assert.equal(doc.sandbox.allow_shell, false);
-    assert.equal(doc.git.auto_commit, true);
-    assert.equal(doc.git.auto_push, false);
-    assert.equal(doc.telemetry.enabled, false);
+  test('booleans stay booleans, in the files that are actually read', () => {
+    // git settings live in agent.yaml because that is the file readManifest
+    // reads; default.yaml carries the telemetry claim and nothing else.
+    const env = p(readFileSync(join(TEMPLATES, 'config', 'default.yaml'), 'utf8'));
+    assert.equal(env.telemetry.enabled, false);
+    assert.equal(env.sandbox, undefined, 'a setting nothing implements is not shipped');
+
+    const manifest = p(readFileSync(join(TEMPLATES, 'agent.yaml'), 'utf8'));
+    assert.equal(manifest.git.session_branch, true);
+    assert.equal(manifest.git.auto_commit, true);
+    assert.equal(manifest.git.branch_prefix, 'jr-arch');
   });
 });
 

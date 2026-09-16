@@ -2,9 +2,10 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { init } from './init.js';
-import { readManifest, patchSection } from './config.js';
+import { readManifest, patchSection, setModelMaxTokens } from './config.js';
 import { writeKey, ensureIgnored, fingerprint } from './env.js';
 import { PROVIDERS, detectProvider, providerFor, listModels, KeyRejected } from './providers.js';
+import { parseRateLimits, probeLimits, printProviderLimits, suggestedCap } from './limits.js';
 import { printTree } from './tree.js';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { c, ok, info, warn } from './util.js';
@@ -45,6 +46,16 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   const model = await pickModel(prompter, conn);
   if (!model) return null;
 
+  // What this key may actually spend, before the first task rather than as a
+  // 429 during one. The listing above may already have carried the headers; if
+  // it did not, one 1-token request asks the model endpoint directly.
+  const limits = conn.limits?.found
+    ? conn.limits
+    : await probeLimits({ provider: conn.provider, model, key: conn.key, baseUrl: conn.baseUrl, fetchImpl });
+  console.log();
+  printProviderLimits(limits, { provider: conn.provider, model });
+  const cap = suggestedCap(limits);
+
   // --- 3. scaffold ----------------------------------------------------------
   step(3, 'Create your agent folder');
   const dir = agentDir();
@@ -55,6 +66,14 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   } else {
     await init({ provider: conn.provider, model, 'base-url': conn.baseUrl ?? undefined, quiet: true });
   }
+
+  // A reply cap above the key's own output allowance is not ambitious, it is
+  // broken: the provider refuses a request that merely ASKS for more, so every
+  // task would fail until someone found the number. Fit it to the key now,
+  // while we have just been told what the key allows.
+  const configured = readManifest(join(dir, 'agent.yaml')).maxTokens;
+  const capped = cap && (configured == null || cap < configured);
+  if (capped) setModelMaxTokens(cap, join(dir, 'agent.yaml'));
 
   if (conn.key) {
     ensureIgnored(root);
@@ -67,6 +86,12 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   ok(`Created ${c.c('.gitagent/')}`);
   printTree(dir);
   explainFiles(conn);
+
+  if (capped) {
+    info(`Replies are capped at ${c.c(cap.toLocaleString())} tokens ${c.d('— under what this key allows')}`);
+  }
+  info(c.d('See or change that with /limits, or jr-arch limits.'));
+  console.log();
 
   // --- 4. mode --------------------------------------------------------------
   step(4, 'How do you want to start?');
@@ -126,15 +151,16 @@ export async function obtainKey(prompter, { fetchImpl = fetch, attempts = 3 } = 
     }
 
     process.stdout.write(`  ${c.d('Checking the key…')} `);
+    let seenHeaders = null;
     try {
-      const models = await listModels(provider, key, { baseUrl, fetchImpl });
+      const models = await listModels(provider, key, { baseUrl, fetchImpl, onHeaders: (h) => { seenHeaders = h; } });
       console.log(c.g('works'));
       if (!models.length) {
         warn('The key works, but no chat models came back. You can still type a model name.');
       } else {
         ok(`${models.length} model${models.length === 1 ? '' : 's'} available`);
       }
-      return { provider, key, baseUrl, keyEnv: providerFor(provider).keyEnv, models };
+      return { provider, key, baseUrl, keyEnv: providerFor(provider).keyEnv, models, limits: parseRateLimits(seenHeaders) };
     } catch (e) {
       console.log(c.r('failed'));
       if (e instanceof KeyRejected) {
@@ -147,7 +173,7 @@ export async function obtainKey(prompter, { fetchImpl = fetch, attempts = 3 } = 
         // is not running. Offer to keep the key anyway rather than trapping
         // someone who is offline in a loop they cannot pass.
         if (await prompter.confirm('Save this key anyway and pick a model by name?', false)) {
-          return { provider, key, baseUrl, keyEnv: providerFor(provider).keyEnv, models: [] };
+          return { provider, key, baseUrl, keyEnv: providerFor(provider).keyEnv, models: [], limits: parseRateLimits(null) };
         }
       }
     }

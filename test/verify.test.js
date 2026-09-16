@@ -145,3 +145,23 @@ describe('winCmd — the Windows .cmd shim path', () => {
     assert.deepEqual(resolveBin('git', ['status'], 'win32'), { bin: 'git', args: ['status'] });
   });
 });
+
+test('a command that prints a lot is not mistaken for a timeout', () => {
+  // execFileSync kills at its buffer limit and reports SIGTERM, which reads as
+  // a timeout. A verbose but passing suite was coming back "unknown", so the
+  // build gate stopped gating.
+  const root = mkdtempSync(join(tmpdir(), 'jra-verbose-'));
+  try {
+    const noisy = 'for (let i = 0; i < 60000; i++) console.log("line " + i + " of an ordinary test log");';
+    const result = verify({
+      root,
+      command: { argv: [process.execPath, '-e', noisy], label: 'noisy build' },
+    });
+
+    assert.equal(result.green, true, 'exit 0 is a pass however much it printed');
+    assert.equal(result.reason, undefined);
+    assert.ok(result.output.length < 20000, 'and the output is still trimmed for the model');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

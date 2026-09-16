@@ -1,4 +1,5 @@
 import { readManifest } from './config.js';
+import { readAgents } from './agents.js';
 import { callModel, apiKey, requiresKey, extractJson, missingKey } from './provider.js';
 import { c, ok, info, warn } from './util.js';
 
@@ -8,7 +9,9 @@ import { c, ok, info, warn } from './util.js';
  * looks like a bug in this tool. Probe at setup, not mid-task.
  */
 
-const PROBE_JSON = 'Reply with only this JSON object and nothing else: {"tier":"junior-dev","confidence":0.9}';
+// A neutral value on purpose: this probe must not imply that the agents are
+// called anything in particular.
+const PROBE_JSON = 'Reply with only this JSON object and nothing else: {"tier":"example","confidence":0.9}';
 
 const TOOL = {
   name: 'read_file',
@@ -39,7 +42,7 @@ export async function doctor() {
       maxTokens: 256,
     });
     const parsed = extractJson(res.text);
-    jsonPass = parsed?.tier === 'junior-dev';
+    jsonPass = parsed?.tier === 'example';
     jsonPass ? ok('structured output') : warn('structured output — parsed, but wrong shape');
   } catch (e) {
     warn(`structured output — failed (${e.message.slice(0, 80)})`);
@@ -65,8 +68,10 @@ export async function doctor() {
   } else {
     warn(c.b('Tiered mode not recommended for this model.'));
     info('escalation would likely thrash between tiers');
-    info(`set routing.entry to ${c.c('senior-dev')} in agent.yaml to run single-agent:`);
-    info('  jr-arch config set routing.entry senior-dev');
+    // Whichever agent is most senior HERE, not whichever this scaffold ships.
+    const last = readAgents().slice(-1)[0]?.name;
+    info(`pin one agent in agent.yaml to run single-tier${last ? '' : ''}:`);
+    info(`  jr-arch config set routing.entry ${c.c(last ?? '<agent>')}`);
   }
   console.log();
 

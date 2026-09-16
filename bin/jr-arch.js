@@ -13,6 +13,7 @@ import { loadEnv, key } from '../src/env.js';
 import { addAgent, addGuard } from '../src/add.js';
 import { chat } from '../src/chat.js';
 import { smoke } from '../src/smoke.js';
+import { limits } from '../src/limits.js';
 import { c } from '../src/util.js';
 
 /**
@@ -57,6 +58,7 @@ ${c.b('COMMANDS')}
   add-guard <git-url>   Install a guardrail file
   agents                List installed agents
   key [<value>]         Store an API key, or show which are set
+  limits [set|unset]    Provider rate limits, and each agent's reply cap
   config                Show or change model, provider, and routing
   init                  Scaffold .gitagent/ without the guided setup
   detect                Report the stack, verify command, and lockfile state
@@ -76,6 +78,7 @@ ${c.b('OPTIONS')}
   --base-url <url>      For ollama, vLLM, OpenRouter, LM Studio
   --env <NAME>          Which variable the key command writes
   --yes                 Approve human checkpoints without asking
+  --no-git              Run without a branch or rollback (a failed attempt keeps its edits)
   --force               Overwrite what is already there
   --json                Machine-readable output where it applies
   --offline             For smoke: check files and keys, skip the model call
@@ -87,8 +90,10 @@ ${c.b('EXAMPLES')}
 
   jr-arch add-agent https://github.com/you/my-reviewer
   jr-arch add-guard https://github.com/you/strict-guards
-  jr-arch run "add a --json flag" --agent senior-dev
+  jr-arch run "add a --json flag" --agent <name>
   jr-arch config set model.name gpt-4o
+  jr-arch limits                              ${c.d('# what this key allows')}
+  jr-arch limits set junior-dev 2048          ${c.d('# cap one agent')}
 `;
 
 const argv = process.argv.slice(2);
@@ -101,7 +106,7 @@ const cmd = argv[0];
  * but "does this flag take a value" is not something a parser can infer.
  */
 const BOOLEAN = new Set([
-  'dry-run', 'force', 'minimal', 'yes', 'no-stream',
+  'dry-run', 'force', 'minimal', 'yes', 'no-stream', 'no-git',
   'allow-dirty', 'skip-verify', 'help', 'version', 'json', 'swarm', 'offline',
 ]);
 
@@ -131,6 +136,7 @@ try {
     case 'agents':    await personas(['list', ...positional], flags); break;
     case 'personas':  await personas(positional, flags); break;
     case 'key':       await key(positional, flags, { manifest: readManifest() }); break;
+    case 'limits':    await limits(positional, flags); break;
     case 'config':    await config(positional, flags); break;
     case 'detect':    await detect(positional, flags); break;
     case 'pull':      await pull(positional, flags); break;

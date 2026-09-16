@@ -201,6 +201,9 @@ Type a task and the right agent picks it up, or send it to one agent with
 | `jr-arch key` | Show which keys are set and where each comes from |
 | `jr-arch key <value>` | Store a key in `.gitagent/.env`. `--env <NAME>` picks the variable |
 | `jr-arch key remove` | Remove a key from `.gitagent/.env` |
+| `jr-arch limits` | Show what this key may spend, and each agent's reply cap. `--offline` skips the provider check |
+| `jr-arch limits set <agent\|default> <n>` | Cap one agent's replies, or the default every agent inherits |
+| `jr-arch limits unset <agent>` | Put an agent back on the default cap |
 | `jr-arch config` | Show model, per-agent models, routing entry |
 | `jr-arch config set <section.key> <value>` | Change one scalar in `agent.yaml`, e.g. `model.name gpt-4o` |
 | `jr-arch init` | Scaffold `.gitagent/` without the guided setup |
@@ -249,6 +252,7 @@ flags never do, so `run --dry-run "task"` keeps the task.
 | `--dry-run` | `run`, `pull` | Say what would happen and change nothing |
 | `--resume [<id>]` | `run` | Continue a stopped session. No id means the most recent |
 | `--yes` | `run` | Approve human checkpoints without asking. Must be typed by a person |
+| `--no-git` | `run` | Work without a branch or rollback. Only for a directory that is not a repo, or has no commits |
 | `--allow-dirty` | `run` | Start even with uncommitted changes (the chat always passes this) |
 | `--skip-verify` | `run` | Don't run the project's build/test command before starting |
 | `--no-stream` | `run` | Buffer model output instead of streaming it |
@@ -261,7 +265,7 @@ flags never do, so `run --dry-run "task"` keeps the task.
 | `--minimal` | `init` | Only `agent.yaml` and `DUTIES.md`, no bundled agents or hooks |
 | `--force` | `init`, `add-agent`, `add-guard`, `personas add`, `pull` | Overwrite what is already there |
 | `--env <NAME>` | `key` | Which environment variable to write or remove |
-| `--offline` | `smoke` | Check files, routing, guards and keys only |
+| `--offline` | `smoke`, `limits` | Skip the provider call: check files, routing, guards and keys only |
 | `--json` | `detect` | Machine-readable output |
 | `--mode <chat\|dev>` | `chat` | Starting mode |
 
@@ -276,6 +280,7 @@ flags never do, so `run --dry-run "task"` keeps the task.
 | `/chat` · `/prompt` · `/dev` | Switch mode |
 | `/key` | Add or change an API key (offers to switch provider) |
 | `/models` | Show each agent's model; switch the default |
+| `/limits` | Provider rate limits, each agent's reply cap, and set them |
 | `/agents` | Installed agents |
 | `/tree` | `.gitagent/` drawn with what each file is for |
 | `/smoke [name]` | Smoke-test one agent or all |
@@ -310,6 +315,42 @@ adds that file to `.gitignore` before writing to it (on POSIX systems the file
 is mode 0600). A key exported in your shell always takes precedence over the
 file. The agents can't read the key either: `.env*` is a sealed guardrail
 path, so both `read_file` and `cat` are refused.
+
+### Token limits
+
+Pasting a key also tells you what the key may spend. jr-arch reads the rate
+limits the provider reports and shows them before your first task, instead of
+letting you find out as a 429 in the middle of one:
+
+```
+  Provider limits  Groq · llama-3.3-70b-versatile
+    requests           14,400   14,398 left · resets in 3 min
+    tokens             18,000   17,600 left · resets in 30s
+```
+
+There are two different numbers here, and it's worth keeping them apart:
+
+- **Provider limits** are set by the plan your key belongs to. jr-arch only
+  reports them.
+- **The reply cap** (`max_tokens`) is the most one reply may generate. That one
+  is yours to set, per agent.
+
+The cap matters more than it looks. A provider refuses a request that merely
+*asks* for more output tokens than your per-minute allowance, so a cap set too
+high fails every task until you find the number; set too low, the model gets
+cut off mid tool call. If the provider reports an output limit, setup fits the
+default cap under it for you.
+
+```bash
+jr-arch limits                       # what the key allows, and every agent's cap
+jr-arch limits set default 4000      # the cap every agent inherits
+jr-arch limits set junior-dev 2048   # one agent only
+jr-arch limits unset junior-dev      # back to inheriting
+```
+
+`/limits` does the same inside the chat. A cap is stored per agent in
+`agent.yaml` under `tiers:`, so it survives and can be reviewed like any other
+config.
 
 ### A different model per agent
 
@@ -462,6 +503,12 @@ usually need to understand code they aren't allowed to touch. To block reading
 too, put the path in a `pre_command` guard. That covers both `cat` and the
 agent's read tool; blocking only one of them would leave the other open.
 
+`secret-scan` matches whole tokens, and a prefixed token has to look like a
+credential — long, with a random-looking mix of letters and digits. Ordinary
+code is not a secret: `task-row`, `risk-high` and `disk-usage` are left alone,
+as is an inline `data:` URI. Thresholds live in `hooks.yaml` under
+`high_entropy` if your repo needs them tuned.
+
 Glob rules: a pattern with no `/` matches a file name at any depth (`.env*`
 catches `packages/app/.env.local`). A pattern with a `/` is anchored at the repo
 root. `**` spans directories and `*` doesn't. Matching is case-insensitive.
@@ -476,6 +523,12 @@ running without that guard.
 - Every run works on its **own git branch** (`jr-arch/session-<id>`), so you can
   review it, merge it, or throw it away. The chat reuses one branch for the
   whole conversation.
+- `run` needs a repository with at least one commit. Both halves of the safety
+  net are git, and neither works without one, so it says so instead of running
+  where a failed attempt could not be undone. `--no-git` accepts that risk.
+- A commit contains **only the files the attempt is answerable for**, so your
+  own uncommitted work is never swept into an agent's commit, and everything
+  committed has been through the secret scan.
 - `run` won't start with uncommitted changes, because rolling back a failed
   attempt must never touch your own work. Commit or stash first, or pass
   `--allow-dirty`.
@@ -548,8 +601,8 @@ Built on the approach in
 │   └── project.yaml      written by /prompt, if it proposed guards
 ├── agent.yaml            model, provider, per-agent models, routing
 ├── DUTIES.md             the handoff protocol every agent is given
-├── config/               environment settings (see below)
-├── memory/               notes about this repo, reviewed like code
+├── config/               environment settings (telemetry claim)
+├── memory/               notes you keep about this repo
 ├── .pack.lock            what a pack installed, for `pull`
 ├── .session/             run transcripts and diffs — gitignored
 └── .env                  your keys — gitignored, unreadable by agents
@@ -587,7 +640,7 @@ routing:
   classifier_confidence_floor: 0.6
   # degraded_fallback: <agent> # where an unclassifiable task goes (default: last by priority)
 
-git:                            # optional; read from agent.yaml
+git:                            # how a run uses git
   session_branch: true         # false: work on the current branch
   branch_prefix: jr-arch
   auto_commit: true            # false: leave successful work uncommitted
@@ -615,13 +668,15 @@ file's comments intact.
 | Symptom | Fix |
 |---|---|
 | `No .gitagent/ found` | Run `jr-arch` (guided) or `jr-arch init` |
+| `is not a git repository` / `no commits yet` | `git init && git add -A && git commit -m "initial commit"`, or pass `--no-git` to accept no rollback |
 | `$GROQ_API_KEY is not set` | `jr-arch key <your-key>`, or export it in your shell |
 | `The working tree has N uncommitted change(s)` | Commit or stash, or pass `--allow-dirty` |
 | `the model replied with prose and called no tool` | The model can't use tools. Run `jr-arch doctor`, then pick another model with `/models` |
 | `hit the 40-step ceiling` | Split the task, or raise `routing.max_steps` |
 | `hooks/<file>.yaml:N: …` | A guard file doesn't parse. Fix it (spaces, not tabs; no anchors or flow maps) |
 | `No base_url for provider "openai-compatible"` | `jr-arch config set model.base_url <url>` |
-| Rate limit / "allows N tokens a minute" | Wait, pick a model with higher limits (`/models`), or upgrade the plan |
+| Rate limit / "allows N tokens a minute" | `jr-arch limits` to see the allowance, then `jr-arch limits set default <n>` to fit under it, pick a model with higher limits (`/models`), or upgrade the plan |
+| Replies are cut off mid tool call | The cap is too low: `jr-arch limits set <agent> <bigger n>` |
 | Checkpoint declined in CI | Expected. A person has to pass `--yes` |
 | `/check` reports an escalation loop | Mark one agent in the loop `terminal: true` |
 | Agent runs unscoped / at default priority | Its `SOUL.md` front matter doesn't parse. Run `/check` |

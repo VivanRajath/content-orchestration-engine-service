@@ -24,6 +24,10 @@ import { record } from './session.js';
 const MAX_READ = 200000;
 const MAX_LIST = 400;
 const COMMAND_TIMEOUT = 120000;
+// execFileSync kills the child at one megabyte by default and reports it as a
+// SIGTERM, so a command that merely printed a lot looked to the agent like it
+// had been killed. See MAX_OUTPUT in verify.js.
+const COMMAND_MAX_OUTPUT = 64 * 1024 * 1024;
 
 export const TOOLS = [
   {
@@ -211,10 +215,14 @@ const HANDLERS = {
     try {
       const out = execFileSync(bin, args, {
         cwd: ctx.root, timeout: COMMAND_TIMEOUT, encoding: 'utf8', stdio: 'pipe',
+        maxBuffer: COMMAND_MAX_OUTPUT,
       });
       return ok(tail(out) || '(no output)');
     } catch (e) {
       if (e.code === 'ENOENT') return err(`${argv[0]} is not installed or not on PATH.`);
+      if (e.code === 'ENOBUFS') {
+        return err(`${argv[0]} printed more than ${COMMAND_MAX_OUTPUT / 1024 / 1024}MB and was stopped. Narrow the command, or write its output to a file.`);
+      }
       if (e.killed) return err(`Timed out after ${COMMAND_TIMEOUT / 1000}s.\n${tail(e.stdout ?? '')}`);
       // A non-zero exit is information the model needs, not a harness failure —
       // a failing test IS the answer to "run the tests".

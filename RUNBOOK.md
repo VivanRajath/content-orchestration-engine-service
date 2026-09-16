@@ -9,7 +9,7 @@ them), what changed over time, and what is currently wrong or incomplete.
 - How it fits together: [ARCHITECTURE.md](ARCHITECTURE.md)
 - Agent-facing project notes: [CLAUDE.md](CLAUDE.md)
 
-This file is current as of **0.1.3** (22 commits, 512 passing tests).
+This file is current as of **0.1.3** (22 commits plus uncommitted work, 535 passing tests).
 
 ---
 
@@ -57,7 +57,12 @@ decision-log entry in [§6](#6-decisions-log) that explains why.
       to a provider they don't belong to, and the model can never read them.
 - [ ] **`.gitignore` is ensured before any key is written.**
 - [ ] **The shell environment wins over `.gitagent/.env`.**
-- [ ] **Rollback only touches the attempt's own files.**
+- [ ] **Rollback only touches the attempt's own files,** and a commit contains
+      only those files — staged with a pathspec, gated on the same set.
+- [ ] **A run needs a repository with a commit,** or explicit `--no-git`:
+      without one there is no branch and no rollback.
+- [ ] **Sealed hooks must not fire on ordinary code.** A false positive in a
+      hook nobody can disable makes a repository unusable.
 - [ ] **Model calls may run in parallel; git bookkeeping may not.**
 - [ ] **Chat goes through `run()`.** There is no second execution path.
 - [ ] **One readline interface per process.** Pass the prompter down.
@@ -87,7 +92,7 @@ decision-log entry in [§6](#6-decisions-log) that explains why.
 ### Commands
 
 ```bash
-npm test                                   # node --test — all 512, ~45s
+npm test                                   # node --test — all 535, ~50s
 node --test test/hooks.test.js             # one file
 node --test --test-name-pattern "sealed"   # by name
 node bin/jr-arch.js --help                 # run from source
@@ -450,6 +455,8 @@ which test pins it. Reverse one only with a new entry here that explains why.
 | **Fail closed on a guard file that doesn't parse** | An unparseable guard must abort, not degrade to unguarded | `loadHooks()` | `hooks.test.js` |
 | **A blocked hook is a tool error, never an exception** | Block reasons are instructions; a model that's told why can correct, a killed run can't | `dispatch()`, `blocked()` | `tools.test.js` |
 | **Commands are argv with `shell: false`** | Analysing argv is reliable; every bypass lives in shell metacharacters | `run_command`, `checkCommand` | `tools.test.js` |
+| **A prefix match must look like a credential** (whole token, length, mixed body, entropy) | `indexOf('sk-')` over a whole line refused `task-row`, `risk-high`, `disk-usage` — in a sealed hook, at edit time and again over whole files at commit time. A sealed guard that fires on ordinary code is not strict, it is broken | `looksLikeCredential()` | `hooks.test.js` |
+| **An inline `data:` URI skips the entropy rule** | Embedded images are high-entropy by nature and carry nothing secret | `scanLines()` | `hooks.test.js` |
 | **Secret scan covers added lines only (multiset delta)** | Scanning whole files would permanently block edits to any file with a fixture-shaped string | `lineDelta()` | `hooks.test.js` |
 | **`ignore_paths` skips entropy only; universal globs refused** | Lockfile hashes are noisy but not trusted; `**` would disable the check | `seal()`, `scanLines()` | `hooks.test.js` |
 | **Candidate secrets are masked in reasons** | Reasons land in transcripts and on screen | `mask()` | — |
@@ -475,6 +482,11 @@ which test pins it. Reverse one only with a new entry here that explains why.
 | **A failed agent rolls back its own files and nothing else** | A whole-tree reset would take a sibling's success in a swarm, or an earlier uncommitted chat turn | `revertAttempt()`, `attemptPaths()` | `swarm.test.js`, `run.test.js` |
 | **Scope widens rollback to dirty files it owns; no scope → only explicit writes** | A formatter run via `run_command` is still caught; "everything dirty" would sweep up others' work | `attemptPaths()` | `swarm.test.js` |
 | **Handoffs revert too** | Half an attempt left in the tree is a trap for the next agent, not a starting point | `ladder()` | `run.test.js` |
+| **A commit stages a pathspec of the attempt's own paths** | `git add --all` committed a sibling's files and the user's uncommitted work under this agent's name, unscanned, because the gate only saw `write_file` paths | `commitAttempt()`, `commit()` | `production-fixes.test.js` |
+| **A run refuses a repo with no commits** (`--no-git` to override) | Without a commit `openSession` cannot branch and `revertAttempt` has no sha, so it returns silently — no branch, no rollback, no warning. The chat reaches it by default via `--allow-dirty` | `requireGit()` | `production-fixes.test.js` |
+| **A swarm's commits are gated on the post-swarm build** | Frames closed with no verify result, and "unknown" only warns, so a red build was committed | `swarm()` + `run()` | `swarm.test.js` |
+| **Swarm membership is chosen from the task** | Ownership answers "does this agent own anything here", which fanned out to agents the task never touched, at a model call each | `selectSwarm()` | `swarm.test.js` |
+| **The chat carries the build state between turns** | The entry check and the commit gate ran the project's whole suite twice per message | `run({build})` | `production-fixes.test.js` |
 | **The harness's git doesn't go through `checkCommand`** | Otherwise the loop deadlocks against `no-force-push` on its first commit; the model only reaches `tools.js` | `session.js` `git()` | — |
 | **Model calls run in parallel; git doesn't** | Two agents staging at once produce a diff belonging to neither | `gitLock()` | `swarm.test.js` |
 | **Swarm is opt-in** | Fanning out by default multiplies a user's token bill without asking | `run()` `flags.swarm` | `swarm.test.js` |
@@ -519,6 +531,15 @@ which test pins it. Reverse one only with a new entry here that explains why.
 | **Provider limits are recovered from, or explained** | Groq free tier OTPM, rate limits; raw provider JSON never reaches the user | `request()`, `parseProviderError()`, `describeError()` | `limits.test.js` |
 | **Streaming stops retrying at the first byte** | Tokens already on screen can't be replayed | `request()` stream path | — |
 | **A JSON body in answer to a streaming request is parsed as JSON** | Some OpenAI-compatible servers ignore `stream: true` | `request()` content-type check | `stream.test.js` |
+| **Limits are read from provider headers, never hard-coded** | Every plan of every provider differs, and a table would be wrong the week it shipped. `{found:false}` when a provider reports nothing is an answer, not an error | `parseRateLimits()`, `listModels` `onHeaders` | `token-limits.test.js` |
+| **The limit probe asks for one token, and reads error responses too** | It must cost nothing, and a throttled key still carries its limit headers on the 429 | `probeLimits()` | `token-limits.test.js` |
+| **Setup fits the reply cap under the key's output allowance** | A provider refuses a request that merely ASKS for more than the allowance, so a too-high cap fails every task until the user finds the number | `suggestedCap()`, `onboard()` | `token-limits.test.js` |
+| **A per-agent cap is written into `tiers:` line by line** | Same rule as the rest of agent.yaml: a read-modify-serialize would drop the comments that say why each agent has the model it has | `patchTierModel()` | `token-limits.test.js` |
+| **An empty assistant turn is sent as "(no reply)"** | Anthropic rejects empty content, and a reply cut off at a low cap is empty — the nudge path has to survive the cap the user just set | `toAnthropicMessages()` | `token-limits.test.js` |
+| **Command and build output are buffered to 64MB** | `execFileSync` kills at 1MB and reports SIGTERM, which read as a timeout — so a verbose suite came back "unknown" and the build gate silently stopped gating | `MAX_OUTPUT` in `verify.js`, `COMMAND_MAX_OUTPUT` in `tools.js` | `verify.test.js` |
+| **A refused request parameter is adapted from the refusal, not from a model list** | OpenAI's reasoning models reject `max_tokens` and a non-default temperature; a hard-coded list of which models those are is stale the week it ships | `unsupportedParam()`, `learnedParams` | `production-fixes.test.js` |
+| **A local `base_url` needs no key** | A local server authenticates nothing, and calling it unconfigured sent the user through onboarding every launch | `requiresKey()`, `isLocal()` | `production-fixes.test.js` |
+| **DUTIES.md is optional for the classifier too** | The rest of the loop treats it as optional; the classifier threw, so deleting it broke every unpinned task | `readDuties()`, `describeAgents()` | `production-fixes.test.js` |
 | **`doctor` fails at setup, not mid-task** | Small models without JSON and tools cause thrash that looks like a bug in jr-arch | `doctor.js` | — |
 
 ### 6.7 `/prompt` generation
@@ -640,6 +661,8 @@ Commit-by-commit, with what changed and why. All dates are 2026.
 | 09-15 | `340a2fc` | **feat**: phase 1: guided setup, `/prompt`, `/dev`, smoke tests | onboarding via model listing; provider registry; model-proposes/harness-writes; `/check`; `/smoke` |
 | 09-15 | `f5b8c5c` | **fix**: the chat works in a real terminal | single prompter; masked secret echo; Windows Ctrl+V; listener leak; `terminal.test.js` |
 | 09-15 | `ddbabb3` | **fix**: handle provider limits instead of dying on them | `ProviderError` kinds, OTPM shrink + learned caps, rate-limit waits, JSON-for-stream fallback, `/prompt` failure menu, `brevity()` |
+| uncommitted | — | **twelve production fixes**: secret-scan token matching, pathspec commits, the no-commit-repo guard, swarm build gating and task-aware selection, DUTIES-less classification, `/undo` guards, local endpoints without keys, request-parameter adaptation, 64MB output buffers, the empty assistant turn, the chat's build-state handoff; plus templates that only declare what is read | each one failed quietly, which is the kind this project treats as worst |
+| uncommitted | — | **token limits**: `src/limits.js`, `jr-arch limits` / `/limits`, rate-limit headers shown at setup, per-agent `max_tokens` via `patchTierModel`; ENOBUFS and empty-assistant-turn fixes | a key's allowance is visible before the first task, and the reply cap is fitted to it |
 | uncommitted | — | `package.json` 0.1.2 → 0.1.3; `.gitignore` gains `.gitagent/.env` and `.gitagent/.session/` | this repo has been dogfooding itself (`.gitagent/` present, session branch checked out) |
 
 ---
@@ -647,62 +670,72 @@ Commit-by-commit, with what changed and why. All dates are 2026.
 ## 9. Known gaps and drift
 
 These are places where the code, its comments, the templates and `CLAUDE.md`
-don't currently agree, found while writing this document. None of them are
-fixed yet. Each entry says what is wrong and where.
+disagree. Everything in 9.1 and 9.2 has now been fixed; the entries are kept
+because each one describes a shape of bug worth recognising again.
 
-### 9.1 Probable bugs
+### 9.1 Fixed: bugs
 
-| # | Issue | Where | Impact |
+| # | Was | Fix | Pinned by |
 |---|---|---|---|
-| B1 | **A swarm commits without its build gate.** `swarm()` closes successful frames with no `verify`, verifies once afterwards, then `run()` calls `commit()` for each. `checkCommit` receives `frame.verify?.green ?? null` = `null`, which only *warns*. A red build after a swarm is committed. | `src/run.js:347`, `:175`, `:538` | a red swarm lands on the branch |
-| B2 | **The commit stages everything, but the commit gate scans only `touched`.** `commitAttempt` runs `git add --all`, and `checkCommit` scans `frame.touched`. Files changed via `run_command`, a sibling's files, and (in chat, with `--allow-dirty`) the user's own uncommitted edits are committed without the secret or protected-path check, and attributed to this agent. | `src/session.js:273`, `src/run.js:537-538` | commit-time secret scan can be bypassed by a command that writes a file; in a swarm the first commit contains every agent's work |
-| B3 | **The classifier throws without DUTIES.md.** CLAUDE.md says a missing DUTIES.md must not be an error, and `prompt()` tolerates it, but `readDuties()` throws whenever a model classification is needed. | `src/classify.js:167-173` | deleting DUTIES.md breaks every unpinned task |
-| B4 | **`/undo` is `git reset --hard HEAD~1`** with no check that HEAD is an agent commit or that the tree is clean. | `src/chat.js:314-322` | can discard a user's own commit and uncommitted changes |
-| B5 | **The chat setup check only exempts `OLLAMA_API_KEY`.** A keyless `openai-compatible` local server (`LLM_API_KEY` unset) sends the user back into onboarding every launch. | `src/chat.js:74` | local vLLM/LM Studio users get stuck in onboarding |
+| B1 | **A swarm committed without its build gate.** Frames closed with no `verify`, so `checkCommit` saw `null`, which only warns. | `swarm()` verifies once, routes a red build to the `fixes_build` agent, and stamps the result onto each done frame before `commit()`. | `swarm.test.js` |
+| B2 | **The commit staged everything, but the gate scanned only `touched`.** `git add --all` swept in a sibling's files and the user's own uncommitted work, unscanned and under the agent's name. | `commitAttempt` adds and commits with a pathspec of `attemptPaths(frame)`, and `commit()` gates on that same set. | `production-fixes.test.js` |
+| B3 | **The classifier threw without DUTIES.md**, a file the rest of the loop treats as optional. | `readDuties` falls back to the default entry rules, and the prompt always carries each agent's own declaration. | `production-fixes.test.js` |
+| B4 | **`/undo` was `git reset --hard HEAD~1`** with no check of whose commit it was or what else it would take. | It refuses a commit without `via jr-arch`, refuses a dirty tree, and then asks. | manual (chat command, not exported) |
+| B5 | **The chat setup check special-cased `OLLAMA_API_KEY`**, so a keyless local server looked unconfigured on every launch. | `requiresKey()` is false for Ollama and for any local `base_url`; the chat asks it per agent. | `production-fixes.test.js` |
+| B6 | **`secret-scan` blocked ordinary code containing `sk-`** — `task-row`, `risk-high`, `disk-usage` — by a sealed hook nobody could switch off, at edit time and again over whole files at commit time. | Prefixes match per token, anchored, and a prefixed token must also look like a credential (length, mixed body, entropy). `-----BEGIN` stays unconditional; `data:` URIs skip the entropy rule. | `hooks.test.js` |
+| B7 | **A repo with no commits got no branch and no rollback**, silently — the first-run path, since the chat passes `--allow-dirty`. | `requireGit()` refuses a non-repo or an empty history with the command that fixes it; `--no-git` is explicit consent. | `production-fixes.test.js` |
+| B8 | **Output over 1MB** killed the child with ENOBUFS reported as SIGTERM, read as a timeout, so a verbose suite came back "unknown" and the build gate stopped gating. | 64MB buffers in `verify.js` and `tools.js`, and ENOBUFS handled before the timeout branch. | `verify.test.js` |
+| B9 | **An empty assistant turn** went to Anthropic as `content: []`, which the API rejects — reachable whenever a reply is cut off at a low `max_tokens`. | `toAnthropicMessages` substitutes a `(no reply)` text block. | `token-limits.test.js` |
+| B10 | **OpenAI reasoning models were unusable**: they reject `max_tokens` and a non-default temperature, and both were always sent. | The request layer reads the refusal, adapts the payload, remembers it per provider and model, and resends. No model ids are hard-coded. | `production-fixes.test.js` |
+| B11 | **`--swarm` was not task-aware**: it fanned out to every parallel agent owning any file in the repo, at one model call each. | `selectSwarm()` asks which agents the task spans; ownership is only the fallback. | `swarm.test.js` |
+| B12 | **The chat ran the project's test suite twice per message** (entry state, then the commit gate). | `run()` accepts the build state the previous turn verified; the post-task verify still runs for real. | `production-fixes.test.js` |
 
-### 9.2 Configuration that is written but not read
+### 9.2 Fixed: configuration that was written but not read
 
-| # | Issue | Where |
+| # | Was | Fix |
 |---|---|---|
-| C1 | `git.session_branch`, `git.branch_prefix` and `git.auto_commit` are read from **`agent.yaml`** (`manifest.raw.git`), but the template puts them in `config/default.yaml`, which **no code reads**. Editing the template's values does nothing. | `src/run.js:132-133,536,779`; `templates/config/default.yaml:12` |
-| C2 | `sandbox:` (`enabled`, `allow_shell`, cpu/memory/disk) is declared but not implemented. `allow_shell: true` doesn't do what its comment says. | `templates/config/default.yaml:2` |
-| C3 | `post_run: session-summary` is declared but never executed; `post_run` hooks are loaded and ignored. | `templates/hooks/hooks.yaml:130` |
-| C4 | `memory:` (`path`, `commit: true`) and `memory/MEMORY.md`: nothing reads or writes memory. | `templates/agent.yaml:25`; `templates/memory/MEMORY.md` |
-| C5 | `identity:` points at root `SOUL.md` / `RULES.md`, which no longer exist by design. | `templates/agent.yaml:20` |
-| C6 | `routing.diff_line_ceiling` is parsed into `manifest.diffCeiling` but unused; the hook uses `max_lines` from `hooks.yaml`. | `src/config.js:122` |
-| C7 | `agents:` is still parsed into `manifest.agents` for backward compatibility; nothing uses it. | `src/config.js:128` |
+| C1 | `git.*` was read from `agent.yaml` but shipped in `config/default.yaml`, which nothing reads | the `git:` block now ships in `agent.yaml`, where it is read |
+| C2 | `sandbox:` declared but not implemented | removed from the template |
+| C3 | `post_run: session-summary` declared but never executed | removed; `/check` warns if a guard file declares `post_run` |
+| C4 | `memory:` config nothing reads | removed; `memory/MEMORY.md` now says what it actually is |
+| C5 | `identity:` pointed at root `SOUL.md` / `RULES.md`, removed by design | removed from the template |
+| C6 | `routing.diff_line_ceiling` parsed but unused | removed; `hooks.yaml` `max_lines` is the single source |
+| C7 | `agents:` parsed into `manifest.agents`, unused | removed |
 
-### 9.3 Default agent names still in code or text
+`patchSequence` in `config.js` is still exported and tested but no longer called
+by anything; it is kept as a tested utility rather than deleted.
 
-These go against "no default agent name in executable code". The routing logic
-itself is clean; these are messages and probes:
+### 9.3 Fixed: default agent names in messages and probes
 
-| Where | What |
+The routing logic never knew the default names; these were messages and a probe
+that did.
+
+| Was | Fix |
 |---|---|
-| `src/doctor.js:11,42` | JSON probe expects `tier: "junior-dev"` (harmless as a fixed string, but reads as a name) |
-| `src/doctor.js:68-69` | advises `config set routing.entry senior-dev`, which fails in a repo without that agent |
-| `src/hooks.js:659` | build-gate reason says "Route to build-doctor" |
-| `src/detect.js:148` | "route to build-doctor first" |
-| `bin/jr-arch.js:90` | help example `--agent senior-dev` (fine as an example of the default pack) |
-| `templates/agent.yaml:7,46` | "Four-tier" description; `entry` comment lists the four names |
+| `doctor` probed for `tier: "junior-dev"` and advised `routing.entry senior-dev`, which fails in a repo without that agent | the probe asks for a neutral value, and the advice names the most senior agent actually installed |
+| build-gate said "Route to build-doctor" | "Hand off to whichever agent repairs builds" |
+| `detect` said "will likely route to build-doctor first" | "to a build-repair agent first" |
+| the shipped manifest said "Four-tier" and listed the four names beside `entry:` | neither; `entry: auto, or the name of an installed agent` |
+| the help example was `--agent senior-dev` | `--agent <name>` |
 
-### 9.4 Stale comments and docs
+### 9.4 Fixed: stale comments and dead code
 
-| Where | Stale statement | Reality |
-|---|---|---|
-| `src/run.js:68-71,77` | "Failed attempts are reverted with `git reset --hard`" (also in the user-facing dirty-tree error) | `revertAttempt` restores or deletes per file |
-| `src/session.js:212-218` | "Throw away everything an attempt did" | per-path, scoped |
-| `CLAUDE.md` "`run` refuses to start on a dirty working tree" | mentions `git reset --hard` and "weakening the default means rewriting `revertAttempt`" | already rewritten; the refusal is still useful but for a narrower reason |
-| `CLAUDE.md` gotcha "`revertAttempt` runs `git clean -fd -e .gitagent/.session`" | — | no `git clean`; `rmSync` per created file |
-| `CLAUDE.md` "Publish 0.1.2" | — | `package.json` is at 0.1.3 (uncommitted) |
-| `src/pack.js:97` | suggests `personas add <name> --from <url>` | still valid, but `add-agent <url>` is the documented path |
-| `src/session.js:290` `handoffPayload` | exported, described as "exactly as DUTIES.md specifies" | unused; `compile()` replaced it |
-| `src/config.js:50` `patchSequence` | "for the `agents:` list" | unused since the list was removed |
+| Was | Fix |
+|---|---|
+| the dirty-tree error said failed attempts are rolled back with `git reset --hard` | "rolled back through git" — the revert has been per-file since the swarm landed |
+| `handoffPayload` in `session.js`, unused since `compile()` replaced it | removed |
+| `post_run` hooks loaded and silently never executed | `/check` now warns that they protect nothing |
+
+`CLAUDE.md` still carries two statements this work invalidates: the dirty-tree
+decision describes `git reset --hard`, and a gotcha describes a
+`git clean -fd -e .gitagent/.session` that `revertAttempt` no longer runs. It is
+the author's file, so it is flagged here rather than rewritten.
 
 ### 9.5 Limitations by design (worth knowing)
 
 - The command guards analyse argv. They can't see what a permitted interpreter
-  does (`node -e`, `python -c`), which is what makes B2 matter.
+  does (`node -e`, `python -c`) — which is why the commit gate now scans
+  everything a commit will contain, not just what `write_file` touched.
 - `list_files` and `repoFiles` don't respect `.gitignore`; they skip a fixed
   directory list.
 - Memory of learned output caps lasts for the process only.
@@ -719,7 +752,7 @@ regression could land unnoticed:
 - `askLock` serialising swarm checkpoints; `ask()` declining when
   non-interactive; the per-attempt "no" memory
 - chat never passing `--yes`; chat reusing its session branch
-- verify running once after a swarm (and B1 above)
+- verify running once after a swarm
 - `hooks.yaml` loading last among guard files
 - secret masking in block reasons
 - streaming not retrying after the first byte
@@ -735,16 +768,15 @@ From `CLAUDE.md` "Next", plus the gaps above that most need fixing.
 
 | # | Item | Notes |
 |---|---|---|
-| 1 | **A real task against a real model** | See procedure §5.12. Everything below is lower priority than this |
-| 2 | Fix B1 and B2 (commit gating) | Gate each swarm commit on the post-swarm verify; make `commitAttempt` stage `attemptPaths(frame)` instead of `--all`, and scan the staged set |
-| 3 | Publish 0.1.3 | See §5.11 |
-| 4 | Bring `gitagent-default` to the current format | Front-matter routing; remove root SOUL/RULES |
-| 5 | Resolve B3 | Classify without DUTIES.md (use agent roles and scopes) |
-| 6 | `routing.entry` still names one agent | |
-| 7 | Swarm doesn't escalate | Ladder and swarm are two paths through `run()` |
-| 8 | `doctor` probes only the default key | Iterate `keyEnvs()` / `modelFor` per agent |
-| 9 | Token accounting per agent and per model | |
-| 10 | Decide C1–C7 | Implement, or remove from the templates |
+| 1 | **A real task against a real model** | See procedure §5.12. Everything else is lower priority, and every fix in §9 was verified against scripted models only |
+| 2 | Publish 0.1.3 | See §5.11 |
+| 3 | Bring `gitagent-default` to the current format | Front-matter routing; remove root SOUL/RULES |
+| 4 | `routing.entry` still names one agent | |
+| 5 | Swarm still does not escalate | Ladder and swarm remain two paths through `run()`; selection is now task-aware but a failed swarm agent has nowhere to go |
+| 6 | `doctor` probes only the default key | Iterate `keyEnvs()` / `modelFor` per agent |
+| 7 | Token accounting per agent and per model | `limits` reports the allowance and sets the cap; nothing counts what a run actually spent |
+| 8 | Memory is inert | `memory/MEMORY.md` is documentation. Either feed it to agents or drop it |
+| 9 | `post_run` hooks are loaded but never executed | Run them, or stop loading the phase |
 
 ---
 

@@ -20,8 +20,8 @@ const NOTES = {
   '.pack.lock': 'what a pack installed, for pull',
   'hooks': 'guardrails the harness enforces',
   'agents': 'one folder per agent',
-  'config': 'sandbox and git settings',
-  'memory': 'what the agents learn about this repo',
+  'config': 'environment settings',
+  'memory': 'notes you keep about this repo',
   'SOUL.md': 'who this agent is',
   'RULES.md': 'what it must and must not do',
 };
