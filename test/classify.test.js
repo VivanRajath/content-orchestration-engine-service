@@ -43,7 +43,7 @@ describe('readManifest reads the routing block', () => {
     assert.equal(BASE.temperature, 0.2);
     assert.equal(BASE.maxTokens, 8192);
     assert.equal(BASE.confidenceFloor, 0.6);
-    assert.equal(BASE.diffCeiling, 400);
+    assert.equal(BASE.defaultAttempts, 2);
     assert.equal(BASE.defaultAttempts, 2);
     // No default fallback NAME. pickFallback uses the last agent by priority,
     // which works whatever the installed agents are called.
@@ -52,7 +52,8 @@ describe('readManifest reads the routing block', () => {
 
   // Which agents exist is the directory's answer, not the manifest's.
   test('the manifest no longer lists agents', () => {
-    assert.deepEqual(BASE.agents, []);
+    assert.equal(BASE.agents, undefined, 'the field was dropped, not just left empty');
+    assert.equal(BASE.raw.agents, undefined);
     assert.deepEqual(
       AGENTS.map((a) => a.name),
       ['build-doctor', 'junior-dev', 'ui-editor', 'senior-dev'],

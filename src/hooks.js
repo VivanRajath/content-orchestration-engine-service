@@ -271,6 +271,45 @@ export function shannonBits(s) {
  */
 const mask = (token) => `${token.slice(0, 4)}…, ${token.length} chars`;
 
+/**
+ * The shortest thing any of the known prefixes produces in the wild: AWS is
+ * AKIA plus sixteen characters. Below this it is an identifier, not a key.
+ */
+const MIN_CREDENTIAL = 20;
+const MIN_SECRET_BODY = 12;
+
+/**
+ * Does this token actually look like the credential its prefix suggests?
+ *
+ * The prefix used to be matched with indexOf against the whole LINE, so every
+ * line containing the substring "sk-" was refused: `task-row`, `risk-high`,
+ * `disk-usage`, any Tailwind-ish `sk-` class. By a hook nobody can switch off,
+ * in a scan that also runs over whole files at commit time — so a repo with a
+ * `task-` identifier in it could not be worked on at all.
+ *
+ * Matching per token fixes the substring half. The rest of this function is
+ * about the remaining case, an identifier that really does start with `sk-`:
+ * a credential is long, and its body is a random-looking mix of letters and
+ * digits, where `sk-button-primary-large` is words. Every real key is caught by
+ * all three rules — a 48-character random body contains a digit with
+ * probability indistinguishable from certainty.
+ *
+ * A structural prefix like `-----BEGIN` is not a random string at all and is
+ * never subject to these rules.
+ */
+export function looksLikeCredential(token, prefix) {
+  if (prefix.startsWith('-')) return true;              // -----BEGIN PRIVATE KEY
+  if (token.length < MIN_CREDENTIAL) return false;
+
+  const body = token.slice(prefix.length);
+  if (body.length < MIN_SECRET_BODY) return false;
+  if (!/[0-9]/.test(body) || !/[A-Za-z]/.test(body)) return false;
+  return shannonBits(body) >= 3.0;
+}
+
+/** Content the author pasted in on purpose, and which is not a credential. */
+const DATA_URI = /(?:^|[^A-Za-z0-9])data:[\w.+-]+\/[\w.+-]+;base64,/i;
+
 function scanLines(lines, hook, path) {
   const found = [];
   const prefixes = hook.known_prefixes ?? [];
@@ -280,13 +319,21 @@ function scanLines(lines, hook, path) {
   const ignored = matchesAny(path, entropy.ignore_paths);
 
   for (const { n, text } of lines) {
+    const tokens = text.match(TOKEN_RE) ?? [];
     for (const prefix of prefixes) {
-      const at = text.indexOf(prefix);
-      if (at === -1) continue;
-      const token = (text.slice(at).match(TOKEN_RE)?.[0] ?? prefix);
-      found.push(`line ${n}: credential prefix "${prefix}" (${mask(token)})`);
+      // Per token, and anchored at its start: a credential IS a token, it is
+      // never a fragment in the middle of an identifier.
+      const hit = tokens.find((t) => t.startsWith(prefix) && looksLikeCredential(t, prefix))
+        ?? (prefix.startsWith('-') && text.includes(prefix) ? prefix : null);
+      if (!hit) continue;
+      found.push(`line ${n}: credential prefix "${prefix}" (${mask(hit)})`);
     }
     if (ignored) continue;
+
+    // An inline data: URI is an image or a font the author embedded. It is
+    // high-entropy by nature and carries nothing secret, and blocking it would
+    // make a whole class of ordinary files unwritable.
+    if (DATA_URI.test(text)) continue;
 
     const minLength = entropy.min_length ?? 32;
     const minBits = entropy.min_entropy_bits ?? 4.0;
@@ -656,7 +703,7 @@ export function checkCommit(files, buildPassed, hooks = loadHooks(), { root = re
   const gate = active(hooks.pre_commit['build-gate']);
   if (gate) {
     if (buildPassed === false) {
-      block(v, 'build-gate', 'the build is red. Route to build-doctor; do not commit over a failing build.');
+      block(v, 'build-gate', 'the build is red. Hand off to whichever agent repairs builds; do not commit over a failing build.');
     } else if (buildPassed == null) {
       warn(v, 'build-gate', 'no verify command was found, so build state is unknown — unknown is not a pass.');
     }

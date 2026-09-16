@@ -39,11 +39,11 @@ function scripted(byAgent) {
 const tool = (name, input) => [name, input];
 
 /** Two scoped, parallel agents. The default four are removed entirely. */
-function sandbox() {
+function sandbox({ test: testScript = 'node -e "process.exit(0)"' } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'jra-swarm-')));
   const git = (...a) => execFileSync('git', a, { cwd: root, stdio: 'pipe' });
 
-  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts: { test: 'node -e "process.exit(0)"' } }, null, 2));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts: { test: testScript } }, null, 2));
   for (const d of ['src/api', 'src/ui']) mkdirSync(join(root, d), { recursive: true });
   writeFileSync(join(root, 'src/api/handler.js'), 'export const api = 1;\n');
   writeFileSync(join(root, 'src/ui/view.js'), 'export const ui = 1;\n');
@@ -157,6 +157,33 @@ describe('swarm', () => {
   });
 
   // Fanning out by default would multiply a token bill nobody agreed to.
+  test('a red build is not committed over', async () => {
+    // Each frame closed with no verify result, and an unknown build only warns,
+    // so a swarm used to commit work that broke the build the ladder would have
+    // sent to a repairer.
+    const box = sandbox({ test: 'node -e "process.exit(1)"' });
+    await inRepo(box, async () => {
+      const call = scripted({
+        'api-dev': [
+          { tools: [tool('write_file', { path: 'src/api/handler.js', content: 'export const api = 3;\n' })] },
+          { tools: [tool('done', { summary: 'api updated' })] },
+        ],
+        'ui-dev': [
+          { tools: [tool('write_file', { path: 'src/ui/view.js', content: 'export const ui = 3;\n' })] },
+          { tools: [tool('done', { summary: 'ui updated' })] },
+        ],
+      });
+      const out = await run(['update both layers'], { swarm: true }, { call });
+
+      assert.notEqual(out.status, 'done', 'a red build is not a success');
+      const log = execFileSync('git', ['log', '--oneline'], { cwd: box.root, encoding: 'utf8' });
+      assert.equal(log.trim().split('\n').length, 1, 'nothing landed on top of the red build');
+      // The work is still there: the user decides, the harness does not discard
+      // a successful agent's edits because a sibling broke the build.
+      assert.match(read(box.root, 'src/api/handler.js'), /api = 3/);
+    });
+  });
+
   test('without --swarm one agent runs, as before', async () => {
     const box = sandbox();
     await inRepo(box, async () => {

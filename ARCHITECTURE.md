@@ -117,6 +117,7 @@ flowchart TD
     DOCTOR[doctor.js]
     ENV[env.js · key]
     CONFIG[config.js · config]
+    LIMITS[limits.js · limits]
   end
 
   subgraph Engine["Execution engine"]
@@ -142,7 +143,7 @@ flowchart TD
     UTIL[util.js]
   end
 
-  BIN --> CHAT & INIT & ADD & PERS & PULL & DETECT & DOCTOR & ENV & CONFIG & SMOKE
+  BIN --> CHAT & INIT & ADD & PERS & PULL & DETECT & DOCTOR & ENV & CONFIG & SMOKE & LIMITS
   BIN --> RUN
   CHAT --> ONB & GEN & DEV & SMOKE & TREE & RUN
   CHAT & ONB & GEN --> PROMPTER
@@ -150,7 +151,9 @@ flowchart TD
   TOOLS --> HOOKS & VERIFY & SESSION
   RUN & CLASSIFY & GEN & SMOKE & DOCTOR --> PROVIDER
   PROVIDER --> PROVIDERS
-  ONB --> PROVIDERS
+  ONB --> PROVIDERS & LIMITS
+  CHAT --> LIMITS
+  LIMITS --> PROVIDERS & CONFIG
   RUN & CLASSIFY & DEV & SMOKE & CHAT --> AGENTS
   AGENTS & HOOKS & CONFIG & PACK --> YAML
   INIT & ADD & PULL & PERS --> PACK
@@ -170,8 +173,9 @@ flowchart TD
 | `src/agents.js` | 240 | Reads agents from front matter; escalation, cycles, build fixer, scope ownership, partition, swarm grouping, disjointness | `readAgents`, `frontMatter`, `findAgent`, `escalatesTo`, `escalationCycle`, `buildFixer`, `ownsPath`, `partition`, `swarmable`, `disjoint` |
 | `src/verify.js` | 139 | Detects and runs the project's build/test; Windows `.cmd` shim handling; head+tail output truncation | `detect`, `verify`, `resolveBin`, `winCmd`, `tail` |
 | `src/provider.js` | 601 | Provider-neutral transcript ↔ Anthropic/OpenAI wire; `request()` with limit recovery; SSE parsing; key redaction; JSON extraction | `callModel`, `ProviderError`, `parseProviderError`, `parseSSE`, `readAnthropicStream`, `readOpenAIStream`, `extractJson`, `redact`, `apiKey`, `requiresKey`, `missingKey` |
+| `src/limits.js` | ~330 | Rate-limit headers from any provider, normalised; the 1-token probe; the reply-cap table; the `limits` command | `parseRateLimits`, `probeLimits`, `printProviderLimits`, `printAgentCaps`, `agentCaps`, `suggestedCap`, `showLimits`, `limits` |
 | `src/providers.js` | 191 | Provider registry, key-prefix detection, endpoint resolution, live model listing, chat-model filter | `PROVIDERS`, `detectProvider`, `baseUrlFor`, `wireFor`, `listModels`, `isChatModel`, `KeyRejected` |
-| `src/config.js` | 227 | The one `agent.yaml` reader; line-based section patchers; per-tier model resolution; `config` command | `readManifest`, `modelFor`, `keyEnvs`, `patchSection`, `patchSequence`, `upsertSection`, `config` |
+| `src/config.js` | 227 | The one `agent.yaml` reader; line-based section patchers; per-tier model resolution; `config` command | `readManifest`, `modelFor`, `keyEnvs`, `patchSection`, `patchSequence`, `upsertSection`, `upsertScalar`, `patchTierModel`, `setModelMaxTokens`, `setTierMaxTokens`, `clearTierMaxTokens`, `config` |
 | `src/env.js` | 192 | `.gitagent/.env` parsing/loading (shell wins), `.gitignore` guard, key writing, `key` command | `loadEnv`, `parseEnv`, `ensureIgnored`, `writeKey`, `removeKey`, `keySource`, `fingerprint`, `key` |
 | `src/init.js` | 203 | Scaffold from templates / `--minimal` / `--from` pack; patch `model:`; gitignore rules | `init` |
 | `src/pack.js` | 406 | Clone, validate (`gitagent.yaml`), confine paths, inspect hooks, install, lock file, update planning | `fetchPack`, `readPack`, `confine`, `inspectHooks`, `installPack`, `packFiles`, `writeLock`, `readLock`, `planUpdate` |
@@ -204,8 +208,8 @@ flowchart TD
 │   ├── RULES.md        constraint prose
 │   └── .source         add-agent provenance: url \n sha
 ├── hooks/*.yaml        guard files; hooks.yaml loads last
-├── config/default.yaml environment settings (documentation; see RUNBOOK §known gaps)
-├── memory/MEMORY.md    repo notes (template only today)
+├── config/default.yaml the telemetry claim, in the user's own repo
+├── memory/MEMORY.md    notes the user keeps; nothing reads or writes it
 ├── .pack.lock          JSON: url, ref, commit, pack, version, files{path: sha256/16}
 ├── .env                KEY=value, gitignored, 0600
 └── .session/<id>/      gitignored run artefacts
@@ -384,9 +388,10 @@ at the first match:
 ```
 
 - `--agent` / `@name` skip `classify()` entirely (`source: explicit`).
-- `readDuties()` **throws** if `DUTIES.md` is missing and a model call is
-  needed. The prompt assembly in `run.js` tolerates a missing `DUTIES.md`, but
-  the classifier doesn't. See RUNBOOK known gaps.
+- `DUTIES.md` is optional here as everywhere else: when it is absent the
+  classifier states the default entry rules itself. The prompt always carries
+  each agent's own declaration (role, priority, scope, who it escalates to), so
+  routing does not depend on a file the user may have deleted.
 - The low-confidence bump only moves the task *up*: sending it to too senior an
   agent costs tokens, while sending it too low causes thrash.
 
@@ -602,6 +607,15 @@ stripped, so `/usr/bin/sudo` and `sudo.exe` both match `sudo`.
   string must stay editable.
 - Reported tokens are masked to four characters plus a length, because a block
   reason ends up in the model transcript and on screen.
+- Prefixes are matched **per token, anchored at its start**, and a prefixed
+  token must also look like a credential: at least 20 characters, a body of at
+  least 12 with both letters and digits, and entropy of at least 3.0 bits per
+  character. A structural prefix (`-----BEGIN`) skips those rules. This is what
+  separates `sk-proj-…48 random chars…` from `sk-button-primary-large`, and it
+  matters because the hook is sealed — a false positive here is one the user
+  cannot switch off.
+- Lines carrying an inline `data:` URI skip the entropy heuristic: embedded
+  images are high-entropy by nature and carry nothing secret.
 
 ---
 
@@ -655,9 +669,10 @@ the files it explicitly wrote, so it can't claim another agent's changes.
 |---|---|
 | `closeAttempt` diff | `git add --intent-to-add -- <paths>` then `git diff <frame.sha> -- <paths>`, written to `attempt-<n>.diff` |
 | `revertAttempt` | for each path: existed at `frame.sha` → `git checkout <sha> -- path`; else `rmSync` |
-| `commitAttempt` | `git add --all`, then commit if anything is staged. Message: `<tier>: <summary ≤68>\n\nvia jr-arch` |
+| `commitAttempt` | `git add -- <attemptPaths>`, then `git commit -- <attemptPaths>`: a pathspec commit takes those paths from the working tree and cannot pick up a sibling's change or the user's own uncommitted work. Message: `<tier>: <summary ≤68>\n\nvia jr-arch` |
 
-`commit()` in `run.js` first runs `checkCommit(frame.touched, frame.verify.green)`.
+`commit()` in `run.js` first runs `checkCommit(attemptPaths(frame), frame.verify.green)`
+— the same set that will be staged, so nothing reaches history unscanned.
 If any commit hook blocks, the commit is skipped with a warning and the work
 stays in the tree. `git.auto_commit: false` (read from `agent.yaml`) skips
 committing entirely.
@@ -769,10 +784,14 @@ general, so anything it can't prove disjoint counts as overlapping.
 
 ### Selecting and running
 
-`swarmFor(ctx, {files})` takes the **first** group with more than one member,
-uses `partition()` to assign repo files to their highest-priority owner, and
-swarms only if **more than one** member of the group claims files. Otherwise
-the task runs on the normal ladder.
+`swarmFor(ctx, {task, files})` takes the **first** group with more than one
+member and asks the model which of them the task actually spans
+(`selectSwarm` in `classify.js`, one small call). One name means it is not
+swarm work, and the ladder runs instead. If the selection call fails or returns
+nothing usable, it falls back to file ownership: `partition()` assigns repo
+files to their highest-priority owner and the agents that claim any are used.
+That fallback answers a different question — "does this agent own anything in
+this repo" — which is why it is no longer the primary path.
 
 `swarm(ctx, group)`:
 - Every agent runs `attempt()` concurrently through `Promise.all`.
@@ -780,7 +799,10 @@ the task runs on the normal ladder.
   `gitLock(ctx)`, a promise chain on `ctx.gitQueue`.
 - A failed agent's report is reconciled into the **shared ledger** and only its
   own paths are reverted.
-- `verify()` runs **once**, after all agents finish.
+- `verify()` runs **once**, after all agents finish. A red build goes to the
+  `fixes_build` agent first, exactly as on the ladder; each successful frame
+  then carries that build result into `checkCommit`, so a swarm cannot commit
+  over a red build.
 - Outcome: some succeeded → `done`, or `partial` if any failed. Each successful
   frame is then committed. None succeeded → `stopped`.
 
@@ -815,6 +837,13 @@ Swarm has no escalation path of its own (RUNBOOK "Next" item).
 | no command detected | `null`, reason "no build or test command found" |
 | binary missing (ENOENT) | `null`, "X is not installed" |
 | killed / timed out (300s) | `null`, "timed out" (a timeout isn't a red build) |
+| output over the 64MB buffer | `null`, "printed more output than could be captured" |
+
+`execFileSync` defaults to a 1MB buffer and then kills the child, reporting
+SIGTERM — indistinguishable from a timeout unless `err.code` is checked. A
+verbose suite therefore read as "unknown", and the build gate silently stopped
+gating, so both `verify()` and `run_command` now buffer 64MB and handle ENOBUFS
+before the timeout branch.
 
 Output keeps the first and last 3,000 characters (`tail`), because the cause is
 often at the start and the failing assertion at the end.
@@ -885,7 +914,13 @@ loop:
      otherwise           → throw
 ```
 
-`kind` is one of `too-large`, `rate-limit`, `auth`, `model`, `server`, `other`.
+`kind` is one of `param`, `too-large`, `rate-limit`, `auth`, `model`, `server`,
+`other`. `param` is a model refusing a request field rather than the request:
+OpenAI's reasoning models want `max_completion_tokens` instead of `max_tokens`
+and accept only the default temperature. The refusal names the field, so the
+request layer adapts, remembers the adaptation per provider and model
+(`learnedParams`), and resends — rather than carrying a list of model ids that
+would be stale the week it shipped.
 `describeError` turns it into a sentence naming the provider, the model, the
 limit, and what to do. Raw provider JSON never reaches the screen. Every string
 passes through `redact` with the key.
@@ -894,6 +929,29 @@ Notices go to **stderr** so they never end up in piped stdout.
 
 **Streaming never retries after the first byte**, because tokens that were
 already printed can't be printed again.
+
+### Limits
+
+Two separate things, both surfaced by `limits.js`:
+
+- **Provider limits** are read from response headers, never guessed. The
+  OpenAI-shaped providers send `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`;
+  Anthropic sends `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-{limit,remaining,reset}`.
+  `parseRateLimits` normalises both into rows and returns `{found:false}` rather
+  than throwing when a provider (Ollama, most OpenAI-compatible servers) reports
+  nothing.
+- **The reply cap** is `max_tokens`, resolved per agent by `modelFor`. It is
+  stored in `agent.yaml` under `tiers.<agent>.model.max_tokens` and written by
+  `patchTierModel`, which patches the nested block line by line so the comments
+  around it survive.
+
+Headers arrive on any response, including errors, so `probeLimits` reads
+whatever came back from a 1-token request; a 429 reports limits just as well as
+a 200. `listModels` also forwards its headers through `onHeaders`, so the key
+check during onboarding usually yields the limits with no extra call.
+`suggestedCap` turns a reported output limit into a cap 10% under it, which
+onboarding applies when the manifest default is higher — a request that asks for
+more output than the per-minute allowance is refused outright, not queued.
 
 ### Streams
 
@@ -949,6 +1007,10 @@ flowchart LR
     a key ever displayed.
   - `.env*` is in the sealed `protected-read` list, so the model can't read it
     with either tool.
+  - `requiresKey()` is false for Ollama and for any `base_url` on this machine
+    (localhost, 127.x, ::1, host.docker.internal): a local server authenticates
+    nothing, and treating it as unconfigured sent the user through onboarding
+    on every launch.
 - `keyEnvs(manifest)` collects the base key variable and every per-tier one.
   The chat's setup gate and `jr-arch key` both use it.
 
@@ -1151,7 +1213,7 @@ pack `model:` refusal.
 ## 21. Testing architecture
 
 - **Runner:** `node --test`, with no framework and no dependencies. There are
-  512 tests in 24 files under `test/`, and a full run takes about 45 seconds.
+  535 tests in 25 files under `test/`, and a full run takes about 50 seconds.
 - **No network:** `callModel` is injected as `call`, and `listModels` /
   onboarding / smoke take `fetchImpl`.
 - **No terminal needed:** flows take a prompter, driven by `scriptedPrompter`,
@@ -1174,4 +1236,6 @@ pack `model:` refusal.
 | `limits.test.js`, `stream.test.js` | provider error parsing and recovery, SSE and stream readers |
 | `providers.test.js`, `env.test.js`, `config.test.js` | registry, key handling, manifest patching |
 | `pack.test.js`, `pull.test.js`, `personas.test.js` | pack validation, lock, merge planning |
+| `production-fixes.test.js` | commit scope, the no-commit repo guard, the build-state handoff, local endpoints, classification without DUTIES.md, parameter adaptation |
+| `token-limits.test.js` | header parsing for both families, the probe (endpoint, 1 token, errors), cap patching and pruning, per-agent resolution, the empty-assistant-turn regression |
 | `verify.test.js`, `detect.test.js`, `yaml.test.js`, `agents.test.js`, `terminal.test.js` | as named |

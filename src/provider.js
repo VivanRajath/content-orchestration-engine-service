@@ -45,9 +45,30 @@ export function isAnthropic(manifest) {
   return wireFor(manifest.provider) === 'anthropic';
 }
 
-/** Local endpoints like ollama take no key at all. */
+/**
+ * Does this configuration need an API key at all?
+ *
+ * Ollama says so in the registry. The other keyless case is a local server —
+ * vLLM, LM Studio, llama.cpp behind `openai-compatible` — which authenticates
+ * nothing. Treating those as needing a key sent the user back through
+ * onboarding on every launch, because the chat's setup check saw a variable
+ * that was unset and could never usefully be set.
+ */
 export function requiresKey(manifest) {
-  return !providerFor(manifest.provider)?.noKey;
+  if (providerFor(manifest.provider)?.noKey) return false;
+  return !isLocal(manifest.baseUrl);
+}
+
+const LOCAL_HOST = /^(?:localhost|127(?:\.\d+){1,3}|\[::1\]|0\.0\.0\.0|host\.docker\.internal)$/i;
+
+/** A base URL that points at this machine, so there is nobody to authenticate to. */
+export function isLocal(baseUrl) {
+  if (!baseUrl) return false;
+  try {
+    return LOCAL_HOST.test(new URL(String(baseUrl)).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -82,6 +103,13 @@ function toAnthropicMessages(messages) {
       for (const call of m.toolCalls ?? []) {
         content.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input ?? {} });
       }
+      // An assistant turn with nothing in it is rejected outright by the
+      // Messages API, which fails the whole run. It happens for real: a reply
+      // cut off at max_tokens before it produced any text arrives as empty, and
+      // the loop's next move is to nudge the model — so the turn it is nudging
+      // about has to be representable. Dropping the turn instead would leave
+      // two user turns in a row, which the same API also refuses.
+      if (!content.length) content.push({ type: 'text', text: '(no reply)' });
       return { role: 'assistant', content };
     }
     // Tool results come back as a user turn in the Anthropic shape.
@@ -172,7 +200,44 @@ export class ProviderError extends Error {
 const learnedCaps = new Map();
 const capKey = (manifest) => `${manifest.provider}|${manifest.model}`;
 export const outputCap = (manifest) => learnedCaps.get(capKey(manifest)) ?? null;
-export const forgetCaps = () => learnedCaps.clear();
+export const forgetCaps = () => { learnedCaps.clear(); learnedParams.clear(); };
+
+/**
+ * Parameters a model turned out not to accept, learned from its own refusal.
+ *
+ * OpenAI's reasoning models reject `max_tokens` (they want
+ * `max_completion_tokens`) and reject any temperature but the default. They are
+ * in the model list this tool shows, so a user picks one and every request
+ * fails with a 400 that reads like a bug here.
+ *
+ * Deliberately NOT a list of model ids. A hard-coded list is stale the week it
+ * ships — the same reason model ids are never hard-coded anywhere else here —
+ * and the provider has just told us exactly what is wrong. So: adapt, remember
+ * for this provider and model, and carry on.
+ */
+const learnedParams = new Map();
+export const learnedParamsFor = (manifest) => learnedParams.get(capKey(manifest)) ?? null;
+
+function adaptPayload(payload, params) {
+  const out = { ...payload };
+  if (params?.maxTokensKey && out.max_tokens !== undefined) {
+    out[params.maxTokensKey] = out.max_tokens;
+    delete out.max_tokens;
+  }
+  if (params?.dropTemperature) delete out.temperature;
+  return out;
+}
+
+/** Which parameter a 400 is complaining about, if it is complaining about one. */
+export function unsupportedParam(raw) {
+  const text = String(raw ?? '');
+  if (/max_completion_tokens/i.test(text)) return 'max_tokens';
+  if (/unsupported[^.]*\bmax_tokens\b|\bmax_tokens\b[^.]*(unsupported|not supported)/i.test(text)) return 'max_tokens';
+  if (/\btemperature\b/i.test(text) && /(unsupported|not supported|only the default|does not support)/i.test(text)) {
+    return 'temperature';
+  }
+  return null;
+}
 
 export function parseProviderError(status, text, headers) {
   let body = null;
@@ -188,18 +253,22 @@ export function parseProviderError(status, text, headers) {
   const limit = num(limits?.[2]);
   const requested = num(limits?.[4]);
 
+  const param = status === 400 || status === 422 ? unsupportedParam(raw + code) : null;
   const retryAfter = retryAfterMs(headers, raw);
   const tooLarge = /request too large|exceeds? the (?:enforced )?limit|context_length_exceeded|maximum context length|too many tokens/i.test(raw)
     || code === 'context_length_exceeded' || status === 413;
 
   let kind = 'other';
-  if (tooLarge) kind = 'too-large';
+  // Before 'model': a refusal naming a parameter usually also contains the
+  // phrase "not supported", which would otherwise read as a dead model.
+  if (param) kind = 'param';
+  else if (tooLarge) kind = 'too-large';
   else if (status === 429) kind = 'rate-limit';
   else if (status === 401 || status === 403) kind = 'auth';
   else if (status === 404 || /model_not_found|does not exist|not supported|decommissioned/i.test(raw + code)) kind = 'model';
   else if (status >= 500) kind = 'server';
 
-  return { kind, status, unit, limit, requested, retryAfter, raw: tidy(raw) };
+  return { kind, status, unit, limit, requested, retryAfter, param, raw: tidy(raw) };
 }
 
 /** The provider's sentence without the organisation id and the sales pitch. */
@@ -274,9 +343,12 @@ const humanWait = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Ma
 async function request(manifest, url, headers, body, key, { stream = false, retries = 2, notice = defaultNotice } = {}) {
   let lastError;
   let limitRetries = 0;
-  const payload = { ...body };
+  let payload = { ...body };
   const cap = outputCap(manifest);
   if (cap && payload.max_tokens > cap) payload.max_tokens = cap;
+  // Whatever this model refused last time, already applied.
+  let params = { ...(learnedParams.get(capKey(manifest)) ?? {}) };
+  payload = adaptPayload(payload, params);
 
   for (let attempt = 0; attempt <= retries + limitRetries; attempt++) {
     let res;
@@ -309,6 +381,21 @@ async function request(manifest, url, headers, body, key, { stream = false, retr
 
     // Limit recoveries get their own small allowance, so a shrink followed by a
     // wait for the minute to roll over does not use up the network retries.
+    if (info.kind === 'param') {
+      const next = info.param === 'max_tokens'
+        ? { ...params, maxTokensKey: 'max_completion_tokens' }
+        : { ...params, dropTemperature: true };
+      // Only retry when the adaptation is new, or a model that refuses both
+      // would loop refusing one of them.
+      const changed = next.maxTokensKey !== params.maxTokensKey || next.dropTemperature !== params.dropTemperature;
+      if (!changed || limitRetries >= 2) throw lastError;
+      params = next;
+      learnedParams.set(capKey(manifest), params);
+      payload = adaptPayload({ ...body, ...(payload.max_tokens ? { max_tokens: payload.max_tokens } : {}) }, params);
+      limitRetries++;
+      continue;
+    }
+
     if (info.kind === 'too-large') {
       const smaller = shrink(payload.max_tokens, info);
       if (!smaller || limitRetries >= 2) throw lastError;

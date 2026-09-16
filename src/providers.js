@@ -121,8 +121,12 @@ export function wireFor(provider) {
  * the one kind of network traffic this tool permits itself.
  *
  * `fetchImpl` is injectable so tests never touch the network.
+ *
+ * `onHeaders` hands the response headers to the caller. Providers report this
+ * key's rate limits there, so the call that proves the key also reveals what
+ * the key may spend — free, on a request we were making anyway.
  */
-export async function listModels(provider, key, { baseUrl = null, fetchImpl = fetch, timeout = 15000 } = {}) {
+export async function listModels(provider, key, { baseUrl = null, fetchImpl = fetch, timeout = 15000, onHeaders = null } = {}) {
   const spec = PROVIDERS[provider];
   if (!spec) throw new Error(`Unknown provider "${provider}".`);
 
@@ -150,6 +154,8 @@ export async function listModels(provider, key, { baseUrl = null, fetchImpl = fe
   } finally {
     clearTimeout(timer);
   }
+
+  try { onHeaders?.(res.headers); } catch { /* reporting limits must never fail the key check */ }
 
   if (res.status === 401 || res.status === 403) {
     throw new KeyRejected(`${spec.label} rejected that key (${res.status}).`);

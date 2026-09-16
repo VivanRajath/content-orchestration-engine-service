@@ -4,7 +4,7 @@ kind: Agent
 
 metadata:
   name: jr-arch
-  description: Four-tier coding agent harness with editable personas and guardrails.
+  description: Coding agent harness with editable personas and harness-enforced guardrails.
   version: 0.1.0
 
 # Your model, your key. Nothing is pinned by this tool.
@@ -17,16 +17,13 @@ model:
   temperature: 0.2
   max_tokens: 8192
 
-identity:
-  soul: SOUL.md
-  rules: RULES.md
-  duties: DUTIES.md
-
-memory:
-  path: memory/MEMORY.md
-  commit: true                 # memory updates land as git commits
-
 hooks: hooks/hooks.yaml
+
+# How a run uses git. These are read from THIS file.
+git:
+  session_branch: true         # false: work on the current branch
+  branch_prefix: jr-arch       # branches are <prefix>/session-<id>
+  auto_commit: true            # false: leave verified work uncommitted
 
 # Per-tier model overrides. Delete this block to run one model everywhere.
 # Anything a tier does not name is inherited from model: above, so a tier can
@@ -43,10 +40,9 @@ hooks: hooks/hooks.yaml
 #       name: claude-opus-4-1           # same provider, same key, bigger model
 
 routing:
-  entry: auto                  # auto | build-doctor | senior-dev | junior-dev | ui-editor
+  entry: auto                  # auto, or the name of an installed agent
   default_attempts: 2          # tries per agent, unless its SOUL.md declares
                                # its own `attempts:`
-  diff_line_ceiling: 400
   max_steps: 40                # tool calls per attempt; a loop on a failing
                                # test burns your key quietly without a ceiling
   context_budget: 6000         # characters of compiled handoff context. The

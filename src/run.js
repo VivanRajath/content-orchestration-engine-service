@@ -4,12 +4,13 @@ import { agentDir, repoRoot } from './paths.js';
 import { readManifest, modelFor } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
 import { callModel, extractJson } from './provider.js';
-import { classify } from './classify.js';
+import { classify, selectSwarm } from './classify.js';
 import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
 import {
   openSession, openAttempt, closeAttempt, closeSession, commitAttempt,
   revertAttempt, dirtyFiles, isRepo, listSessions, readSession, resumeBrief, git,
+  attemptPaths, headSha,
   record as sessionRecord,
 } from './session.js';
 import { newLedger, reconcile, compile, REPORT_SYSTEM, reportPrompt } from './context.js';
@@ -32,7 +33,7 @@ const DEFAULT_MAX_STEPS = 40;
 /** Consecutive tool-free replies before an attempt is declared stalled. */
 const IDLE_LIMIT = 3;
 
-export async function run(positional, flags, { call = callModel, prompter = null } = {}) {
+export async function run(positional, flags, { call = callModel, prompter = null, build: knownBuild = null } = {}) {
   const root = repoRoot();
   const dir = agentDir();
   const task = (positional ?? []).join(' ').trim() || (typeof flags.task === 'string' ? flags.task : '');
@@ -65,21 +66,36 @@ export async function run(positional, flags, { call = callModel, prompter = null
   const tiers = agents.map((a) => a.name);
   const maxSteps = manifest.raw?.routing?.max_steps ?? DEFAULT_MAX_STEPS;
 
-  // Failed attempts are reverted with `git reset --hard`. Refusing to start on
-  // a dirty tree is what makes that safe: the only work it can ever destroy is
-  // the agent's own. This guard is the precondition for revertAttempt, not a
-  // convenience — do not weaken it without removing that.
+  // Both halves of the safety net are git: the session branch that makes a run
+  // reviewable, and the per-file revert that undoes a failed attempt. Neither
+  // exists without a commit to work from — `openSession` cannot branch off
+  // nothing, and `revertAttempt` has no sha to restore to, so it returns
+  // silently and the failed attempt's files stay. That state used to be entered
+  // without a word, and the chat reaches it by default because it passes
+  // --allow-dirty.
+  requireGit(root, flags);
+
+  // Refusing to start on a dirty tree is what makes the revert safe: the only
+  // work it can ever destroy is the agent's own. This guard is the precondition
+  // for revertAttempt, not a convenience.
   const dirty = isRepo(root) ? dirtyFiles(root) : [];
   if (dirty.length && !flags['allow-dirty']) {
     throw new Error(
       `The working tree has ${dirty.length} uncommitted change(s).\n` +
       `  ${dirty.slice(0, 5).join('\n  ')}${dirty.length > 5 ? `\n  … and ${dirty.length - 5} more` : ''}\n\n` +
-      '  Failed attempts are rolled back with git reset --hard, which would destroy them.\n' +
+      '  A failed attempt is rolled back through git, which would destroy them.\n' +
       '  Commit or stash first, or pass --allow-dirty to accept that risk.',
     );
   }
 
-  const build = flags['skip-verify'] ? { green: null, output: '', label: null } : verify({ root });
+  // The chat hands back the build state from the end of the previous turn,
+  // which it has just verified. Without it every message paid for the project's
+  // whole test suite twice: once to decide routing, once to check the result.
+  // The post-task verify is still run for real — that is the one that gates a
+  // commit, and it is never taken from a cache.
+  const build = flags['skip-verify']
+    ? { green: null, output: '', label: null }
+    : (knownBuild ?? verify({ root }));
   // Chat repeats this loop once per message, so the standing facts — model,
   // agent list, build state — are banner material for a one-off `run` and
   // noise in a conversation that already showed them at startup.
@@ -160,15 +176,28 @@ export async function run(positional, flags, { call = callModel, prompter = null
     // A swarm is opt-in. Fanning out by default would multiply a user's token
     // bill the first time they installed two scoped agents, without them ever
     // asking for it.
-    const group = flags.swarm && !named ? swarmFor(ctx, { files: repoFiles(root) }) : null;
+    const group = flags.swarm && !named
+      ? await swarmFor(ctx, { task: subject, files: repoFiles(root) })
+      : null;
     if (group) {
       const result = await swarm(ctx, group, { task: subject, brief });
+      // The same gate the ladder applies: a red build goes to whoever repairs
+      // builds, and only then is anything committed. Without this a swarm
+      // committed over a red build — every frame was closed with no verify
+      // result, and "unknown" only warns.
+      let build = result.build;
+      if (build.green === false && result.done.length) {
+        const repaired = await callBuildDoctor(ctx, result.done[0].frame, build);
+        build = repaired.build;
+      }
+      for (const d of result.done) d.frame.verify = build;
+
       const outcome = result.done.length
         ? {
-            status: result.failed.length ? 'partial' : 'done',
+            status: result.failed.length || build.green === false ? 'partial' : 'done',
             tier: result.done.map((d) => d.agent.name).join(', '),
             summary: result.done.map((d) => `${d.agent.name}: ${d.result.summary}`).join('; '),
-            build: result.build,
+            build,
           }
         : { status: 'stopped', reason: 'every agent in the swarm failed', detail: result.failed[0]?.result?.reason };
       if (outcome.status !== 'stopped') {
@@ -382,12 +411,26 @@ function agentOf(ctx, name) {
   return findAgent(name, ctx.agents) ?? { name, dir: join(ctx.dir, 'agents', name), owns: [], role: '' };
 }
 
-/** The agents a task should fan out to, or null when it is one agent's job. */
-export function swarmFor(ctx, { files = [] } = {}) {
+/**
+ * The agents a task should fan out to, or null when it is one agent's job.
+ *
+ * Selection is about the TASK. The file-ownership pass below is only a
+ * fallback, because on its own it answers a different question — "does this
+ * agent own anything in this repo" — and so fanned out to agents the task never
+ * touched, at one model call each.
+ */
+export async function swarmFor(ctx, { task = '', files = [] } = {}) {
   const groups = swarmable(ctx.agents).filter((g) => g.length > 1);
   if (!groups.length) return null;
-  // Fan out only when the work actually spans more than one agent's scope.
   const group = groups[0];
+
+  const picked = await selectSwarm({ task, agents: group, manifest: ctx.manifest, call: ctx.call });
+  if (picked) {
+    const chosen = group.filter((a) => picked.includes(a.name));
+    // One agent named is a real answer: it means this is not swarm work.
+    return chosen.length > 1 ? chosen : null;
+  }
+
   const { claims } = partition(group, files);
   const busy = group.filter((a) => (claims.get(a.name) ?? []).length);
   return busy.length > 1 ? busy : null;
@@ -534,7 +577,9 @@ async function callBuildDoctor(ctx, parent, build) {
 
 function commit(ctx, frame, summary) {
   if (ctx.manifest.raw?.git?.auto_commit === false) return;
-  const files = [...(frame.touched ?? [])];
+  // The same set commitAttempt will stage. Gating on frame.touched alone left
+  // anything a run_command wrote unscanned, while the commit took it anyway.
+  const files = attemptPaths(ctx.session, frame);
   const gate = checkCommit(files, frame.verify?.green ?? null, ctx.hooks, { root: ctx.root });
   if (!gate.allowed) {
     for (const b of gate.blocked) warn(`commit blocked by ${b.hook}: ${b.reason}`);
@@ -771,6 +816,42 @@ function priorLedger(prior, task) {
     });
   }
   return ledger;
+}
+
+/**
+ * Refuse to run where a failed attempt could not be undone.
+ *
+ * `--no-git` is the way to say you accept that, and it has to be typed: the
+ * cost of guessing wrong is the user's files, and "it seemed to work" is how
+ * someone finds out afterwards.
+ */
+function requireGit(root, flags) {
+  if (flags['no-git']) {
+    warn('Running without git: no session branch, and a failed attempt cannot be rolled back.');
+    return;
+  }
+
+  if (!isRepo(root)) {
+    throw new Error([
+      `${root} is not a git repository.`,
+      '  Every run works on its own branch, and a failed attempt is undone with git.',
+      '  Neither is possible here, so a failed attempt would leave its edits behind.',
+      '',
+      '  Start one:   git init && git add -A && git commit -m "initial commit"',
+      '  Or accept the risk:  --no-git',
+    ].join(NEWLINE));
+  }
+
+  if (!headSha(root)) {
+    throw new Error([
+      'This repository has no commits yet.',
+      '  There is nothing to branch from and nothing to roll back to, so a failed',
+      '  attempt would leave its edits in your working tree.',
+      '',
+      '  Make the first commit:  git add -A && git commit -m "initial commit"',
+      '  Or accept the risk:     --no-git',
+    ].join(NEWLINE));
+  }
 }
 
 /** The current branch, if it is already one of our session branches. */

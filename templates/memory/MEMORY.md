@@ -1,8 +1,9 @@
 # Memory
 
-Git-committed. Each session appends what was learned about this repo:
-conventions, gotchas, where things live, what has already been tried.
+Notes about this repository for whoever works on it next — conventions,
+gotchas, where things live, what has already been tried.
 
-Review it like code — if the agent learned something wrong, edit it out.
+Written and maintained by you. Nothing in jr-arch writes to this file yet, and
+agents are not given it, so treat it as documentation rather than as state.
 
 ---

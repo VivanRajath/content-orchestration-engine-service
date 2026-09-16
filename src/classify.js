@@ -76,7 +76,7 @@ export async function classify({
 
   const rules = duties ?? readDuties(dir);
   const response = await call(manifest, {
-    system: `${SYSTEM}\n\nAvailable tiers: ${tiers.join(', ')}\n\n--- DUTIES.md ---\n${rules}`,
+    system: `${SYSTEM}\n\nAvailable tiers, as they describe themselves:\n${describeAgents(roster)}\n\n--- DUTIES.md ---\n${rules}`,
     messages: [{ role: 'user', content: prompt(task, buildGreen, files) }],
     maxTokens: 256,
     temperature: 0,
@@ -164,10 +164,80 @@ function prompt(task, buildGreen, files) {
   ].join('\n');
 }
 
+/**
+ * The entry rules, from the user's own DUTIES.md when there is one.
+ *
+ * A missing DUTIES.md is not an error. The loop already treats the file as
+ * optional — it passes whatever is there and nothing when it is gone — and this
+ * threw instead, so deleting a file the docs call optional broke every task
+ * that needed classifying. What the classifier actually needs is the entry
+ * rule, and the agents themselves declare enough to state it.
+ */
 function readDuties(dir) {
   const file = join(dir, 'DUTIES.md');
-  if (!existsSync(file)) {
-    throw new Error(`No DUTIES.md in ${dir}. It defines the entry rules the classifier routes by.`);
+  if (existsSync(file)) return readFileSync(file, 'utf8');
+  return [
+    '(No DUTIES.md in this repository, so the default entry rules apply.)',
+    '',
+    '1. If the build is red, the agent that repairs builds takes it.',
+    '2. Otherwise the task goes to the agent whose declared scope covers it,',
+    '   lowest priority number first.',
+    '3. A task no scope covers goes to the agent with no scope, or failing that,',
+    '   to the last agent by priority.',
+  ].join('\n');
+}
+
+/** What each agent says it is for, so the model can route without DUTIES.md. */
+function describeAgents(agents) {
+  return agents.map((a) => {
+    const bits = [
+      `priority ${a.priority}`,
+      a.owns.length ? `owns ${a.owns.join(' ')}` : 'owns anything',
+      a.fixesBuild ? 'repairs builds' : '',
+      a.terminal ? 'terminal' : a.escalatesTo ? `escalates to ${a.escalatesTo}` : '',
+    ].filter(Boolean).join(' · ');
+    return `- ${a.name}: ${a.role || 'no role declared'} (${bits})`;
+  }).join('\n');
+}
+
+/**
+ * Which of these agents does the task actually span?
+ *
+ * `--swarm` used to fan out to every parallel agent that owned any file in the
+ * repository, which is not a fact about the task at all: an agent owning
+ * `**\/*.css` was "busy" in any repo containing CSS, and ran — and was billed
+ * for — on a task about the database. The question is what the task touches, so
+ * it is asked the same way the entry tier is.
+ *
+ * Returns null when the model cannot answer, and the caller falls back to the
+ * ownership heuristic rather than refusing to swarm.
+ */
+const SWARM_SYSTEM = `You decide which agents a coding task needs.
+
+Reply with a single JSON object and nothing else:
+{"agents": ["name", ...]}
+
+Name only agents whose own scope the task genuinely touches — they will run at
+the same time, and each one costs the user a model call. One agent is a normal
+answer. Never invent a name that is not listed.`;
+
+export async function selectSwarm({ task, agents, manifest, call = callModel } = {}) {
+  if (!task || !agents?.length) return null;
+
+  try {
+    const response = await call(manifest, {
+      system: `${SWARM_SYSTEM}\n\nAgents:\n${describeAgents(agents)}`,
+      messages: [{ role: 'user', content: `Task:\n${task}` }],
+      maxTokens: 200,
+      temperature: 0,
+    });
+    const parsed = extractJson(response.text);
+    const names = Array.isArray(parsed?.agents) ? parsed.agents.map((n) => String(n).trim()) : null;
+    if (!names) return null;
+    const known = names.filter((n) => agents.some((a) => a.name === n));
+    return known.length ? known : null;
+  } catch {
+    // A failed selection is not a failed run: the caller has a heuristic.
+    return null;
   }
-  return readFileSync(file, 'utf8');
 }

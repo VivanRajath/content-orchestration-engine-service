@@ -89,6 +89,62 @@ describe('secret-scan', () => {
     assert.ok(blockedBy(edit('a.pem', '-----BEGIN RSA PRIVATE KEY-----'), 'secret-scan'));
   });
 
+  test('still blocks the real thing, in every shipped shape', () => {
+    // Assembled at runtime, not written out. These are invented, but a fixture
+    // shaped exactly like a live token is one GitHub's own push protection
+    // refuses to accept — a test for a secret scanner must not itself look
+    // like a leak.
+    const fake = (prefix, body) => prefix + body;
+    const real = [
+      ['openai', `const k = "${fake('sk-', 'proj-Ab3kR9xQ2mZpL7vN4tY8wE1sD6fG0hJ5cV2bN9mK4pQ7rT3x')}";`],
+      ['github', `token: ${fake('ghp_', 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8')}`],
+      ['google', `const g = "${fake('AIza', 'SyD3aBcDeFgHiJkLmNoPqRsTuVwXyZ01234')}";`],
+      ['slack', fake('xoxb-', '123456789012-987654321098-AbCdEfGhIjKlMnOpQrStUvWx')],
+    ];
+    for (const [who, line] of real) {
+      assert.ok(blockedBy(edit('src/app.js', line), 'secret-scan'), `${who} key was not blocked`);
+    }
+  });
+
+  /**
+   * The prefix was matched with indexOf against the whole line, so any line
+   * containing "sk-" anywhere was refused — `task-row`, `risk-high`,
+   * `disk-usage` — by a hook nobody can switch off. A repo with a task list in
+   * it could not be worked on at all.
+   */
+  test('ordinary code containing "sk-" is not a credential', () => {
+    const ordinary = [
+      '<div className="task-row">{title}</div>',
+      'const m = { "risk-high": 1 };',
+      'import { used } from "./disk-usage.js";',
+      'const cls = "sk-button-primary-large";',
+      'export const TASK_STATES = ["task-open", "task-done"];',
+    ];
+    for (const line of ordinary) {
+      const v = edit('src/app.jsx', line);
+      assert.equal(v.allowed, true, `blocked ordinary code: ${line}`);
+    }
+  });
+
+  test('an inline data: URI is content, not a secret', () => {
+    const png = 'const ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk";';
+    assert.equal(edit('src/icon.js', png).allowed, true);
+  });
+
+  test('a commit-time whole-file scan agrees with the edit gate', () => {
+    // checkCommit rescans whole files, so a false positive there meant a file
+    // could be written and then never committed.
+    const box = withHooks();
+    try {
+      const file = join(box.dir, 'app.jsx');
+      writeFileSync(file, '<div className="task-row" />\nconst id = "risk-high";\n');
+      const v = checkCommit(['app.jsx'], true, box.hooks, { root: box.dir });
+      assert.equal(v.allowed, true);
+    } finally {
+      box.cleanup();
+    }
+  });
+
   test('never renders the candidate secret in full', () => {
     const secret = 'sk-livekey01234567890abcdefghijklmnop';
     const v = edit('src/config.js', `const k = "${secret}";`);

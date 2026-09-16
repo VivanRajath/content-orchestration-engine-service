@@ -145,7 +145,7 @@ export async function detect(_positional, flags) {
   // dependencies are not pinned routes to build-doctor before anything else.
   const unpinned = found.stacks.filter((s) => s.lockable && !s.lock);
   for (const s of unpinned) {
-    warn(`${s.name} has no lockfile — a run will likely route to build-doctor first.`);
+    warn(`${s.name} has no lockfile — a run will likely route to a build-repair agent first.`);
   }
   console.log();
   return found;

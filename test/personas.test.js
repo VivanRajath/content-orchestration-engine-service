@@ -48,7 +48,7 @@ describe('personas add', () => {
       const before = readFileSync(file, 'utf8');
       await personas(['add', 'reviewer'], {});
       assert.equal(readFileSync(file, 'utf8'), before);
-      assert.deepEqual(readManifest(file).agents, []);
+      assert.equal(readManifest(file).agents, undefined);
     });
   });
 
