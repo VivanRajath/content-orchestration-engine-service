@@ -288,3 +288,46 @@ describe('a model that refuses the parameters we send', () => {
     }
   });
 });
+
+describe('a model that cannot do this at all', () => {
+  test('stops after one attempt instead of climbing the ladder', async () => {
+    // Reported from a real session: groq/compound-mini does not support tool
+    // calling, so the answer is the same every time. The ladder spent two
+    // attempts at one agent, escalated, spent two more, and printed the same
+    // sentence four times — four paid requests to learn it once.
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const { ProviderError } = await import('../src/provider.js');
+      let calls = 0;
+      const refuses = async () => {
+        calls++;
+        throw new ProviderError(
+          'Groq cannot use groq/compound-mini for this: `tool calling` is not supported with this model',
+          { kind: 'model', provider: 'groq', model: 'groq/compound-mini' },
+        );
+      };
+
+      const out = await run(['can u tell me what this repo is about'], { quiet: true }, { call: refuses });
+
+      assert.equal(out.status, 'stopped');
+      assert.equal(out.fatal, 'model', 'the outcome says what kind of dead end this was');
+      assert.match(out.reason, /tool calling/);
+      assert.equal(calls, 1, 'one request, not one per attempt per agent');
+    });
+  });
+
+  test('a rate limit is still retried, because it is weather', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const { ProviderError } = await import('../src/provider.js');
+      let calls = 0;
+      const throttled = async () => {
+        calls++;
+        throw new ProviderError('Groq rate limit reached', { kind: 'rate-limit' });
+      };
+
+      await run(['do a thing'], { quiet: true }, { call: throttled });
+      assert.ok(calls > 1, 'a transient failure keeps its attempts');
+    });
+  });
+});

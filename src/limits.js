@@ -3,6 +3,7 @@ import { agentDir } from './paths.js';
 import { readManifest, modelFor, setTierMaxTokens, clearTierMaxTokens, setModelMaxTokens } from './config.js';
 import { readAgents } from './agents.js';
 import { PROVIDERS, providerFor, baseUrlFor, wireFor } from './providers.js';
+import { parseProviderError } from './provider.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -178,6 +179,92 @@ export async function probeLimits({
     note: res.status === 401 || res.status === 403
       ? `${spec.label} refused the key (${res.status}).`
       : `${spec.label} reports no rate-limit headers for ${model}.`,
+  };
+}
+
+/**
+ * Can this model drive an agent at all?
+ *
+ * Every agent works through tools, so a model without tool calling cannot do
+ * anything here — and plenty of models a provider lists cannot. Groq's
+ * compound models are chat models in every other respect and answer "`tool
+ * calling` is not supported with this model" to the first real request.
+ *
+ * That answer used to arrive as a failed task: two attempts at one agent, an
+ * escalation, two more, four paid requests and a wall of red. The provider will
+ * say it for the price of one token, before the first task, so it is asked
+ * here. The same request carries the rate-limit headers, so this replaces the
+ * limits probe rather than adding to it.
+ *
+ * `supportsTools` is deliberately three-valued: false is a refusal we
+ * understood, null is anything else — a rate limit, a network failure, a
+ * provider that answered something we cannot read. Only false is worth acting
+ * on, because only false is certain.
+ */
+const TOOL_PROBE = {
+  name: 'ping',
+  description: 'A connectivity check. Do not call this.',
+  input_schema: { type: 'object', properties: {} },
+};
+
+export async function probeModel({
+  provider, model, key = '', baseUrl = null, fetchImpl = fetch, timeout = 15000,
+} = {}) {
+  const spec = PROVIDERS[provider];
+  if (!spec) return { supportsTools: null, limits: { found: false, rows: [] }, note: `Unknown provider "${provider}".` };
+
+  const base = baseUrlFor(provider, baseUrl);
+  if (!base || !model) {
+    return { supportsTools: null, limits: await probeLimits({ provider, model, key, baseUrl, fetchImpl, timeout }) };
+  }
+
+  const anthropic = wireFor(provider) === 'anthropic';
+  const url = anthropic ? `${base}/v1/messages` : `${base}/chat/completions`;
+  const headers = anthropic
+    ? { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }
+    : { 'content-type': 'application/json', authorization: `Bearer ${key}` };
+  const tools = anthropic
+    ? [TOOL_PROBE]
+    : [{ type: 'function', function: { name: TOOL_PROBE.name, description: TOOL_PROBE.description, parameters: TOOL_PROBE.input_schema } }];
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  let res;
+  try {
+    res = await fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }], tools }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    return {
+      supportsTools: null,
+      limits: { found: false, rows: [] },
+      note: e.name === 'AbortError'
+        ? `${spec.label} did not answer within ${timeout / 1000}s.`
+        : `Could not reach ${spec.label} (${e.message}).`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const limits = parseRateLimits(res.headers);
+  if (res.ok) return { supportsTools: true, limits };
+
+  let body = '';
+  try { body = await res.text(); } catch { /* the status is enough */ }
+  const info = parseProviderError(res.status, body, res.headers);
+  // The refusal has to name tools. "not supported" on its own is also what a
+  // decommissioned model says, and telling someone their model cannot call
+  // tools when it simply no longer exists sends them to fix the wrong thing.
+  const aboutTools = /\btool|function[ _-]?call/i.test(info.raw);
+
+  return {
+    supportsTools: aboutTools ? false : null,
+    limits,
+    reason: info.raw,
+    note: aboutTools ? null : `${spec.label} answered ${res.status}: ${info.raw}`,
   };
 }
 

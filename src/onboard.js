@@ -5,7 +5,7 @@ import { init } from './init.js';
 import { readManifest, patchSection, setModelMaxTokens } from './config.js';
 import { writeKey, ensureIgnored, fingerprint } from './env.js';
 import { PROVIDERS, detectProvider, providerFor, listModels, KeyRejected } from './providers.js';
-import { parseRateLimits, probeLimits, printProviderLimits, suggestedCap } from './limits.js';
+import { parseRateLimits, probeModel, printProviderLimits, suggestedCap } from './limits.js';
 import { printTree } from './tree.js';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { c, ok, info, warn } from './util.js';
@@ -43,17 +43,24 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
 
   // --- 2. model -------------------------------------------------------------
   step(2, 'Choose a model');
-  const model = await pickModel(prompter, conn);
-  if (!model) return null;
+  let model = null;
+  let limits = conn.limits ?? { found: false, rows: [] };
+  for (;;) {
+    model = await pickModel(prompter, conn);
+    if (!model) return null;
 
-  // What this key may actually spend, before the first task rather than as a
-  // 429 during one. The listing above may already have carried the headers; if
-  // it did not, one 1-token request asks the model endpoint directly.
-  const limits = conn.limits?.found
-    ? conn.limits
-    : await probeLimits({ provider: conn.provider, model, key: conn.key, baseUrl: conn.baseUrl, fetchImpl });
-  console.log();
-  printProviderLimits(limits, { provider: conn.provider, model });
+    // One 1-token request answers both questions worth asking before the first
+    // task: what this key may spend, and whether this model can call a tool at
+    // all. A model that cannot is not a slow start, it is a dead end — every
+    // agent here works through tools.
+    const check = await probeModel({ provider: conn.provider, model, key: conn.key, baseUrl: conn.baseUrl, fetchImpl });
+    if (check.limits?.found) limits = check.limits;
+    else if (!limits.found && check.note) limits = { ...limits, note: check.note };
+
+    console.log();
+    printProviderLimits(limits, { provider: conn.provider, model });
+    if (await keepModel(prompter, model, check)) break;
+  }
   const cap = suggestedCap(limits);
 
   // --- 3. scaffold ----------------------------------------------------------
@@ -181,6 +188,22 @@ export async function obtainKey(prompter, { fetchImpl = fetch, attempts = 3 } = 
 
   warn('Giving up after three tries. Run `jr-arch` again whenever you have a key.');
   return null;
+}
+
+/**
+ * Report a model that cannot drive an agent, and ask whether to pick another.
+ *
+ * Only a refusal we understood stops anyone: `supportsTools === false`. A rate
+ * limit or an unreachable endpoint says nothing about the model, and refusing
+ * to continue on a maybe would be worse than the problem.
+ */
+export async function keepModel(prompter, model, check) {
+  if (check?.supportsTools !== false) return true;
+
+  warn(`${model} cannot call tools, so it cannot drive an agent.`);
+  if (check.reason) info(c.d(`  ${check.reason}`));
+  info(c.d('  Every agent here reads and writes through tools, so every task would fail.'));
+  return !(await prompter.confirm('Pick a different model?', true));
 }
 
 /** Choose from what the key can reach, or type a name when the list is empty. */

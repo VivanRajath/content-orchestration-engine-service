@@ -8,13 +8,13 @@ import { dirtyFiles, isRepo, git } from './session.js';
 import { verify } from './verify.js';
 import { run } from './run.js';
 import { createPrompter } from './prompter.js';
-import { onboard, obtainKey, pickModel, setModel } from './onboard.js';
+import { onboard, obtainKey, pickModel, setModel, keepModel } from './onboard.js';
 import { promptMode } from './generate.js';
 import { newAgent, newGuard, checkAll, printCheck, pathsFor, DEV_HELP } from './dev.js';
 import { smokeTest, printSmoke } from './smoke.js';
 import { printTree } from './tree.js';
 import { writeKey, ensureIgnored } from './env.js';
-import { showLimits, suggestedCap, DEFAULT_CAP } from './limits.js';
+import { showLimits, suggestedCap, probeModel, DEFAULT_CAP } from './limits.js';
 import { listModels } from './providers.js';
 import { c, ok, info, warn } from './util.js';
 
@@ -137,7 +137,16 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
         continue;
       }
 
-      lastBuild = await turn({ task, agent, call, flags, prompter, build: lastBuild });
+      const outcome = await turn({ task, agent, call, flags, prompter, build: lastBuild });
+      lastBuild = outcome?.build ?? null;
+
+      // A model that cannot do this at all will not do it next message either.
+      // Offering the fix here is the difference between one wasted task and a
+      // whole conversation of them.
+      if (outcome?.fatal && await prompter.confirm('Pick a different model now?', true)) {
+        const swapped = await switchModel({ dir, prompter, fetchImpl, models });
+        if (swapped?.models) models = swapped.models;
+      }
     }
   } finally {
     prompter.close();
@@ -168,7 +177,47 @@ async function turn({ task, agent, call, flags, prompter, build }) {
   // What the run verified on its way out is the state the next turn starts in.
   // Anything else — a failure, a stop — leaves it unknown, and the next turn
   // checks for itself.
-  return outcome?.build ?? null;
+  return outcome;
+}
+
+/**
+ * Switch the default model, and check the new one can actually drive an agent.
+ *
+ * Used by /models and by the offer made after a task fails on the model itself
+ * — without the check, the obvious next move is to pick another model that
+ * cannot call tools either.
+ */
+async function switchModel({ dir, prompter, fetchImpl, models }) {
+  const manifest = readManifest(join(dir, 'agent.yaml'));
+  let list = models;
+  if (!list?.length) {
+    try {
+      list = await listModels(manifest.provider, process.env[manifest.keyEnv] ?? '', {
+        baseUrl: manifest.baseUrl, fetchImpl,
+      });
+    } catch (e) {
+      warn(e.message);
+      return null;
+    }
+  }
+
+  const picked = await pickModel(prompter, { models: list, provider: manifest.provider });
+  if (!picked) return null;
+
+  const check = await probeModel({
+    provider: manifest.provider,
+    model: picked,
+    key: process.env[manifest.keyEnv] ?? '',
+    baseUrl: manifest.baseUrl,
+    fetchImpl,
+  });
+  if (!(await keepModel(prompter, picked, check))) {
+    return switchModel({ dir, prompter, fetchImpl, models: list });
+  }
+
+  setModel({ provider: manifest.provider, model: picked, keyEnv: manifest.keyEnv, baseUrl: manifest.baseUrl });
+  ok(`Default model is now ${c.c(picked)}`);
+  return { models: list, model: picked };
 }
 
 async function command(line, ctx) {
@@ -240,12 +289,8 @@ async function command(line, ctx) {
       }
       console.log();
       if (!(await prompter.confirm('Switch the default model?', false))) return { models };
-      const picked = await pickModel(prompter, { models, provider: manifest.provider });
-      if (picked) {
-        setModel({ provider: manifest.provider, model: picked, keyEnv: manifest.keyEnv, baseUrl: manifest.baseUrl });
-        ok(`Default model is now ${c.c(picked)}`);
-      }
-      return { models };
+      const swapped = await switchModel({ dir, prompter, fetchImpl: ctx.fetchImpl, models });
+      return { models: swapped?.models ?? models };
     }
 
     case 'limits': {
