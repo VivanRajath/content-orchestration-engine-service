@@ -157,7 +157,23 @@ const HANDLERS = {
     const buf = readFileSync(abs);
     if (buf.includes(0)) return err(`${rel.path} is a binary file.`);
     const text = buf.toString('utf8');
-    return ok(text.length > MAX_READ ? `${text.slice(0, MAX_READ)}\n\n… [truncated at ${MAX_READ} characters]` : text);
+
+    // The ceiling comes from what the key allows per request, not from a
+    // constant. It used to be 200,000 characters — around 50,000 tokens, more
+    // than an entire minute's allowance on a small plan, so reading one large
+    // file guaranteed that every later request in the attempt was refused.
+    const ceiling = ctx.readCeiling ?? MAX_READ;
+    if (text.length <= ceiling) return ok(text);
+
+    const shown = text.slice(0, ceiling);
+    const lines = shown.split('\n').length;
+    const total = text.split('\n').length;
+    return ok(
+      `${shown}\n\n` +
+      `… [${rel.path} is ${text.length} characters; the first ${ceiling} are shown ` +
+      `(about lines 1-${lines} of ${total}). This is what fits in one request on this key. ` +
+      'Work from this part, or use run_command with a tool like sed to read a later section.]',
+    );
   },
 
   list_files(input, ctx) {

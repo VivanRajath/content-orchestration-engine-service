@@ -352,6 +352,57 @@ jr-arch limits unset junior-dev      # back to inheriting
 `agent.yaml` under `tiers:`, so it survives and can be reviewed like any other
 config.
 
+### Working under a small limit
+
+Free tiers are tight. A Groq key with 8,000 tokens a minute counts input and
+output together, and an agent carries about 2,000 tokens of prompt and tool
+schemas before it reads anything — so one 7,000-token README used to blow the
+whole minute and fail the task.
+
+jr-arch measures the limit at setup (`model.tokens_per_minute` in
+`agent.yaml`), tells you what a step costs before spending anything, and fits
+every request under it:
+
+```
+  [chat] › what does this repo do
+  senior-dev · high-level question about the whole repo
+    ~2.4k per step · 8.0k/min on this key · about 1 step a minute
+```
+
+- **`read_file` is capped by the budget**, not by a constant. A file that
+  doesn't fit comes back cut, with a note saying how much was left and that a
+  later section can be read with `run_command`.
+- **The reply cap shrinks first** when a request is tight, because a shorter
+  answer still answers.
+- **Then the oldest tool output is dropped**, with a note in its place — the
+  task and recent turns are what the model works from, and a dropped file can
+  be read again.
+- **If the prompt alone exceeds the budget, it stops before the first request**
+  and says so, instead of failing four times on the way up the ladder.
+
+Estimates are characters over a ratio, not a tokenizer (this project has no
+dependencies). When a provider rejects a request it reports the true count,
+and that number replaces the estimate's ratio for that model.
+
+**If it's still too tight**, put the demanding agent on another provider's key
+— per-agent models already do this, and each key keeps its own allowance:
+
+```yaml
+tiers:
+  senior-dev:                 # the one that reads whole files
+    model:
+      provider: anthropic
+      name: claude-sonnet-4-6
+      api_key_env: ANTHROPIC_API_KEY
+  junior-dev:                 # scoped work stays on the cheap key
+    model:
+      provider: groq
+      name: llama-3.3-70b-versatile
+      api_key_env: GROQ_API_KEY
+```
+
+Add the second key with `jr-arch key <value> --env ANTHROPIC_API_KEY`.
+
 ### A different model per agent
 
 ```yaml
@@ -675,6 +726,7 @@ file's comments intact.
 | `hit the 40-step ceiling` | Split the task, or raise `routing.max_steps` |
 | `hooks/<file>.yaml:N: …` | A guard file doesn't parse. Fix it (spaces, not tabs; no anchors or flow maps) |
 | `No base_url for provider "openai-compatible"` | `jr-arch config set model.base_url <url>` |
+| "the conversation alone needs N" | The input is too big, not the reply. Read less per step, or use a model with a higher limit. The loop trims automatically once `tokens_per_minute` is recorded — check `jr-arch limits` |
 | Rate limit / "allows N tokens a minute" | `jr-arch limits` to see the allowance, then `jr-arch limits set default <n>` to fit under it, pick a model with higher limits (`/models`), or upgrade the plan |
 | Replies are cut off mid tool call | The cap is too low: `jr-arch limits set <agent> <bigger n>` |
 | Checkpoint declined in CI | Expected. A person has to pass `--yes` |

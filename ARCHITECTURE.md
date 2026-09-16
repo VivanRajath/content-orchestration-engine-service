@@ -173,6 +173,7 @@ flowchart TD
 | `src/agents.js` | 240 | Reads agents from front matter; escalation, cycles, build fixer, scope ownership, partition, swarm grouping, disjointness | `readAgents`, `frontMatter`, `findAgent`, `escalatesTo`, `escalationCycle`, `buildFixer`, `ownsPath`, `partition`, `swarmable`, `disjoint` |
 | `src/verify.js` | 139 | Detects and runs the project's build/test; Windows `.cmd` shim handling; head+tail output truncation | `detect`, `verify`, `resolveBin`, `winCmd`, `tail` |
 | `src/provider.js` | 601 | Provider-neutral transcript ↔ Anthropic/OpenAI wire; `request()` with limit recovery; SSE parsing; key redaction; JSON extraction | `callModel`, `ProviderError`, `parseProviderError`, `parseSSE`, `readAnthropicStream`, `readOpenAIStream`, `extractJson`, `redact`, `apiKey`, `requiresKey`, `missingKey` |
+| `src/budget.js` | ~230 | Token estimation, the per-request budget, request fitting (reply cap, then oldest tool output), and calibration from provider rejections | `estimateTokens`, `estimateRequest`, `budgetFor`, `readCeiling`, `fit`, `calibrate`, `describeBudget`, `formatTokens` |
 | `src/limits.js` | ~330 | Rate-limit headers from any provider, normalised; the 1-token probe; the reply-cap table; the `limits` command | `parseRateLimits`, `probeLimits`, `printProviderLimits`, `printAgentCaps`, `agentCaps`, `suggestedCap`, `showLimits`, `limits` |
 | `src/providers.js` | 191 | Provider registry, key-prefix detection, endpoint resolution, live model listing, chat-model filter | `PROVIDERS`, `detectProvider`, `baseUrlFor`, `wireFor`, `listModels`, `isChatModel`, `KeyRejected` |
 | `src/config.js` | 227 | The one `agent.yaml` reader; line-based section patchers; per-tier model resolution; `config` command | `readManifest`, `modelFor`, `keyEnvs`, `patchSection`, `patchSequence`, `upsertSection`, `upsertScalar`, `patchTierModel`, `setModelMaxTokens`, `setTierMaxTokens`, `clearTierMaxTokens`, `config` |
@@ -930,6 +931,27 @@ Notices go to **stderr** so they never end up in piped stdout.
 **Streaming never retries after the first byte**, because tokens that were
 already printed can't be printed again.
 
+### Budget
+
+Provider limits are a number; the budget is what the loop does with it.
+
+- `model.tokens_per_minute` is written at setup from the rate-limit headers and
+  refreshed by `jr-arch limits`. `budgetFor()` turns it into a per-request
+  ceiling (90% of the minute).
+- `estimateRequest()` counts characters over a ratio — no tokenizer, because
+  that would be a dependency and a 15% error does not change the decision.
+  `calibrate()` replaces the ratio with the provider's own count whenever a
+  rejection reports one.
+- `fit()` runs before every request: reduce the reply cap first, then blank the
+  oldest tool results (never the task or the last two turns), leaving a note in
+  place of what it dropped. It returns `fits: false` when the prompt and tools
+  alone exceed the budget — a fact about the key, not something trimming can
+  reach.
+- `readCeiling()` sizes `read_file` to ~35% of the budget, so a file cannot
+  make every later request in the attempt unaffordable.
+- `run()` prints `describeBudget()` before the first request and refuses
+  outright when nothing can fit, with `fatal: 'budget'`.
+
 ### Limits
 
 Two separate things, both surfaced by `limits.js`:
@@ -1213,7 +1235,7 @@ pack `model:` refusal.
 ## 21. Testing architecture
 
 - **Runner:** `node --test`, with no framework and no dependencies. There are
-  535 tests in 25 files under `test/`, and a full run takes about 50 seconds.
+  564 tests in 27 files under `test/`, and a full run takes about 50 seconds.
 - **No network:** `callModel` is injected as `call`, and `listModels` /
   onboarding / smoke take `fetchImpl`.
 - **No terminal needed:** flows take a prompter, driven by `scriptedPrompter`,
@@ -1236,6 +1258,7 @@ pack `model:` refusal.
 | `limits.test.js`, `stream.test.js` | provider error parsing and recovery, SSE and stream readers |
 | `providers.test.js`, `env.test.js`, `config.test.js` | registry, key handling, manifest patching |
 | `pack.test.js`, `pull.test.js`, `personas.test.js` | pack validation, lock, merge planning |
+| `budget.test.js` | estimation, calibration from a rejection, the budget from a measured limit, read ceilings, and what fitting gives up first |
 | `production-fixes.test.js` | commit scope, the no-commit repo guard, the build-state handoff, local endpoints, classification without DUTIES.md, parameter adaptation |
 | `token-limits.test.js` | header parsing for both families, the probe (endpoint, 1 token, errors), cap patching and pruning, per-agent resolution, the empty-assistant-turn regression |
 | `verify.test.js`, `detect.test.js`, `yaml.test.js`, `agents.test.js`, `terminal.test.js` | as named |

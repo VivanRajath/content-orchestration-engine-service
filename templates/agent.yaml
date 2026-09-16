@@ -16,6 +16,11 @@ model:
   base_url: null               # set for ollama / vLLM / OpenRouter / LM Studio
   temperature: 0.2
   max_tokens: 8192
+  # What this key allows per minute, measured from the provider's own headers
+  # at setup and refreshed by `jr-arch limits`. Every request is fitted under
+  # it: the reply cap shrinks first, then the oldest tool output is dropped.
+  # Delete it to send requests unfitted.
+  # tokens_per_minute: 8000
 
 hooks: hooks/hooks.yaml
 

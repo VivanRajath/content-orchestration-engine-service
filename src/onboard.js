@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { init } from './init.js';
-import { readManifest, patchSection, setModelMaxTokens } from './config.js';
+import { readManifest, patchSection, setModelMaxTokens, setTokensPerMinute } from './config.js';
 import { writeKey, ensureIgnored, fingerprint } from './env.js';
 import { PROVIDERS, detectProvider, providerFor, listModels, KeyRejected } from './providers.js';
 import { parseRateLimits, probeModel, printProviderLimits, suggestedCap } from './limits.js';
@@ -78,6 +78,13 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   // broken: the provider refuses a request that merely ASKS for more, so every
   // task would fail until someone found the number. Fit it to the key now,
   // while we have just been told what the key allows.
+  // The per-minute allowance is what every later request is fitted against.
+  // Without it the loop can only find out by being refused.
+  const perMinute = limits.rows?.find((r) => r.key === 'tokens')?.limit
+    ?? limits.rows?.find((r) => r.key === 'input')?.limit
+    ?? null;
+  if (perMinute) setTokensPerMinute(perMinute, join(dir, 'agent.yaml'));
+
   const configured = readManifest(join(dir, 'agent.yaml')).maxTokens;
   const capped = cap && (configured == null || cap < configured);
   if (capped) setModelMaxTokens(cap, join(dir, 'agent.yaml'));

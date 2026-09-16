@@ -331,3 +331,96 @@ describe('a model that cannot do this at all', () => {
     });
   });
 });
+
+describe('a key with a small per-minute allowance', () => {
+  test('the loop fits the request instead of being refused by the provider', async () => {
+    // The reported session, reproduced: 8,000 tokens a minute, and an agent
+    // that reads a 7,300-token README. Before this, the request went out at
+    // 10,664 tokens, was refused, had its REPLY cap shrunk — the half that was
+    // not the problem — and was refused again at 10,733.
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const file = join(box.dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace(
+        '  max_tokens: 8192',
+        '  max_tokens: 4000\n  tokens_per_minute: 8000',
+      ));
+      // A README the size of this project's own.
+      writeFileSync(join(box.root, 'BIG.md'), 'lorem ipsum dolor sit amet. '.repeat(1100));
+
+      const { estimateRequest } = await import('../src/budget.js');
+      const sizes = [];
+      const call = async (_manifest, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) {
+          return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        }
+        sizes.push({
+          tokens: estimateRequest({ system: req.system, messages: req.messages, tools: req.tools }),
+          maxTokens: req.maxTokens ?? null,
+        });
+        const step = sizes.length;
+        if (step === 1) {
+          return { text: '', toolCalls: [{ id: 'c1', name: 'read_file', input: { path: 'BIG.md' } }], stopReason: 'tool_use' };
+        }
+        return { text: '', toolCalls: [{ id: 'c2', name: 'done', input: { summary: 'read it' } }], stopReason: 'tool_use' };
+      };
+
+      const out = await run(['summarise BIG.md'], { quiet: true, 'allow-dirty': true }, { call });
+      assert.equal(out.status, 'done');
+
+      // Every request, prompt plus the reply it is allowed to generate, has to
+      // land under what the key permits — that is the number the provider
+      // checks.
+      for (const { tokens, maxTokens } of sizes) {
+        assert.ok(
+          tokens + (maxTokens ?? 4000) <= 8000,
+          `a request of ${tokens} + ${maxTokens} exceeds the 8,000 the key allows`,
+        );
+      }
+      assert.ok(sizes.length >= 2, 'the task still ran to completion');
+    });
+  });
+
+  test('a file too big for the budget is cut, and says so', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const file = join(box.dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace('  max_tokens: 8192', '  max_tokens: 2000\n  tokens_per_minute: 8000'));
+      writeFileSync(join(box.root, 'BIG.md'), 'x'.repeat(200000));
+
+      let toolResult = null;
+      const call = async (_m, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        const last = req.messages[req.messages.length - 1];
+        if (last?.role === 'tool') toolResult = last.results[0].content;
+        if (toolResult) return { text: '', toolCalls: [{ id: 'd', name: 'done', input: { summary: 'ok' } }], stopReason: 'tool_use' };
+        return { text: '', toolCalls: [{ id: 'r', name: 'read_file', input: { path: 'BIG.md' } }], stopReason: 'tool_use' };
+      };
+
+      await run(['read it'], { quiet: true, 'allow-dirty': true }, { call });
+
+      assert.ok(toolResult, 'the read happened');
+      assert.ok(toolResult.length < 200000, 'and was cut to something the key can carry');
+      assert.match(toolResult, /is 200000 characters/, 'the model is told what it did not get');
+      assert.match(toolResult, /fits in one request on this key/);
+    });
+  });
+
+  test('a prompt bigger than the whole budget is refused before any request', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const file = join(box.dir, 'agent.yaml');
+      // 1,200 tokens a minute cannot carry a 2,000-token agent prompt.
+      writeFileSync(file, readFileSync(file, 'utf8').replace('  max_tokens: 8192', '  max_tokens: 500\n  tokens_per_minute: 1200'));
+
+      let calls = 0;
+      const call = async () => { calls++; return { text: '', toolCalls: [], stopReason: 'end_turn' }; };
+      const out = await run(['anything'], { quiet: true, 'allow-dirty': true }, { call });
+
+      assert.equal(out.status, 'stopped');
+      assert.equal(out.fatal, 'budget');
+      assert.match(out.reason, /no room left to work in/);
+      assert.equal(calls, 0, 'nothing was spent finding out');
+    });
+  });
+});

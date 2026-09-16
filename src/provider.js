@@ -15,6 +15,7 @@
  */
 
 import { baseUrlFor, wireFor, providerFor } from './providers.js';
+import { calibrate } from './budget.js';
 
 export function apiKey(manifest) {
   return process.env[manifest.keyEnv] || '';
@@ -410,6 +411,27 @@ async function request(manifest, url, headers, body, key, { stream = false, retr
     }
 
     if (info.kind === 'too-large') {
+      // The provider just counted this exact request for us. Its number beats
+      // any constant the estimator carries, so the next estimate uses it.
+      if (info.requested) {
+        calibrate(manifest, { chars: JSON.stringify(payload).length, tokens: info.requested });
+      }
+
+      // Shrinking the reply cap cannot help when the input alone is over the
+      // limit — that was the loop that burned an attempt: cap 4,000 -> 1,236,
+      // refused again at a bigger input. Say which half is too big.
+      const output = payload.max_tokens ?? payload.max_completion_tokens ?? 0;
+      if (info.limit && info.requested && info.requested - output >= info.limit) {
+        throw new ProviderError(
+          `${providerFor(manifest.provider)?.label ?? manifest.provider} allows ${info.limit.toLocaleString()} ` +
+          `${UNIT_NAMES[info.unit] ?? 'tokens'} for ${manifest.model}, and the conversation alone needs ` +
+          `${(info.requested - output).toLocaleString()}.
+` +
+          '  A smaller reply cap cannot fix this. Read less in one step, or use a model with a higher limit (/models).',
+          { ...info, kind: 'too-large', inputOnly: true, provider: manifest.provider, model: manifest.model },
+        );
+      }
+
       const smaller = shrink(payload.max_tokens, info);
       if (!smaller || limitRetries >= 2) throw lastError;
       learnedCaps.set(capKey(manifest), smaller);
