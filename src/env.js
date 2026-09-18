@@ -1,7 +1,8 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
-import { keyEnvs, modelFor } from './config.js';
+import { keyEnvs, modelFor, addSavedKey } from './config.js';
+import { detectProvider, providerFor } from './providers.js';
 import { readAgents } from './agents.js';
 import { c, ok, info, warn } from './util.js';
 
@@ -88,6 +89,22 @@ export function ensureIgnored(root = repoRoot()) {
   return false;
 }
 
+/**
+ * A variable name for one more key of a provider already in use.
+ *
+ * GROQ_API_KEY, then GROQ_API_KEY_2, and so on. Writing a second Groq key into
+ * GROQ_API_KEY would silently replace the first, and every agent using it would
+ * move to the new one without anyone deciding that.
+ */
+export function nextKeyEnv(base, taken = []) {
+  const used = new Set(taken);
+  if (!used.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}_${n}`;
+    if (!used.has(candidate)) return candidate;
+  }
+}
+
 /** First four characters and a length. Never the whole key, anywhere. */
 export function fingerprint(value) {
   const s = String(value ?? '');
@@ -137,7 +154,7 @@ export function keySource(name) {
 // ---------------------------------------------------------------------------
 
 export async function key(positional, flags, { manifest }) {
-  const name = typeof flags.env === 'string' ? flags.env : manifest.keyEnv;
+  let name = typeof flags.env === 'string' ? flags.env : manifest.keyEnv;
   if (!name) {
     throw new Error('agent.yaml does not name an api_key_env. Set one:\n  jr-arch config set model.api_key_env MY_KEY');
   }
@@ -178,6 +195,17 @@ export async function key(positional, flags, { manifest }) {
   }
 
   if (/^\s*$/.test(value)) throw new Error('That key is empty.');
+
+  // A key belongs to its own provider's variable. `jr-arch key sk-ant-...` in
+  // a repo set up for Groq used to be written into GROQ_API_KEY — the Anthropic
+  // key sent to Groq on the next request, and the working Groq key gone.
+  const detected = typeof flags.env === 'string' ? null : detectProvider(value.trim());
+  if (detected && detected !== manifest.provider) {
+    name = providerFor(detected).keyEnv;
+    info(`That looks like a ${providerFor(detected).label} key, so it is saved as ${c.c(name)} — your ${c.c(manifest.keyEnv)} is left as it is.`);
+    try { addSavedKey({ provider: detected, keyEnv: name }); } catch { /* the key still lands */ }
+    info(c.d('Put an agent on it with /models in the chat.'));
+  }
 
   const alreadyIgnored = ensureIgnored();
   writeKey(name, value.trim());

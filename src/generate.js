@@ -1,13 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
-import { readManifest, upsertSection } from './config.js';
+import { readManifest, upsertSection, savedConnections, addSavedKey } from './config.js';
 import { readAgents } from './agents.js';
 import { inspect } from './detect.js';
 import { callModel, extractJson, outputCap } from './provider.js';
-import { writeKey, ensureIgnored } from './env.js';
+import { writeKey, ensureIgnored, nextKeyEnv } from './env.js';
 import { obtainKey, pickModel } from './onboard.js';
-import { listModels } from './providers.js';
+import { listModels, providerFor } from './providers.js';
 import { printTree } from './tree.js';
 import { c, ok, info, warn } from './util.js';
 
@@ -487,19 +487,44 @@ async function assignModels(prompter, plan, { manifest, models, fetchImpl }) {
 
   const assignments = {};
   const extra = new Map();   // keyEnv -> connection, so one key is only asked for once
+  // Keys added at setup or with /key, offered by name so nobody pastes one twice.
+  const saved = savedConnections(manifest).filter((k) => !k.isDefault);
+  const listed = new Map();  // keyEnv -> models, so each key's list is fetched once
 
   for (const a of plan.agents) {
     console.log();
     // The optional entry goes LAST. If it sat in the middle, a failed model
     // listing would renumber everything after it, and the same keypress would
     // pick a different thing depending on the network.
+    // Saved keys come from the manifest, so they are the same every run; the
+    // network-dependent option stays last, where its absence renumbers nothing.
     const choice = await prompter.choose(`Model for ${c.c(a.name)} ${c.d(`— ${a.role}`)}`, [
       { value: 'same', label: `${manifest.model}`, note: 'the default' },
       { value: 'other', label: 'a different provider or API key' },
+      ...saved.map((k) => ({
+        value: `saved:${k.keyEnv}`,
+        label: `a model on your ${providerFor(k.provider)?.label ?? k.provider} key`,
+        note: k.keyEnv,
+      })),
       ...(models?.length ? [{ value: 'list', label: 'another model on the same key' }] : []),
     ]);
 
     if (choice === 'same' || choice === null) continue;
+
+    if (String(choice).startsWith('saved:')) {
+      const k = saved.find((s) => `saved:${s.keyEnv}` === choice);
+      if (!listed.has(k.keyEnv)) {
+        try {
+          listed.set(k.keyEnv, await listModels(k.provider, process.env[k.keyEnv] ?? '', { baseUrl: k.baseUrl, fetchImpl }));
+        } catch (e) {
+          warn(e.message);
+          listed.set(k.keyEnv, []);
+        }
+      }
+      const id = await pickModel(prompter, { models: listed.get(k.keyEnv), provider: k.provider });
+      if (id) assignments[a.name] = { provider: k.provider, model: id, keyEnv: k.keyEnv, baseUrl: k.baseUrl };
+      continue;
+    }
 
     if (choice === 'list') {
       const id = await pickModel(prompter, { models, provider: manifest.provider });
@@ -511,11 +536,24 @@ async function assignModels(prompter, plan, { manifest, models, fetchImpl }) {
     if (!conn) continue;
     const id = await pickModel(prompter, conn);
     if (!id) continue;
-    if (conn.key && !extra.has(conn.keyEnv)) {
+    // A second key for a provider already in use gets its own variable. Written
+    // into the default's, it would quietly move every other agent to it too.
+    const known = savedConnections(manifest).find((k) => conn.key && process.env[k.keyEnv] === conn.key)
+      ?? [...extra.values()].find((k) => k.key === conn.key);
+    if (known) {
+      conn.keyEnv = known.keyEnv;
+    } else {
+      conn.keyEnv = nextKeyEnv(conn.keyEnv, [
+        ...savedConnections(manifest).map((k) => k.keyEnv),
+        ...extra.keys(),
+      ]);
+    }
+    if (conn.key && !extra.has(conn.keyEnv) && !known) {
       ensureIgnored();
       writeKey(conn.keyEnv, conn.key);
       process.env[conn.keyEnv] = conn.key;
       extra.set(conn.keyEnv, conn);
+      try { addSavedKey({ provider: conn.provider, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl }); } catch { /* the key still works */ }
     }
     assignments[a.name] = { provider: conn.provider, model: id, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl };
   }

@@ -2,8 +2,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { init } from './init.js';
-import { readManifest, patchSection, setModelMaxTokens, setTokensPerMinute } from './config.js';
-import { writeKey, ensureIgnored, fingerprint } from './env.js';
+import { readManifest, patchSection, setModelMaxTokens, setTokensPerMinute, addSavedKey } from './config.js';
+import { writeKey, ensureIgnored, fingerprint, nextKeyEnv } from './env.js';
 import { PROVIDERS, detectProvider, providerFor, listModels, KeyRejected } from './providers.js';
 import { parseRateLimits, probeModel, printProviderLimits, suggestedCap } from './limits.js';
 import { printTree } from './tree.js';
@@ -26,6 +26,9 @@ import { c, ok, info, warn } from './util.js';
  */
 
 const STEPS = 4;
+
+/** "an Anthropic key", "a Groq key", "an xAI key" — by sound, so x takes an. */
+const an = (word) => (/^[aeiou]|^x/i.test(String(word)) ? 'an' : 'a');
 const step = (n, title) => {
   console.log();
   console.log(`  ${c.d(`Step ${n} of ${STEPS}`)}  ${c.b(title)}`);
@@ -41,6 +44,7 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   step(1, 'Connect an AI provider');
   const conn = await obtainKey(prompter, { fetchImpl });
   if (!conn) return null;
+  const extra = await moreKeys(prompter, conn, { fetchImpl });
 
   // --- 2. model -------------------------------------------------------------
   step(2, 'Choose a model');
@@ -90,12 +94,17 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   const capped = cap && (configured == null || cap < configured);
   if (capped) setModelMaxTokens(cap, join(dir, 'agent.yaml'));
 
-  if (conn.key) {
-    ensureIgnored(root);
-    writeKey(conn.keyEnv, conn.key);
-    // Make it live for the rest of this process — onboarding hands straight
-    // into a chat that is about to use it.
-    process.env[conn.keyEnv] = conn.key;
+  // Every key added in step 1, the default model's first. The ignore rule is
+  // checked before the first one touches disk, never after.
+  for (const k of [conn, ...extra]) {
+    if (k.key) {
+      ensureIgnored(root);
+      writeKey(k.keyEnv, k.key);
+      // Live for the rest of this process — onboarding hands straight into a
+      // chat that is about to use it.
+      process.env[k.keyEnv] = k.key;
+    }
+    addSavedKey({ provider: k.provider, keyEnv: k.keyEnv, baseUrl: k.baseUrl }, join(dir, 'agent.yaml'));
   }
 
   ok(`Created ${c.c('.gitagent/')}`);
@@ -104,6 +113,10 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
 
   if (capped) {
     info(`Replies are capped at ${c.c(cap.toLocaleString())} tokens ${c.d('— under what this key allows')}`);
+  }
+  if (extra.length) {
+    const names = extra.map((k) => providerFor(k.provider)?.label ?? k.provider).join(', ');
+    info(`Also saved: ${names}. ${c.d('Put an agent on one with /models, or when /prompt asks.')}`);
   }
   info(c.d('See or change that with /limits, or jr-arch limits.'));
   console.log();
@@ -199,7 +212,7 @@ export async function obtainKey(prompter, { fetchImpl = fetch, attempts = 3 } = 
     } else {
       provider = detectProvider(entered);
       if (provider) {
-        ok(`That looks like a ${c.b(PROVIDERS[provider].label)} key ${c.d(fingerprint(entered))}`);
+        ok(`That looks like ${an(PROVIDERS[provider].label)} ${c.b(PROVIDERS[provider].label)} key ${c.d(fingerprint(entered))}`);
       } else {
         info("I can't tell whose key that is from its format.");
         provider = await prompter.choose('Which provider is it for?', [
@@ -261,6 +274,44 @@ export async function keepModel(prompter, model, check) {
   if (check.reason) info(c.d(`  ${check.reason}`));
   info(c.d('  Every agent here reads and writes through tools, so every task would fail.'));
   return !(await prompter.confirm('Pick a different model?', true));
+}
+
+/**
+ * More keys, for agents that should run somewhere else.
+ *
+ * Asked straight after the first key works, while the person is still in the
+ * key-pasting frame of mind, and defaulting to no so pressing Enter moves on.
+ * Nothing is assigned here: which agent uses which key is theirs to decide,
+ * later, because that decides where each agent sends the code it reads.
+ *
+ * Rate limits belong to the provider account, not the key. A second key from
+ * the same account shares the first one's allowance, and saying so here
+ * saves someone adding five keys and wondering why nothing got faster.
+ */
+export async function moreKeys(prompter, first, { fetchImpl = fetch } = {}) {
+  const added = [];
+  const all = () => [first, ...added];
+
+  for (;;) {
+    console.log();
+    if (!(await prompter.confirm('Add another API key? (a different provider gives its agents their own limit)', false))) break;
+
+    const more = await obtainKey(prompter, { fetchImpl });
+    if (!more) break;
+
+    if (more.key && all().some((k) => k.key === more.key)) {
+      warn('That key is already added.');
+      continue;
+    }
+    const label = providerFor(more.provider)?.label ?? more.provider;
+    if (all().some((k) => k.provider === more.provider)) {
+      info(c.d(`  Keys from the same ${label} account share that account's limit.`));
+    }
+    more.keyEnv = nextKeyEnv(more.keyEnv, all().map((k) => k.keyEnv));
+    added.push(more);
+    ok(`Added ${an(label)} ${label} key ${c.d(`as ${more.keyEnv}`)}`);
+  }
+  return added;
 }
 
 /** Choose from what the key can reach, or type a name when the list is empty. */

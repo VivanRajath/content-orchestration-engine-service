@@ -278,8 +278,8 @@ flags never do, so `run --dry-run "task"` keeps the task.
 | `<task>` | The classifier picks an agent |
 | `@name <task>` | Give the task to one agent |
 | `/chat` · `/prompt` · `/dev` | Switch mode |
-| `/key` | Add or change an API key (offers to switch provider) |
-| `/models` | Show each agent's model; switch the default |
+| `/key` | Add an API key (as many as you like) or change one; offers to switch provider |
+| `/models` | Show each agent's model and key; switch the default, or put one agent on another key |
 | `/limits` | Provider rate limits, each agent's reply cap, and set them |
 | `/agents` | Installed agents |
 | `/tree` | `.gitagent/` drawn with what each file is for |
@@ -308,6 +308,29 @@ When you paste a key, jr-arch recognises the provider from its prefix. The model
 list is always fetched live from the provider. Nothing is hard-coded, so you're
 never offered a model your key can't use. Speech, embedding, moderation and
 image models are filtered out because they can't call tools.
+
+### More than one key
+
+Setup asks **"Add another API key?"** after the first one works, and keeps
+asking until you say no. Each key is checked the same way — by listing its
+models — and saved under its own provider's variable in `.gitagent/.env`. A
+second key for a provider you already added gets its own name
+(`GROQ_API_KEY_2`), so it never overwrites the first. Add more later with
+`/key` in the chat, or `jr-arch key <value>` — a key is always filed under its
+own provider, whatever the default is.
+
+Nothing is assigned automatically: which agent uses which key is yours to
+choose, because it decides where that agent sends your code. Use `/models` →
+*One agent's model or key*, or pick when `/prompt` asks which model each agent
+uses — saved keys are offered by name, so none is pasted twice.
+
+`agent.yaml` lists the keys by provider and variable name under `keys:`, never
+their values. It doubles as the list of every provider your code can be sent
+to from this repo.
+
+**Rate limits belong to the account, not the key.** Several keys from one Groq
+account share one allowance, so they don't reduce waits. Keys from *different*
+providers do: each agent on its own provider gets that provider's limit.
 
 **Where your key lives.** `agent.yaml` stores the *name* of an environment
 variable, never the key itself. The key goes in `.gitagent/.env`, and jr-arch
