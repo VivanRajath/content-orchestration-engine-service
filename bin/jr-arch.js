@@ -74,7 +74,7 @@ ${c.b('OPTIONS')}
   --as <name>           Install under a different name
   --ref <branch|sha>    Pin to a branch, tag, or commit
   --model <name>        Model for init
-  --provider <name>     anthropic | groq | openai | openrouter | xai | ollama | openai-compatible
+  --provider <name>     anthropic | gemini | groq | openai | openrouter | xai | ollama | openai-compatible
   --base-url <url>      For ollama, vLLM, OpenRouter, LM Studio
   --env <NAME>          Which variable the key command writes
   --yes                 Approve human checkpoints without asking

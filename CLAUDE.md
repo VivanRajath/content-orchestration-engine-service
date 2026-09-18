@@ -48,7 +48,7 @@ test/                   node --test, no runner
 Phase 1 is built: `npx jr-arch` onboards interactively (paste a key, the
 provider is detected, the key is checked by listing its models, pick one,
 scaffold, pick a mode), then opens a chat with `/prompt`, `/dev` and `/chat`.
-Providers: Anthropic, Groq, OpenAI, OpenRouter, xAI, Ollama, any
+Providers: Anthropic, Gemini, Groq, OpenAI, OpenRouter, xAI, Ollama, any
 OpenAI-compatible endpoint. 512 tests, `node --test`, no runner.
 
 The key and model-listing path has been exercised against the real Groq API.

@@ -13,7 +13,7 @@ That's the whole install. It asks for what it needs, one step at a time.
 - **Node 18 or newer.** No other runtime dependencies.
 - **A git repository** is strongly recommended. Every run works on its own
   branch, and failed attempts are rolled back through git.
-- **An API key** for Anthropic, Groq, OpenAI, OpenRouter or xAI. You can also
+- **An API key** for Anthropic, Google Gemini, Groq, OpenAI, OpenRouter or xAI. You can also
   use a local Ollama or any OpenAI-compatible endpoint.
 
 > Looking for how it works inside? See [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -259,7 +259,7 @@ flags never do, so `run --dry-run "task"` keeps the task.
 | `--from <git-url>` | `init`, `add-agent`, `add-guard`, `personas add`, `pull` | Where to fetch from |
 | `--ref <branch\|tag\|sha>` | same as `--from` | Pin to a ref |
 | `--as <name>` | `add-agent`, `add-guard` | Install under a different name (single item only) |
-| `--provider <id>` | `init` | `anthropic` · `groq` · `openai` · `openrouter` · `xai` · `ollama` · `openai-compatible` |
+| `--provider <id>` | `init` | `anthropic` · `gemini` · `groq` · `openai` · `openrouter` · `xai` · `ollama` · `openai-compatible` |
 | `--model <name>` | `init` | Model id |
 | `--base-url <url>` | `init` | Endpoint for Ollama, vLLM, LM Studio, or any OpenAI-compatible server |
 | `--minimal` | `init` | Only `agent.yaml` and `DUTIES.md`, no bundled agents or hooks |
@@ -301,6 +301,7 @@ flags never do, so `run --dry-run "task"` keeps the task.
 | Groq | `gsk_…` | `GROQ_API_KEY` | |
 | OpenRouter | `sk-or-…` | `OPENROUTER_API_KEY` | |
 | xAI | `xai-…` | `XAI_API_KEY` | |
+| Google Gemini | `AIza…` | `GEMINI_API_KEY` | key from aistudio.google.com; uses Google's OpenAI-compatible endpoint |
 | OpenAI | `sk-…` | `OPENAI_API_KEY` | |
 | Ollama | none | `OLLAMA_API_KEY` | type `ollama` instead of a key; runs locally |
 | Anything OpenAI-compatible | anything | `LLM_API_KEY` | Together, vLLM, LM Studio… you give the URL |
