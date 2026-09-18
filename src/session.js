@@ -54,6 +54,54 @@ export function headSha(root = repoRoot()) {
   return git(['rev-parse', 'HEAD'], { root, check: false });
 }
 
+/**
+ * Give a folder the one thing a run needs from git: a commit to branch from.
+ *
+ * Only ever called after the person said yes. Creating a repository in
+ * someone's folder is theirs to decide; this makes the decision one keystroke
+ * instead of a command they have to go and find.
+ *
+ * What goes into that first commit matters more than the commit itself, so the
+ * ignore rules come first. `.gitagent/.env` holds their key. `node_modules/` is
+ * there in any folder where someone has run `npm i` — including `npm i jr-arch`
+ * — and committing it is thousands of files nobody wanted.
+ */
+export function initialCommit(root = repoRoot()) {
+  const email = git(['config', 'user.email'], { root, check: false });
+  const name = git(['config', 'user.name'], { root, check: false });
+  if (!email || !name) {
+    return {
+      ok: false,
+      reason: 'git does not know who you are yet, so it cannot make a commit.',
+      help: [
+        '  git config --global user.name "Your Name"',
+        '  git config --global user.email you@example.com',
+      ],
+    };
+  }
+
+  if (!isRepo(root)) git(['init', '-q'], { root });
+
+  const wanted = ['.gitagent/.env', '.gitagent/.session/'];
+  if (existsSync(join(root, 'node_modules'))) wanted.push('node_modules/');
+  const ignoreFile = join(root, '.gitignore');
+  const current = existsSync(ignoreFile) ? readFileSync(ignoreFile, 'utf8') : '';
+  const lines = current.split('\n').map((l) => l.trim());
+  const missing = wanted.filter((rule) => !lines.includes(rule));
+  if (missing.length) {
+    const sep = current && !current.endsWith('\n') ? '\n' : '';
+    writeFileSync(ignoreFile, `${current}${sep}${missing.join('\n')}\n`);
+  }
+
+  git(['add', '-A'], { root });
+  const staged = git(['diff', '--cached', '--name-only'], { root, check: false });
+  const files = staged ? staged.split('\n').filter(Boolean) : [];
+  // --allow-empty: an empty folder still needs a commit to branch from.
+  git(['commit', '-q', '--allow-empty', '-m', 'initial commit'], { root });
+
+  return { ok: true, files: files.length, sha: headSha(root) };
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------

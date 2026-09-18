@@ -8,6 +8,8 @@ import { run } from '../src/run.js';
 import { classify } from '../src/classify.js';
 import { requiresKey, isLocal, callModel, forgetCaps } from '../src/provider.js';
 import { TEMPLATES } from '../src/paths.js';
+import { ensureRepo } from '../src/onboard.js';
+import { scriptedPrompter } from '../src/prompter.js';
 
 /**
  * Failures found by reading the code for what a real repository would do to it,
@@ -422,5 +424,107 @@ describe('a key with a small per-minute allowance', () => {
       assert.match(out.reason, /no room left to work in/);
       assert.equal(calls, 0, 'nothing was spent finding out');
     });
+  });
+});
+
+describe('a folder that is not a git repository yet', () => {
+  /**
+   * Reported from a real session: `npx jr-arch` in a plain folder. Setup and
+   * /prompt both ran — spending model calls — and then every task was refused
+   * with advice to pass `--no-git`, which nobody inside a chat can do. Typing
+   * "yes" was read as a new task and refused again.
+   */
+  /** A plain folder, with the two things that must never reach a first commit. */
+  function plainFolder() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'jra-nogit-')));
+    writeFileSync(join(root, 'index.html'), '<h1>landing</h1>\n');
+    mkdirSync(join(root, 'node_modules', 'jr-arch'), { recursive: true });
+    writeFileSync(join(root, 'node_modules', 'jr-arch', 'index.js'), '// installed\n');
+    mkdirSync(join(root, '.gitagent'), { recursive: true });
+    writeFileSync(join(root, '.gitagent', '.env'), 'GROQ_API_KEY=gsk_not_a_real_key\n');
+    writeFileSync(join(root, '.gitagent', 'agent.yaml'), 'model:\n  provider: groq\n');
+    return root;
+  }
+
+  /** Point git at a config of our choosing, so the test does not depend on this machine's. */
+  async function withGitConfig(contents, fn) {
+    const cfg = join(realpathSync(mkdtempSync(join(tmpdir(), 'jra-gitcfg-'))), 'gitconfig');
+    writeFileSync(cfg, contents);
+    const saved = { g: process.env.GIT_CONFIG_GLOBAL, s: process.env.GIT_CONFIG_NOSYSTEM };
+    process.env.GIT_CONFIG_GLOBAL = cfg;
+    process.env.GIT_CONFIG_NOSYSTEM = '1';
+    try {
+      return await fn();
+    } finally {
+      if (saved.g === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = saved.g;
+      if (saved.s === undefined) delete process.env.GIT_CONFIG_NOSYSTEM; else process.env.GIT_CONFIG_NOSYSTEM = saved.s;
+    }
+  }
+
+  const IDENTITY = '[user]\n\tname = Test\n\temail = test@example.com\n';
+  const tracked = (root) => execFileSync('git', ['ls-files'], { cwd: root, encoding: 'utf8' }).split('\n').filter(Boolean);
+
+  test('saying yes makes the first commit, without the key or node_modules in it', async () => {
+    const root = plainFolder();
+    try {
+      await withGitConfig(IDENTITY, async () => {
+        const state = await ensureRepo(scriptedPrompter(['y']), root);
+        assert.equal(state, 'ok');
+
+        const files = tracked(root);
+        assert.ok(files.includes('index.html'), 'the project is committed');
+        assert.ok(files.includes('.gitagent/agent.yaml'), 'and so is the agent config, which is meant to be');
+        assert.ok(!files.some((f) => f.startsWith('node_modules/')), 'node_modules is not');
+        assert.ok(!files.includes('.gitagent/.env'), 'and the key is never committed');
+        assert.match(readFileSync(join(root, '.gitignore'), 'utf8'), /node_modules\//);
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('declining, then choosing to go without git, is a knowing choice', async () => {
+    const root = plainFolder();
+    try {
+      const state = await ensureRepo(scriptedPrompter(['n', 'y']), root);
+      assert.equal(state, 'no-git');
+      assert.equal(existsSync(join(root, '.git')), false, 'nothing was created without a yes');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('declining both leaves tasks waiting, and says how to unblock them', async () => {
+    const root = plainFolder();
+    try {
+      const state = await ensureRepo(scriptedPrompter(['n', 'n']), root);
+      assert.equal(state, 'blocked');
+      assert.equal(existsSync(join(root, '.git')), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a git with no identity is explained, not left to fail', async () => {
+    const root = plainFolder();
+    try {
+      await withGitConfig('', async () => {
+        // yes to set up, then no to going without — so the result is blocked.
+        const state = await ensureRepo(scriptedPrompter(['y', 'n']), root);
+        assert.equal(state, 'blocked', 'no commit could be made, and nothing pretends one was');
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a committed repository is not asked anything', async () => {
+    const box = sandbox();
+    try {
+      // A scripted prompter with no answers throws if a question is asked.
+      assert.equal(await ensureRepo(scriptedPrompter([]), box.root), 'ok');
+    } finally {
+      rmSync(box.root, { recursive: true, force: true });
+    }
   });
 });

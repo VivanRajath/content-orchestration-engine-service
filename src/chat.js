@@ -8,7 +8,7 @@ import { dirtyFiles, isRepo, git } from './session.js';
 import { verify } from './verify.js';
 import { run } from './run.js';
 import { createPrompter } from './prompter.js';
-import { onboard, obtainKey, pickModel, setModel, keepModel } from './onboard.js';
+import { onboard, obtainKey, pickModel, setModel, keepModel, ensureRepo } from './onboard.js';
 import { promptMode } from './generate.js';
 import { newAgent, newGuard, checkAll, printCheck, pathsFor, DEV_HELP } from './dev.js';
 import { smokeTest, printSmoke } from './smoke.js';
@@ -74,6 +74,9 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
     let models = [];
     // Carried between turns so the suite is not run twice per message.
     let lastBuild = null;
+    // Whether this session has said "go ahead without git". Asked, never assumed.
+    let noGit = false;
+    let gitState = null;
 
     // A key is missing only when the model it belongs to actually needs one.
     // This used to special-case the name OLLAMA_API_KEY, so a local
@@ -94,6 +97,7 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
       const result = await onboard(prompter, { fetchImpl, root });
       if (!result) return;
       models = result.models ?? [];
+      gitState = result.git ?? null;
       if (result.mode === 'prompt') {
         const made = await promptMode(prompter, { call: call ?? undefined, fetchImpl, models, root });
         mode = made?.mode ?? 'chat';
@@ -101,6 +105,12 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
         mode = result.mode;
       }
     }
+
+    // A returning user has not been asked yet. Only in a real conversation:
+    // a prompter reading a closed stdin would answer the default, and the
+    // default here is "yes, create a repository".
+    if (gitState === null && interactive) gitState = await ensureRepo(prompter, root);
+    noGit = gitState === 'no-git';
 
     banner(mode);
 
@@ -137,7 +147,17 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
         continue;
       }
 
-      const outcome = await turn({ task, agent, call, flags, prompter, build: lastBuild });
+      let outcome = await turn({ task, agent, call, flags, prompter, build: lastBuild, noGit });
+
+      // The run refused because git cannot undo a failed attempt here. Offer the
+      // fix now and then do what was asked, rather than print a flag the person
+      // cannot pass from inside a chat.
+      if (NEEDS_GIT.has(outcome?.error?.code)) {
+        const state = await ensureRepo(prompter, root);
+        if (state === 'blocked') continue;
+        noGit = state === 'no-git';
+        outcome = await turn({ task, agent, call, flags, prompter, build: lastBuild, noGit });
+      }
       lastBuild = outcome?.build ?? null;
 
       // A model that cannot do this at all will not do it next message either.
@@ -161,16 +181,22 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
  * work. NOT `--yes`: a human checkpoint still stops and asks, even here. Chat
  * is a faster way to reach the loop, not a way around its rules.
  */
-async function turn({ task, agent, call, flags, prompter, build }) {
+const NEEDS_GIT = new Set(['NO_GIT_REPO', 'NO_COMMITS']);
+
+async function turn({ task, agent, call, flags, prompter, build, noGit = false }) {
   let outcome = null;
   try {
     outcome = await run([task], {
       ...flags,
       'allow-dirty': true,
       quiet: true,
+      ...(noGit ? { 'no-git': true } : {}),
       ...(agent ? { agent: agent.name } : {}),
     }, { ...(call ? { call } : {}), prompter, build });
   } catch (e) {
+    // A git refusal is answered by the caller with an offer, so its
+    // command-line wording is not printed here.
+    if (NEEDS_GIT.has(e.code)) return { error: e };
     warn(e.message);
   }
   console.log();

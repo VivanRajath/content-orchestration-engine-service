@@ -7,6 +7,7 @@ import { writeKey, ensureIgnored, fingerprint } from './env.js';
 import { PROVIDERS, detectProvider, providerFor, listModels, KeyRejected } from './providers.js';
 import { parseRateLimits, probeModel, printProviderLimits, suggestedCap } from './limits.js';
 import { printTree } from './tree.js';
+import { isRepo, headSha, initialCommit } from './session.js';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { c, ok, info, warn } from './util.js';
 
@@ -107,6 +108,10 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   info(c.d('See or change that with /limits, or jr-arch limits.'));
   console.log();
 
+  // Asked here, before step 4, because /prompt spends a model call designing
+  // agents — and every task after it would be refused without a commit.
+  const git = await ensureRepo(prompter, root);
+
   // --- 4. mode --------------------------------------------------------------
   step(4, 'How do you want to start?');
   const mode = await prompter.choose('', [
@@ -115,7 +120,52 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
     { value: 'chat', label: `${c.c('/chat')}    start with the default agents`, note: 'and edit code now' },
   ]);
 
-  return { ...conn, model, mode: mode ?? 'chat', dir };
+  return { ...conn, model, mode: mode ?? 'chat', dir, git };
+}
+
+/**
+ * Make sure there is a commit to branch from, or an explicit choice to go
+ * without one.
+ *
+ * A run refuses a folder with no commits, and it should: the session branch and
+ * the rollback of a failed attempt are both git, and without them a failed
+ * attempt leaves its edits in someone's files. What it should not do is leave
+ * the person holding a sentence about `--no-git`, a flag nobody inside a chat
+ * can pass — which is what happened, after setup and /prompt had both already
+ * spent model calls. So this asks, once, and does it.
+ *
+ * Returns 'ok', 'no-git' (proceed, knowingly, without rollback), or 'blocked'.
+ */
+export async function ensureRepo(prompter, root = repoRoot()) {
+  const repo = isRepo(root);
+  if (repo && headSha(root)) return 'ok';
+
+  console.log();
+  warn(repo ? 'This repository has no commits yet.' : 'This folder is not a git repository.');
+  info(c.d('  Every task runs on its own branch, and a failed attempt is undone through git.'));
+  info(c.d('  With nothing committed there is no branch to work on and nothing to roll back to.'));
+
+  const offer = repo
+    ? 'Commit what is here now, so tasks can run?'
+    : 'Set up git here now? (git init, then commit what is here)';
+  if (await prompter.confirm(offer, true)) {
+    const made = initialCommit(root);
+    if (made.ok) {
+      ok(`Committed ${made.files} file${made.files === 1 ? '' : 's'} as ${c.c('initial commit')} ${c.d('— tasks branch from here')}`);
+      return 'ok';
+    }
+    warn(made.reason);
+    for (const line of made.help ?? []) info(line);
+  }
+
+  // Declining is allowed; not knowing what it means is not.
+  if (await prompter.confirm('Work without git for this session? A failed attempt would keep its edits.', false)) {
+    warn('Working without git: no branch, and failed attempts are not rolled back.');
+    return 'no-git';
+  }
+  info(c.d('Tasks will wait until there is a commit. Answer yes here next time, or run:'));
+  info(c.d('  git init && git add -A && git commit -m "initial commit"'));
+  return 'blocked';
 }
 
 // ---------------------------------------------------------------------------

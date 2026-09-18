@@ -902,25 +902,27 @@ function requireGit(root, flags) {
   }
 
   if (!isRepo(root)) {
-    throw new Error([
+    // Coded, so the chat can offer to fix it instead of printing advice about a
+    // command-line flag nobody inside a chat can pass.
+    throw Object.assign(new Error([
       `${root} is not a git repository.`,
       '  Every run works on its own branch, and a failed attempt is undone with git.',
       '  Neither is possible here, so a failed attempt would leave its edits behind.',
       '',
       '  Start one:   git init && git add -A && git commit -m "initial commit"',
       '  Or accept the risk:  --no-git',
-    ].join(NEWLINE));
+    ].join(NEWLINE)), { code: 'NO_GIT_REPO' });
   }
 
   if (!headSha(root)) {
-    throw new Error([
+    throw Object.assign(new Error([
       'This repository has no commits yet.',
       '  There is nothing to branch from and nothing to roll back to, so a failed',
       '  attempt would leave its edits in your working tree.',
       '',
       '  Make the first commit:  git add -A && git commit -m "initial commit"',
       '  Or accept the risk:     --no-git',
-    ].join(NEWLINE));
+    ].join(NEWLINE)), { code: 'NO_COMMITS' });
   }
 }
 

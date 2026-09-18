@@ -574,9 +574,12 @@ running without that guard.
 - Every run works on its **own git branch** (`jr-arch/session-<id>`), so you can
   review it, merge it, or throw it away. The chat reuses one branch for the
   whole conversation.
-- `run` needs a repository with at least one commit. Both halves of the safety
-  net are git, and neither works without one, so it says so instead of running
-  where a failed attempt could not be undone. `--no-git` accepts that risk.
+- Tasks need a repository with at least one commit, because both halves of the
+  safety net are git. In a plain folder, setup (or the chat, for a folder that
+  was already set up) offers to `git init` and make that first commit for you —
+  with `.gitagent/.env` and `node_modules/` ignored first, so neither is ever
+  committed. Decline, and it asks whether to work without git for the session;
+  from the command line, `--no-git` is the same choice.
 - A commit contains **only the files the attempt is answerable for**, so your
   own uncommitted work is never swept into an agent's commit, and everything
   committed has been through the secret scan.
@@ -719,7 +722,7 @@ file's comments intact.
 | Symptom | Fix |
 |---|---|
 | `No .gitagent/ found` | Run `jr-arch` (guided) or `jr-arch init` |
-| `is not a git repository` / `no commits yet` | `git init && git add -A && git commit -m "initial commit"`, or pass `--no-git` to accept no rollback |
+| `is not a git repository` / `no commits yet` | In the chat, answer yes when it offers to set up git. From the command line: `git init && git add -A && git commit -m "initial commit"`, or pass `--no-git` to accept no rollback |
 | `$GROQ_API_KEY is not set` | `jr-arch key <your-key>`, or export it in your shell |
 | `The working tree has N uncommitted change(s)` | Commit or stash, or pass `--allow-dirty` |
 | `the model replied with prose and called no tool` | The model can't use tools. Run `jr-arch doctor`, then pick another model with `/models` |
