@@ -298,9 +298,13 @@ export function fit({
       const size = String(result.content ?? '').length;
       if (size < 400 || result.trimmed) continue;
       const cost = Math.ceil(size / charsPerToken(manifest));
+      // This used to end "Read it again", which is precisely the loop: read,
+      // dropped, read again, dropped again, until the day's allowance was gone.
+      // The model's own replies survive trimming; tool output does not.
       result.content =
         `[${formatTokens(cost)} tokens of earlier ${result.name ?? 'tool'} output were dropped to fit ` +
-        'this key’s per-minute limit. Read it again, in smaller pieces, if you still need it.]';
+        'this key’s per-minute limit. You have already seen it: rely on what you said about it ' +
+        'in your replies, which are kept. Re-reading it would be dropped again.]';
       result.trimmed = true;
       trimmed.push({ name: result.name ?? 'tool', tokens: cost });
       used -= cost - estimateTokens(result.content, manifest);
