@@ -5,7 +5,10 @@ import { readManifest, modelFor } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
 import { callModel, extractJson, isFatalProviderError } from './provider.js';
 import { classify, selectSwarm } from './classify.js';
-import { budgetFor, fit, estimateRequest, describeBudget, formatTokens, readCeiling } from './budget.js';
+import {
+  budgetFor, fit, estimateRequest, describeBudget, formatTokens, readCeiling,
+  liveRemaining, msUntilRefill, fitDuties,
+} from './budget.js';
 import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
 import {
@@ -136,7 +139,7 @@ export async function run(positional, flags, { call = callModel, prompter = null
   const entryAgent = findAgent(entry.tier, agents);
   if (entryAgent) {
     const preflight = fit({
-      system: prompt({ dir, agents }, entryAgent),
+      system: prompt({ dir, agents, budget, manifest }, entryAgent),
       messages: [{ role: 'user', content: brief }],
       tools: TOOLS,
       maxTokens: modelFor(manifest, entry.tier).maxTokens,
@@ -506,6 +509,11 @@ async function attempt(ctx, frame, brief) {
     return yes;
   };
   let idle = 0;
+  // A reply cut off because its cap was lowered to fit is sent again, once,
+  // with the room it ran out of.
+  let regrow = null;
+  let regrowUsed = false;
+  let refills = 0;
   // commit() gates on the files this attempt actually wrote, so the set has to
   // live on the frame, not only in the tool context that closes over it.
   frame.touched = toolCtx.touched;
@@ -513,21 +521,53 @@ async function attempt(ctx, frame, brief) {
   while (frame.steps < ctx.maxSteps) {
     frame.steps++;
 
-    // Fit before sending, not after being refused. A reply cap is reduced
-    // first; only when there is no room to answer in does the oldest tool
-    // output go, which is where the weight actually is.
+    // Fit before sending, not after being refused — and fit to what is left
+    // of this minute, not to a fresh one. Each step resends the conversation,
+    // so steps that each fit the limit can still spend it twice over; the
+    // provider reports what remains on every response, and that is the budget
+    // the next request actually has. The reply cap gives way first; only then
+    // does the oldest tool output go, which is where the weight actually is.
+    const model = ctx.tierModel ?? ctx.manifest;
+    const left = liveRemaining(model);
+    const budget = ctx.budget && left != null ? Math.min(ctx.budget, Math.floor(left * 0.95)) : ctx.budget;
     const room = fit({
       system, messages, tools: TOOLS,
-      maxTokens: (ctx.tierModel ?? ctx.manifest).maxTokens,
-      budget: ctx.budget,
-      manifest: ctx.tierModel ?? ctx.manifest,
+      maxTokens: model.maxTokens,
+      budget,
+      manifest: model,
+      ...(regrow ? { minOutput: regrow } : {}),
     });
     for (const t of room.trimmed) {
       warn(`dropped ${formatTokens(t.tokens)} tokens of earlier ${t.name} output to fit this key’s limit`);
     }
     if (!room.fits) {
+      // Nothing useful fits in what is left of the minute. Sending anyway buys
+      // a refusal and a blind backoff; the provider has already said when the
+      // minute refills, so wait exactly that, once, and go on. Only a step
+      // that would not fit even a fresh minute is a real dead end.
+      const wait = budget !== ctx.budget ? msUntilRefill(model) : null;
+      // A retry asked for more room than even a fresh minute holds. Send it
+      // with the most room there is instead — giving up would throw away a
+      // step that fits, just not as generously as hoped.
+      if (regrow && wait == null) {
+        regrow = null;
+        frame.steps--;
+        continue;
+      }
+      if (wait != null && refills < 3) {
+        refills++;
+        info(c.d(`  … this key’s minute is spent — waiting ${Math.max(1, Math.ceil(wait / 1000))}s for it to refill`));
+        if (!ctx.refillHintShown) {
+          info(c.d('    a model or key with a higher per-minute limit avoids these waits (/models)'));
+          ctx.refillHintShown = true;
+        }
+        await sleep(wait + 250);
+        frame.steps--;
+        continue;
+      }
       return { kind: 'fatal', reason: `this step does not fit the key's budget — ${room.reason}`, fatal: 'budget' };
     }
+    refills = 0;
 
     let reply;
     const stream = ctx.stream ? streamWriter() : null;
@@ -548,6 +588,23 @@ async function attempt(ctx, frame, brief) {
 
     // Already shown live when streaming; printing it again would double it.
     if (!stream && reply.text?.trim()) info(c.d(`  ${truncate(reply.text.trim(), 300)}`));
+
+    // Cut off mid-call because the reply cap was lowered to fit. A half-written
+    // tool call fed back to the model wastes the step and confuses it; the
+    // answer is the same step again with the room it ran out of. Once per step
+    // — a model that fills any cap it is given is not going to stop at twice.
+    const cutOff = /^(length|max_tokens)$/.test(String(reply.stopReason ?? ''));
+    const broken = reply.toolCalls.some((call) => call.input?.__parseError !== undefined);
+    if (cutOff && (broken || !reply.toolCalls.length) && room.budget && !regrowUsed
+        && room.maxTokens < (model.maxTokens ?? room.maxTokens)) {
+      regrowUsed = true;
+      regrow = Math.min(model.maxTokens, room.maxTokens * 2);
+      info(c.d(`  … the reply was cut off at ${room.maxTokens} tokens — sending that step again with room for ${regrow}`));
+      frame.steps--;
+      continue;
+    }
+    regrow = null;
+    regrowUsed = false;
 
     if (!reply.toolCalls.length) {
       // No tool call and no done(). A capable model ends with done; one that
@@ -724,7 +781,9 @@ async function ask(ctx, cp) {
 function prompt(ctx, agent) {
   const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '');
   const { body: soul } = frontMatter(read(join(agent.dir, 'SOUL.md')));
-  const duties = read(join(ctx.dir, 'DUTIES.md'));
+  // Sent exactly as written unless the key is tight enough that its ~1,000
+  // tokens, resent on every step, are a real share of the minute.
+  const duties = fitDuties(read(join(ctx.dir, 'DUTIES.md')), ctx.budget, ctx.tierModel ?? ctx.manifest);
   const others = ctx.agents.filter((a) => a.name !== agent.name);
 
   return [
@@ -935,6 +994,7 @@ function sessionBranchInUse(root, manifest) {
 }
 
 const NEWLINE = String.fromCharCode(10);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function streamWriter(indent = '    ') {
   let started = false;

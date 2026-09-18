@@ -379,6 +379,22 @@ every request under it:
   be read again.
 - **If the prompt alone exceeds the budget, it stops before the first request**
   and says so, instead of failing four times on the way up the ladder.
+- **Each step is fitted to what is left of the minute**, not to a fresh one. A
+  per-minute limit is spent by every step together — each one resends the
+  conversation — so the provider's own "tokens remaining" header, read from
+  every response, is the budget the next step actually has.
+- **When the minute is spent, it waits once, for exactly as long as the
+  provider says**, instead of sending a request it will refuse and backing off
+  blind. On a tight key `DUTIES.md` is also shortened (its preamble first, then
+  later sections) — it is the largest part of every step.
+- **A reply cut off because its cap was lowered is sent again with more room**,
+  rather than handing the model its own half-written tool call.
+
+A per-minute limit is a per-minute limit: on an 8,000-a-minute key, an agent
+gets two or three steps a minute however tightly it is packed. The waits get
+shorter and never end in a refusal, but only a key or model with a higher
+allowance removes them — reasoning models in particular spend output tokens
+thinking before each tool call. `jr-arch limits` shows what yours allows.
 
 Estimates are characters over a ratio, not a tokenizer (this project has no
 dependencies). When a provider rejects a request it reports the true count,
