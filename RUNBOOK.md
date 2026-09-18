@@ -9,7 +9,7 @@ them), what changed over time, and what is currently wrong or incomplete.
 - How it fits together: [ARCHITECTURE.md](ARCHITECTURE.md)
 - Agent-facing project notes: [CLAUDE.md](CLAUDE.md)
 
-This file is current as of **0.1.3** (24 commits plus uncommitted work, 564 passing tests).
+This file is current as of **0.1.10** (38 commits, 617 passing tests).
 
 ---
 
@@ -211,6 +211,12 @@ streams), or use `--no-stream` and read the dimmed lines.
 | `No DUTIES.md in …` | `classify()` → `readDuties` | DUTIES.md deleted (see [§9](#9-known-gaps-and-drift)) |
 | `classifier did not return usable JSON; using routing.degraded_fallback` | `classify()` | a weak model; pin `routing.entry` |
 | `refusing to run "…" through cmd.exe` | `winCmd` | a Windows shim token containing a metacharacter |
+| `the agent kept re-running the same read (N repeats)` | `attempt()`, `REPEATABLE` / `callKey` | the key cannot hold the file and the history at once; the agent kept no notes. Fatal (`stuck`) |
+| `this step does not fit the key's budget` | `attempt()` after `fit()` | the system prompt and tools alone exceed the per-request budget. Fatal (`budget`) |
+| `allows N tokens a day` / a daily quota | `isFatalProviderError` | the day is spent; waiting inside the run cannot help. For Gemini the unit comes from the `quotaId` |
+| `is not a git repository` / `no commits yet` | `requireGit()` (`NO_GIT_REPO` / `NO_COMMITS`) | a plain folder; the chat offers `ensureRepo()` |
+| `.gitagent/.env changed — now using …` | `refreshKeys()` in the chat | expected: a key was edited in the folder mid-conversation |
+| "I can't tell whose key that is" for an `AIza…` key | `detectProvider()` | a copy older than 0.1.10, before Gemini was added. `npx jr-arch@latest` |
 
 ### Reproducing a model bug without a key
 
@@ -266,6 +272,22 @@ SSE bytes to `parseSSE` + `readAnthropicStream` / `readOpenAIStream`
    ARCHITECTURE §15.
 7. Tests: `detectProvider`, `baseUrlFor`, and `listModels` with a fake
    `fetchImpl` in `test/providers.test.js`.
+8. Read the provider's documented shapes for the places "OpenAI-compatible"
+   usually is not. Gemini (`test/gemini.test.js`) needed five, none of which
+   a registry entry alone would have handled:
+   - **bad-key status**: Google sends 400 `API_KEY_INVALID`, not 401. Without
+     handling it, a wrong key read as a server error.
+   - **model ids**: listed as `models/<name>`. `listModels` strips the prefix.
+   - **error body**: wrapped in an array. `parseProviderError` unwraps it.
+   - **daily limits**: named only in a `quotaId`. Missed, a spent day was
+     waited out and retried.
+   - **streamed tool calls**: may arrive without `index`. Missed, two calls
+     were merged into one.
+9. Add a new provider at the **end** of the `obtainKey` fallback menu, so
+   the existing numbers keep picking the same thing.
+10. `envTemplate()` gives the provider a placeholder in `.gitagent/.env`
+    automatically, and `providerOfVar()` recognises `<KEYENV>_2` and so on.
+    Nothing to do, but check it in a test.
 
 **Never** add a fallback URL. If a provider has no base URL, the request must
 refuse rather than guess.
@@ -537,6 +559,9 @@ which test pins it. Reverse one only with a new entry here that explains why.
 | **The key file is edited in place, never rewritten** | It is now a file people edit; rebuilding it from parsed pairs deleted every comment and placeholder they left | `writeKey()`, `removeKey()` | `env.test.js` |
 | **The chat re-reads the key file before every message, and the shell still wins** | Someone switches to the folder mid-conversation to paste a key; a restart should not be the price. A variable exported in the terminal is never overridden | `reloadEnv()` | `env.test.js`, `phase1.test.js` |
 | **A key pasted into agent.yaml is offered a move, and a committed one is called out** | agent.yaml is committed. Moving a key does not remove it from history, so the person is told to revoke it | `misplacedKeys()`, `moveMisplacedKey()` | `env.test.js`, `phase1.test.js` |
+| **Gemini goes through Google's OpenAI-compatible endpoint, not its native API** | A native wire format would be a third converter and a third stream reader to keep in step. The compatible endpoint takes the same payload; the differences are error shapes and ids, handled where the other providers' are | `PROVIDERS.gemini`, `parseProviderError()`, `listModels()`, `readOpenAIStream()` | `gemini.test.js` |
+| **A 400 that says the key is invalid is a rejected key** | Google does not use 401 for this. Read as a server error, it asked for a retry with the same dead key | `listModels()`, `parseProviderError()` | `gemini.test.js` |
+| **Model ids are shown and sent without `models/`** | It is the name people recognise, and chat requests take the bare form | `listModels()` | `gemini.test.js` |
 | **Keys are never rotated to get round a provider's limit** | Limits belong to the account; keys from one account share them, and multiple accounts to exceed a limit is generally against provider terms. Different providers each give their own allowance, and per-agent assignment already uses that | — | — |
 | **A repeated read is a loop only when nothing was written in between** | Re-running the tests after each edit is checking, not circling; a write resets the count | `REPEATABLE`, `callKey()` | `production-fixes.test.js` |
 | **Model-facing numbers are plain digits** | `toLocaleString()` follows the machine's locale — `2,00,000` on this author's — and the same file must read the same everywhere | `read_file` | `tools.test.js` |
@@ -682,10 +707,21 @@ Commit-by-commit, with what changed and why. All dates are 2026.
 | 09-15 | `340a2fc` | **feat**: phase 1: guided setup, `/prompt`, `/dev`, smoke tests | onboarding via model listing; provider registry; model-proposes/harness-writes; `/check`; `/smoke` |
 | 09-15 | `f5b8c5c` | **fix**: the chat works in a real terminal | single prompter; masked secret echo; Windows Ctrl+V; listener leak; `terminal.test.js` |
 | 09-15 | `ddbabb3` | **fix**: handle provider limits instead of dying on them | `ProviderError` kinds, OTPM shrink + learned caps, rate-limit waits, JSON-for-stream fallback, `/prompt` failure menu, `brevity()` |
-| uncommitted | — | **request budgets**: `src/budget.js`, per-request fitting, budget-sized reads, the pre-flight estimate in chat, `model.tokens_per_minute` measured at setup | a small free tier now works and explains itself instead of failing four times |
-| uncommitted | — | **twelve production fixes**: secret-scan token matching, pathspec commits, the no-commit-repo guard, swarm build gating and task-aware selection, DUTIES-less classification, `/undo` guards, local endpoints without keys, request-parameter adaptation, 64MB output buffers, the empty assistant turn, the chat's build-state handoff; plus templates that only declare what is read | each one failed quietly, which is the kind this project treats as worst |
-| uncommitted | — | **token limits**: `src/limits.js`, `jr-arch limits` / `/limits`, rate-limit headers shown at setup, per-agent `max_tokens` via `patchTierModel`; ENOBUFS and empty-assistant-turn fixes | a key's allowance is visible before the first task, and the reply cap is fitted to it |
-| uncommitted | — | `package.json` 0.1.2 → 0.1.3; `.gitignore` gains `.gitagent/.env` and `.gitagent/.session/` | this repo has been dogfooding itself (`.gitagent/` present, session branch checked out) |
+| 09-15 | `11faabc` | **docs**: README, ARCHITECTURE, RUNBOOK | the three documents this table lives in |
+| 09-17 | `fbada10` | **chore**: ignore the `.gitagent` state this repo now carries | this repo dogfoods itself; `.gitagent/.env` and `.gitagent/.session/` must never be committed |
+| 09-17 | `fc3daf5` | **feat**: token limits, and the failures a real repository would hit | `src/limits.js`, `jr-arch limits` / `/limits`, rate-limit headers at setup, per-agent `max_tokens` via `patchTierModel`; plus twelve production fixes (secret-scan token matching, pathspec commits, the no-commit-repo guard, swarm build gating, DUTIES-less classification, `/undo` guards, keyless local endpoints, request-parameter adaptation, 64MB output buffers, the empty assistant turn, the chat's build-state handoff) — each one failed quietly |
+| 09-17 | `738c01e` | **chore**: 0.1.3 | — |
+| 09-17 | `75dbe99` | **fix**: a model that cannot call tools fails once, not four times | `isFatalProviderError`: a missing model or a rejected key stops the ladder; the chat offers another model |
+| 09-17 | `0357108` | **feat**: work out what a request costs before sending it | `src/budget.js`: `estimateRequest`, `calibrate`, `fit`, `readCeiling`, the pre-flight estimate; a small free tier works and explains itself instead of failing four times |
+| 09-19 | `5790ea1` | **chore**: 0.1.5 | — |
+| 09-19 | `eb55663` | **fix**: offer to set up git instead of refusing a plain folder | `ensureRepo()` at setup and on a `NO_GIT_REPO` / `NO_COMMITS` refusal; the old advice was a launch flag nobody could type from inside a chat (B14) |
+| 09-19 | `fff4689` | **fix**: fit each step to what is left of the minute | `observe` / `liveRemaining` / `msUntilRefill`; `fitDuties`; `regrow`; a lower limit named by the provider is learned and saved |
+| 09-19 | `75ec493` | **feat**: add as many API keys as you like, and choose which agent uses which | `moreKeys`, `keys:` registry, `nextKeyEnv`, `assignAgent`; keys are saved, never assigned automatically |
+| 09-19 | `d79016b` | **chore**: 0.1.8 | — |
+| 09-19 | `de5b332` | **fix**: stop an agent re-reading a file until the day's allowance is gone | `read_file` paging, the `REPEATABLE` / `callKey` stuck guard, daily limits fatal (B16) |
+| 09-19 | `a3c037b` | **feat**: keys you can see and edit in the folder, picked up as you go | `envTemplate` placeholders, in-place `writeKey`, `reloadEnv` before every message, `discoverKeys`, `/keys`, rescue of a key pasted into `agent.yaml` |
+| 09-19 | `89db1ea` | **feat**: recognise Google Gemini keys | `gemini` provider (`AIza`, `GEMINI_API_KEY`) on Google's OpenAI-compatible endpoint; `models/` prefix, 400 bad-key, array-wrapped errors, `quotaId` daily limits, "retry in", unindexed stream tool calls |
+| 09-19 | `72e3319` | **chore**: 0.1.10 | — |
 
 ---
 
@@ -795,7 +831,7 @@ From `CLAUDE.md` "Next", plus the gaps above that most need fixing.
 | # | Item | Notes |
 |---|---|---|
 | 1 | **A real task against a real model** | See procedure §5.12. Everything else is lower priority, and every fix in §9 was verified against scripted models only |
-| 2 | Publish 0.1.3 | See §5.11 |
+| 2 | Gemini against the live API | Built from Google's documented shapes and tested only with a fake `fetch`. A real key should run a task and hit a rate limit once, to confirm the error parsing and the unindexed tool calls |
 | 3 | Bring `gitagent-default` to the current format | Front-matter routing; remove root SOUL/RULES |
 | 4 | `routing.entry` still names one agent | |
 | 5 | Swarm still does not escalate | Ladder and swarm remain two paths through `run()`; selection is now task-aware but a failed swarm agent has nowhere to go |

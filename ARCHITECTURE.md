@@ -331,10 +331,19 @@ sequenceDiagram
    fails to parse throws here, and the notes print as warnings.
 4. `readAgents()` returns at least one agent. Zero agents is an error; the code
    never falls back to built-in defaults.
-5. Dirty tree check, skipped by `--allow-dirty`.
-6. `verify()`, skipped by `--skip-verify`.
-7. `--agent` must name an installed agent.
-8. `--dry-run` returns after classification, before any session exists.
+5. `requireGit()`, skipped by `--no-git`. Rollback and the session branch need
+   a repository with at least one commit, so a plain folder throws with
+   `code: 'NO_GIT_REPO'` and an empty repository with `code: 'NO_COMMITS'`.
+   The chat catches both codes and offers `ensureRepo()` (`git init` plus a
+   first commit that leaves out `.gitagent/.env` and `node_modules/`) instead
+   of printing advice about a launch flag nobody can type mid-chat.
+6. Dirty tree check, skipped by `--allow-dirty`.
+7. `verify()`, skipped by `--skip-verify`.
+8. `--agent` must name an installed agent.
+9. `--dry-run` returns after classification, before any session exists.
+10. Pre-flight budget: `fit()` on the first request. When the system prompt and
+    tools alone exceed the key's per-request budget, the run stops with
+    `fatal: 'budget'` before spending a request.
 
 ### The `ctx` object
 
@@ -452,21 +461,43 @@ Rules encoded in the loop:
 messages = [{role:user, content: brief}]
 system   = prompt(ctx, agent)
 while frame.steps < max_steps:
-    reply = call(tierModel, {system, messages, tools: TOOLS, onDelta?})
-    if model call throws → failed("model call failed: …")
+    budget = min(ctx.budget, liveRemaining(model))       what is left of this minute
+    room   = fit(system, messages, tools, budget, regrow?)
+    if !room.fits:
+        wait = msUntilRefill(model) → sleep once, exactly that long, and refit
+        still no fit → fatal("does not fit the key's budget")
+    reply = call(tierModel, {system, messages: room.messages, tools: TOOLS, maxTokens: room.maxTokens})
+    if model call throws:
+        isFatalProviderError (model, auth, daily limit) → fatal(kind)
+        too-large naming a lower limit → learn it (setTokensPerMinute), refit, retry
+        otherwise → failed("model call failed: …")
+    if the reply was cut off at room.maxTokens with no usable tool call:
+        resend once with regrow = 2 × the cap
     if no tool calls:
         step 1 → failed("replied with prose … run doctor")
         3 in a row → failed("stopped acting")
         push "Continue, or call done()"; continue
     for each tool call:
         if a control call already happened this turn → "Skipped" error
-        out = dispatch(call, toolCtx)
+        read_file / list_files / run_command with the same arguments:
+            third time, or more than 4 repeats, with no write between → fatal("stuck")
+        out = dispatch(call, toolCtx)                     a write resets the repeat count
         if out.control → remember it
     push tool results
     done → {kind: done, summary}
     handoff → {kind: handoff, to, reason}
 failed("hit the N-step ceiling")
 ```
+
+A `fatal` result ends the whole ladder, not just the attempt. Another attempt
+or another agent on the same key would only spend a request to hear the same
+refusal: a model that does not exist, a rejected key, a spent daily allowance,
+a prompt that cannot fit, or an agent going round in circles. The chat offers
+to pick a different model when a turn ends this way.
+
+The stuck guard exists because of one real run: an 11k-token file on a
+7k-per-request key, each slice dropped to make room for the next, and the agent
+re-reading it until 199,378 of the day's 200,000 tokens were gone.
 
 ### System prompt assembly (`prompt()`)
 
@@ -513,7 +544,7 @@ only in memory for the length of one attempt and is never written to disk.
 
 | Tool | Gate | Action | Notes |
 |---|---|---|---|
-| `read_file(path)` | `inside()` → `checkRead` | `readFileSync` | Directory and binary files are rejected; output truncated at 200,000 characters |
+| `read_file(path, start_line?, line_count?)` | `inside()` → `checkRead` | `readFileSync` | Directory and binary files are rejected. Returns whole lines up to `readCeiling()` (sized to the key's budget, at most 200,000 characters) under a `[path · lines a-b of N]` header, and names the `start_line` to continue from. Numbers are plain digits, never locale-formatted |
 | `list_files(path?)` | `inside()` | recursive walk | Skips `.git`, `node_modules`, `dist`, `build`, `.next`, `target`, `__pycache__`, `.venv`; 400 entries shown |
 | `write_file(path, content)` | `inside()` → `checkEdit(before, after)` → approve | `mkdir -p` + `writeFileSync`; adds to `touched` | Whole-file content, never patches |
 | `run_command(command[])` | argv shape → `checkCommand` → approve → `resolveBin` | `execFileSync`, no shell, 120s timeout, cwd = root | Non-zero exit is returned as an error result with output (head+tail) |
@@ -878,8 +909,18 @@ default, or `null`. `endpoint()` in `provider.js` **throws** on `null` rather
 than guessing a URL.
 
 `listModels` calls `GET /v1/models?limit=1000` (Anthropic) or `GET /models`. A
-401 or 403 raises `KeyRejected`. The list is filtered by `isChatModel` and
-sorted newest first.
+401 or 403 raises `KeyRejected`, and so does a 400 whose body says
+`API_KEY_INVALID` — Google's way of rejecting a key. A leading `models/` is
+stripped from ids (Gemini lists `models/gemini-2.5-flash`; requests take the
+bare name). The list is filtered by `isChatModel` and sorted newest first.
+
+Gemini is served through Google's OpenAI-compatible endpoint, so it needs no
+wire format of its own. What differs is detail, and each detail is handled
+where the others are: the bad-key status above, errors wrapped in a
+one-element array, a daily quota named only in the `quotaId`, "Please retry in
+35s" instead of "try again in", and streamed tool calls without an `index`.
+All of it is built from Google's documented shapes and has not yet met the
+live API.
 
 ### `callModel(manifest, {system, messages, tools, maxTokens, temperature, onDelta, onNotice})`
 
@@ -916,8 +957,15 @@ loop:
      otherwise           → throw
 ```
 
+`parseProviderError` unwraps an array-shaped body before reading it. The unit
+comes from the message (`(TPM): Limit …`), or for Gemini from a `quotaId`
+containing `PerDay` (`RPD`, or `TPD` when it counts tokens). A 400 saying the
+API key is invalid is `auth`.
+
 `kind` is one of `param`, `too-large`, `rate-limit`, `auth`, `model`, `server`,
-`other`. `param` is a model refusing a request field rather than the request:
+`other`. `isFatalProviderError()` marks `model`, `auth`, and a rate limit whose
+unit is daily as fatal: the run loop stops the ladder on them instead of
+retrying or escalating. `param` is a model refusing a request field rather than the request:
 OpenAI's reasoning models want `max_completion_tokens` instead of `max_tokens`
 and accept only the default temperature. The refusal names the field, so the
 request layer adapts, remembers the adaptation per provider and model
@@ -952,6 +1000,22 @@ Provider limits are a number; the budget is what the loop does with it.
   make every later request in the attempt unaffordable.
 - `run()` prints `describeBudget()` before the first request and refuses
   outright when nothing can fit, with `fatal: 'budget'`.
+- `observe()` records the remaining-tokens and reset headers of every
+  response. `liveRemaining()` is what is left of the current minute, and
+  `attempt()` fits each step to that rather than to a fresh minute: every step
+  resends the conversation, so steps that each fit the limit spend it together.
+  When nothing fits, `msUntilRefill()` gives the exact wait from the reset
+  header, and the loop waits once.
+- `fitDuties()` shortens DUTIES.md on a tight key — it is ~1,000 tokens resent
+  on every step — keeping the protocol sections and saying what was cut.
+- The reply reservation is lowered only when a step would not otherwise fit. A
+  step cut off at the lowered cap is resent once with twice the room
+  (`regrow`), because reasoning models spend output tokens before a tool call.
+- A too-large error naming a lower limit than the manifest's is believed:
+  `setTokensPerMinute()` writes it to `agent.yaml` so the next run starts
+  from it.
+- Tight keys get a line in the system prompt telling the agent to note what it
+  learns as it goes, because older tool output will be dropped.
 
 ### Limits
 
@@ -983,7 +1047,9 @@ more output than the per-minute allowance is refused outright, not queued.
 - Anthropic: indexed content blocks. `text_delta` → text; `input_json_delta` is
   accumulated per block and parsed when the block ends.
 - OpenAI: `tool_calls` deltas keyed by `index`. The id and name arrive once and
-  `arguments` accumulate.
+  `arguments` accumulate. A delta with no `index` (Gemini sends each call
+  whole) starts a new call when it carries a new id or a name, and otherwise
+  continues the last one. Reading a missing index as 0 glued two calls into one.
 - Malformed tool arguments become `{__parseError}`, which `dispatch` turns into
   a tool error.
 
@@ -1034,8 +1100,63 @@ flowchart LR
     (localhost, 127.x, ::1, host.docker.internal): a local server authenticates
     nothing, and treating it as unconfigured sent the user through onboarding
     on every launch.
-- `keyEnvs(manifest)` collects the base key variable and every per-tier one.
-  The chat's setup gate and `jr-arch key` both use it.
+- `keyEnvs(manifest)` collects the base key variable, every per-tier one, and
+  every name in the `keys:` registry. The chat's setup gate and `jr-arch key`
+  both use it.
+
+### More than one key, and keys edited by hand
+
+`.gitagent/.env` is a file people open and edit, so it is treated like one:
+
+- **`ensureEnvFile()`** creates it at setup (after `ensureIgnored`), filled
+  from `envTemplate()`: a commented placeholder `# NAME=` for every provider in
+  `PROVIDERS` that has a key prefix. Adding a provider to the registry adds
+  its placeholder.
+- **`writeKey()` / `removeKey()`** edit in place. A placeholder line becomes the
+  real line; every other line and comment stays. Rebuilding the file from
+  parsed pairs used to delete what the person had written.
+- **`parseEnv()`** strips a BOM (Notepad) and a leading `export `.
+- **`reloadEnv()`** runs before every chat message. Same rule as `loadEnv`:
+  a variable exported in the shell is never touched; one that came from the
+  file is updated when its line changes and forgotten when it is deleted.
+- **`discoverKeys()`** records keys found in the file that no setting mentions
+  yet into `keys:`, so a key typed as `GROQ_API_KEY_5` becomes offerable.
+  `providerOfVar()` decides the provider from the variable name
+  (`GEMINI_API_KEY_2`) or, failing that, the value's prefix (`GOOGLE_API_KEY=AIza…`).
+  An OpenAI-compatible key is skipped: it is useless without a base URL.
+- **`misplacedKeys()` / `moveMisplacedKey()`** catch a key pasted into
+  `agent.yaml` where a variable name belongs. The chat offers to move it into
+  `.env` and restore the name, and warns that a committed key must be revoked,
+  because moving it does not remove it from history.
+
+```yaml
+# agent.yaml — names only, never values
+model:
+  api_key_env: GROQ_API_KEY
+keys:
+  - provider: groq
+    api_key_env: GROQ_API_KEY_2
+  - provider: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+tiers:
+  senior-dev:
+    model:
+      provider: anthropic
+      name: <model id>
+      api_key_env: ANTHROPIC_API_KEY
+```
+
+- `keys:` is the list of providers code may be sent to. A saved key is never
+  assigned to an agent automatically; which agent uses which key decides where
+  its code goes, so a person chooses it (`/models`, or `moreKeys()` at setup).
+- `nextKeyEnv()` gives a second key for a provider its own variable
+  (`GROQ_API_KEY_2`). Writing it into `GROQ_API_KEY` moved every agent on the
+  first key to another account without anyone deciding that.
+- `jr-arch key <value>` files a key under the provider its prefix names, not
+  under whatever the repo's default is.
+- Keys are never rotated to get round a limit. Keys from one account share its
+  limits. A key from a different provider brings its own allowance, and
+  putting an agent on it is the supported way to use that.
 
 ---
 
@@ -1076,16 +1197,44 @@ flowchart TD
 A turn never passes `--yes`. Errors from `run()` are printed as warnings, and
 the REPL continues.
 
+Around each turn:
+
+- On start, before the setup check, `rescueMisplacedKeys()` offers to move a
+  key pasted into `agent.yaml`.
+- Before each input, `refreshKeys()` runs `reloadEnv()` and `discoverKeys()`
+  and says what it picked up, so a key added in the folder mid-conversation
+  works without a restart.
+- A `NO_GIT_REPO` / `NO_COMMITS` refusal offers `ensureRepo()`, then retries
+  the same task. Declining asks whether to carry on without git for the
+  session.
+- A turn that ends `fatal` (model, key, daily limit, budget, stuck) offers to
+  pick a different model.
+
+Key and model commands: `/keys` lists every key variable, whether it is set,
+where from (shell or file), masked, and which agents use it, with the full
+path of `.env`. `/key` adds a key or replaces one. `/models` switches the
+default model or puts one agent on another saved key. `/limits` shows the rate
+limits and the per-agent reply caps.
+
 ### Onboarding (`onboard.js`)
 
 1. **Key:** `obtainKey` reads a secret. `ollama` asks for an address; otherwise
-   `detectProvider`, falling back to a menu; `openai-compatible` asks for a
-   URL. Then `listModels` proves the key. `KeyRejected` gives up to 3 tries; a
-   network failure offers "save anyway".
+   `detectProvider`, falling back to a menu (new providers go at the end of
+   it, so existing numbers do not move); `openai-compatible` asks for a URL.
+   Then `listModels` proves the key, and its response headers give the key's
+   rate limits. `KeyRejected` gives up to 3 tries; a network failure offers
+   "save anyway". `moreKeys` then offers to add further keys, each proved the
+   same way and saved, never assigned.
 2. **Model:** `pickModel` shows the 12 newest, then "another model (N more)"
-   **last**, or asks for a name when the list is empty.
+   **last**, or asks for a name when the list is empty. The model is probed
+   for tool calling; `keepModel` asks before keeping one that failed, and
+   re-asks on anything but yes or no.
 3. **Scaffold:** `init({quiet:true})`, or `setModel` if `.gitagent/` already
-   exists. Then `ensureIgnored` → `writeKey` → set `process.env`.
+   exists. The per-minute limit is written as `model.tokens_per_minute`, and
+   the reply cap is lowered under the key's output allowance. Then
+   `ensureEnvFile` → `writeKey` for every key → set `process.env`. The chat
+   then offers `ensureRepo()` in a folder that is not a repository yet,
+   before `/prompt` spends any model calls.
 4. **Mode:** prompt / dev / chat.
 
 ### `/prompt` (`generate.js`)
@@ -1236,7 +1385,7 @@ pack `model:` refusal.
 ## 21. Testing architecture
 
 - **Runner:** `node --test`, with no framework and no dependencies. There are
-  564 tests in 27 files under `test/`, and a full run takes about 50 seconds.
+  617 tests in 28 files under `test/`, and a full run takes about 55 seconds.
 - **No network:** `callModel` is injected as `call`, and `listModels` /
   onboarding / smoke take `fetchImpl`.
 - **No terminal needed:** flows take a prompter, driven by `scriptedPrompter`,

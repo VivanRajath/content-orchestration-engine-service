@@ -13,8 +13,8 @@ That's the whole install. It asks for what it needs, one step at a time.
 - **Node 18 or newer.** No other runtime dependencies.
 - **A git repository** is strongly recommended. Every run works on its own
   branch, and failed attempts are rolled back through git.
-- **An API key** for Anthropic, Google Gemini, Groq, OpenAI, OpenRouter or xAI. You can also
-  use a local Ollama or any OpenAI-compatible endpoint.
+- **An API key** for Anthropic, Google Gemini, Groq, OpenAI, OpenRouter or
+  xAI. You can also use a local Ollama or any OpenAI-compatible endpoint.
 
 > Looking for how it works inside? See [ARCHITECTURE.md](ARCHITECTURE.md).
 > Working on the code itself? See [RUNBOOK.md](RUNBOOK.md).
@@ -308,8 +308,13 @@ flags never do, so `run --dry-run "task"` keeps the task.
 
 When you paste a key, jr-arch recognises the provider from its prefix. The model
 list is always fetched live from the provider. Nothing is hard-coded, so you're
-never offered a model your key can't use. Speech, embedding, moderation and
-image models are filtered out because they can't call tools.
+never offered a model your key can't use. Speech, embedding, moderation,
+image and video models are filtered out because they can't call tools.
+
+Gemini keys (from aistudio.google.com) start with `AIza` and use Google's
+OpenAI-compatible endpoint. Gemini support is new and has been tested against
+Google's documented responses rather than the live service. If something
+Google sends back reads oddly, please open an issue with the message.
 
 ### More than one key
 
@@ -344,6 +349,7 @@ keys live in one file: **`.gitagent/.env`**, one per line as `NAME=value`.
 GROQ_API_KEY=gsk_...
 GROQ_API_KEY_2=gsk_...          # a second key for the same provider
 ANTHROPIC_API_KEY=sk-ant-...
+GEMINI_API_KEY=AIza...
 ```
 
 Setup creates it with a placeholder line for every provider, so there is
@@ -810,6 +816,10 @@ file's comments intact.
 | "the conversation alone needs N" | The input is too big, not the reply. Read less per step, or use a model with a higher limit. The loop trims automatically once `tokens_per_minute` is recorded — check `jr-arch limits` |
 | Rate limit / "allows N tokens a minute" | `jr-arch limits` to see the allowance, then `jr-arch limits set default <n>` to fit under it, pick a model with higher limits (`/models`), or upgrade the plan |
 | Replies are cut off mid tool call | The cap is too low: `jr-arch limits set <agent> <bigger n>` |
+| "the agent kept re-running the same read" | The key's per-minute limit can't hold that file and the conversation together. Ask about a smaller part of the file, or put the agent on a key with a bigger limit (`/models`) |
+| A daily limit ("tokens a day", or Gemini's daily quota) | The day's allowance is spent and the run stops rather than retrying. Use a key from another provider (`/models`), or wait for the reset |
+| An `AIza…` (Gemini) key isn't recognised | You're on a copy older than 0.1.10. Run `npx jr-arch@latest`; if a local install is pinned, `npm i jr-arch@latest` |
+| Added a key in `.gitagent/.env` and nothing happened | Check the line is `NAME=value` with no `#` in front. A variable exported in your shell wins over the file. `/keys` shows which one is in use |
 | Checkpoint declined in CI | Expected. A person has to pass `--yes` |
 | `/check` reports an escalation loop | Mark one agent in the loop `terminal: true` |
 | Agent runs unscoped / at default priority | Its `SOUL.md` front matter doesn't parse. Run `/check` |
