@@ -528,3 +528,151 @@ describe('a folder that is not a git repository yet', () => {
     }
   });
 });
+
+describe('the minute, not just the request', () => {
+  test('steps are fitted to what is left of the minute, so none is refused', async () => {
+    // Reported from a real session: four steps on an 8,000-a-minute key each
+    // fitted the limit on their own, but together spent it — the fifth was
+    // refused and the run sat out a 50-second wait. The provider reports what
+    // is left on every response; the loop now fits to that.
+    const { estimateRequest, observe, forgetLive } = await import('../src/budget.js');
+    forgetLive();
+
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const file = join(box.dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace(
+        '  max_tokens: 8192',
+        '  max_tokens: 900\n  tokens_per_minute: 8000',
+      ));
+      writeFileSync(join(box.root, 'README.md'), 'A landing page. '.repeat(900));
+      writeFileSync(join(box.root, 'notes.md'), 'More notes here. '.repeat(700));
+
+      // A provider with a real per-minute bucket that refuses what it cannot
+      // take, and reports what is left the way Groq does.
+      const MINUTE = 8000;
+      const WINDOW_MS = 400;
+      let spent = 0;
+      let windowStart = Date.now();
+      let refusals = 0;
+      let step = 0;
+      const script = [
+        { name: 'list_files', input: {} },
+        { name: 'read_file', input: { path: 'README.md' } },
+        { name: 'read_file', input: { path: 'notes.md' } },
+        { name: 'read_file', input: { path: 'README.md' } },
+        { name: 'done', input: { summary: 'a landing page, described' } },
+      ];
+
+      const call = async (manifest, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        if (Date.now() - windowStart >= WINDOW_MS) { spent = 0; windowStart = Date.now(); }
+
+        const cost = estimateRequest({ system: req.system, messages: req.messages, tools: req.tools }) + (req.maxTokens ?? 900);
+        const resetIn = `${((WINDOW_MS - (Date.now() - windowStart)) / 1000).toFixed(2)}s`;
+        if (spent + cost > MINUTE) {
+          refusals++;
+          const { ProviderError } = await import('../src/provider.js');
+          throw new ProviderError('rate limited', { kind: 'rate-limit' });
+        }
+        spent += cost;
+        observe(manifest, { get: (n) => ({
+          'x-ratelimit-remaining-tokens': String(MINUTE - spent),
+          'x-ratelimit-limit-tokens': String(MINUTE),
+          'x-ratelimit-reset-tokens': resetIn,
+        })[n] ?? null });
+
+        const next = script[Math.min(step++, script.length - 1)];
+        return { text: '', toolCalls: [{ id: `c${step}`, ...next }], stopReason: 'tool_use' };
+      };
+
+      const out = await run(['wt does this repo do'], { quiet: true, 'allow-dirty': true }, { call });
+
+      assert.equal(out.status, 'done', 'the task still finishes');
+      assert.equal(refusals, 0, 'and no request was sent that the minute could not take');
+    });
+    forgetLive();
+  });
+
+  test('a reply cut off mid tool call is sent again with more room, not fed back broken', async () => {
+    // The cap is lowered when the minute is nearly spent, and a lowered cap is
+    // exactly what cuts a file write off half-way. That step is sent again —
+    // after the minute refills, with the room it ran out of — rather than
+    // handing the model its own half-written call as an error.
+    const { observe, forgetLive } = await import('../src/budget.js');
+    forgetLive();
+
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const file = join(box.dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace(
+        '  max_tokens: 8192',
+        '  max_tokens: 3000\n  tokens_per_minute: 8000',
+      ));
+
+      // Most of this minute is already gone when the task starts.
+      const manifest = { provider: 'anthropic', model: 'claude-sonnet-4-6' };
+      observe(manifest, { get: (n) => ({
+        'x-ratelimit-remaining-tokens': '3200',
+        // Long enough to outlast the run's own startup (the verify step alone
+        // spawns npm), so the first step really does meet a spent minute.
+        'x-ratelimit-reset-tokens': '4s',
+      })[n] ?? null });
+
+      const sizes = [];
+      let dispatchedBroken = false;
+      const call = async (_m, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        sizes.push(req.maxTokens);
+        const last = req.messages[req.messages.length - 1];
+        if (last?.role === 'tool' && /not valid JSON/.test(last.results?.[0]?.content ?? '')) dispatchedBroken = true;
+
+        if (sizes.length === 1) {
+          return {
+            text: '',
+            toolCalls: [{ id: 'w1', name: 'write_file', input: { __parseError: '{"path":"index.js","content":"export con' } }],
+            stopReason: 'length',
+          };
+        }
+        if (sizes.length === 2) {
+          return { text: '', toolCalls: [{ id: 'w2', name: 'write_file', input: { path: 'index.js', content: 'export const a = 7;\n' } }], stopReason: 'tool_use' };
+        }
+        return { text: '', toolCalls: [{ id: 'd', name: 'done', input: { summary: 'written' } }], stopReason: 'tool_use' };
+      };
+
+      const out = await run(['write it'], { quiet: true, 'allow-dirty': true }, { call });
+
+      assert.equal(out.status, 'done');
+      assert.ok(sizes[1] > sizes[0], `the retry had more room (${sizes[0]} then ${sizes[1]})`);
+      assert.equal(dispatchedBroken, false, 'the half-written call was never run');
+      assert.match(readFileSync(join(box.root, 'index.js'), 'utf8'), /a = 7/);
+    });
+    forgetLive();
+  });
+
+  test('a retry that can never get more room is sent with the most there is', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const file = join(box.dir, 'agent.yaml');
+      // So small a key that a doubled reply can never fit.
+      writeFileSync(file, readFileSync(file, 'utf8').replace(
+        '  max_tokens: 8192',
+        '  max_tokens: 3000\n  tokens_per_minute: 4000',
+      ));
+
+      let calls = 0;
+      const call = async (_m, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        calls++;
+        if (calls === 1) {
+          return { text: '', toolCalls: [{ id: 'w1', name: 'write_file', input: { __parseError: '{"path"' } }], stopReason: 'length' };
+        }
+        return { text: '', toolCalls: [{ id: 'd', name: 'done', input: { summary: 'ok' } }], stopReason: 'tool_use' };
+      };
+
+      const out = await run(['write it'], { quiet: true, 'allow-dirty': true }, { call });
+      assert.equal(out.status, 'done', 'it did not give up on a step that fits');
+      assert.ok(calls <= 3, `and it did not loop (${calls} calls)`);
+    });
+  });
+});

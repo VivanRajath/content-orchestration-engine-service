@@ -15,7 +15,7 @@
  */
 
 import { baseUrlFor, wireFor, providerFor } from './providers.js';
-import { calibrate } from './budget.js';
+import { calibrate, observe } from './budget.js';
 
 export function apiKey(manifest) {
   return process.env[manifest.keyEnv] || '';
@@ -376,6 +376,10 @@ async function request(manifest, url, headers, body, key, { stream = false, retr
       await sleep(backoff(attempt));
       continue;
     }
+
+    // Every response says what is left of this key's minute, refused or not.
+    // The loop fits the next request to it rather than to a fresh minute.
+    try { observe(manifest, res.headers); } catch { /* bookkeeping must not fail a request */ }
 
     if (res.ok) {
       if (!stream) return { json: await res.json() };

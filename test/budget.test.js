@@ -144,3 +144,115 @@ describe('fitting a request', () => {
     assert.equal(formatTokens(48000), '48k');
   });
 });
+
+describe('what is left of the minute', () => {
+  const headers = (h) => ({ get: (n) => h[n] ?? null });
+
+  test('is read from any response, OpenAI-shaped or Anthropic', async () => {
+    const { observe, liveRemaining, forgetLive } = await import('../src/budget.js');
+    forgetLive();
+
+    observe(GROQ, headers({
+      'x-ratelimit-remaining-tokens': '1200',
+      'x-ratelimit-limit-tokens': '8000',
+      'x-ratelimit-reset-tokens': '42s',
+    }), 1000);
+    assert.equal(liveRemaining(GROQ, 1000), 1200);
+
+    const CLAUDE = { provider: 'anthropic', model: 'claude-sonnet-4-6' };
+    observe(CLAUDE, headers({
+      'anthropic-ratelimit-input-tokens-remaining': '30000',
+      'anthropic-ratelimit-input-tokens-limit': '40000',
+      'anthropic-ratelimit-input-tokens-reset': new Date(61000).toISOString(),
+    }), 1000);
+    assert.equal(liveRemaining(CLAUDE, 1000), 30000);
+    forgetLive();
+  });
+
+  test('stops describing the minute once the minute has turned over', async () => {
+    const { observe, liveRemaining, msUntilRefill, forgetLive } = await import('../src/budget.js');
+    forgetLive();
+    observe(GROQ, headers({ 'x-ratelimit-remaining-tokens': '300', 'x-ratelimit-reset-tokens': '10s' }), 0);
+
+    assert.equal(liveRemaining(GROQ, 5000), 300, 'still this minute');
+    assert.equal(msUntilRefill(GROQ, 5000), 5000, 'the provider said how long');
+    assert.equal(liveRemaining(GROQ, 10001), null, 'a refilled minute is not the old one');
+    forgetLive();
+  });
+
+  test('a response with no rate-limit headers changes nothing', async () => {
+    const { observe, liveRemaining, forgetLive } = await import('../src/budget.js');
+    forgetLive();
+    assert.equal(observe(GROQ, headers({})), null);
+    assert.equal(liveRemaining(GROQ), null);
+  });
+
+  test('resets arrive as seconds, durations, or a timestamp', async () => {
+    const { resetToMs } = await import('../src/budget.js');
+    assert.equal(resetToMs('60'), 60000);
+    assert.equal(resetToMs('7.5s'), 7500);
+    assert.equal(resetToMs('1m2s'), 62000);
+    assert.equal(resetToMs(new Date(3000).toISOString(), 1000), 2000);
+    assert.equal(resetToMs(''), null);
+  });
+});
+
+describe('DUTIES.md on a tight key', () => {
+  const DUTIES = [
+    '# Duties',
+    '',
+    'An explanation of this file, for the person reading it. '.repeat(20),
+    '',
+    '## Entry',
+    '',
+    'How the first agent is chosen. '.repeat(10),
+    '',
+    '## Escalation',
+    '',
+    'How an agent hands off. '.repeat(10),
+    '',
+    '## What travels with a handoff',
+    '',
+    'The record, not the transcript. '.repeat(40),
+  ].join('\n');
+
+  test('is sent exactly as written when there is room', async () => {
+    const { fitDuties } = await import('../src/budget.js');
+    assert.equal(fitDuties(DUTIES, null), DUTIES, 'no budget, no change');
+    assert.equal(fitDuties(DUTIES, 200000), DUTIES, 'a big key gets the whole file');
+  });
+
+  test('loses its preamble and later sections first, and says so', async () => {
+    const { fitDuties, estimateTokens } = await import('../src/budget.js');
+    const short = fitDuties(DUTIES, 7200);
+
+    assert.ok(estimateTokens(short) < estimateTokens(DUTIES), 'it got smaller');
+    assert.doesNotMatch(short, /An explanation of this file/, 'the preamble is the first to go');
+    assert.match(short, /^## Entry/, 'the protocol starts where the file does');
+    assert.match(short, /Shortened to fit/, 'and the model is told it is not the whole file');
+    assert.match(short, /still enforced by the harness/);
+  });
+});
+
+describe('a reply that has to be sent again with more room', () => {
+  test('fit can require a bigger reply than the floor', () => {
+    const room = fit({
+      system: 'x'.repeat(3600),
+      messages: [{ role: 'user', content: 'write the file' }],
+      maxTokens: 4000,
+      budget: 6000,
+      minOutput: 3000,
+    });
+    assert.equal(room.fits, true);
+    assert.ok(room.maxTokens >= 3000, 'the retry gets at least the room it asked for');
+
+    const tight = fit({
+      system: 'x'.repeat(3600),
+      messages: [{ role: 'user', content: 'write the file' }],
+      maxTokens: 4000,
+      budget: 2500,
+      minOutput: 3000,
+    });
+    assert.equal(tight.fits, false, 'and when that room is not there, it says so rather than sending less');
+  });
+});

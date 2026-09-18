@@ -119,6 +119,126 @@ export function readCeiling(budget, manifest) {
 
 const margin = (budget) => Math.max(SAFETY_FLOOR, Math.round(budget * SAFETY));
 
+// ---------------------------------------------------------------------------
+// What is left of this minute
+// ---------------------------------------------------------------------------
+
+/**
+ * A per-minute limit is spent by every request in the minute, not by one.
+ *
+ * Each step resends the whole conversation, so four steps that each fit the
+ * limit comfortably can still spend it twice over — and the fifth is refused
+ * and waits out the rest of the minute. The provider says how much is left on
+ * every response it sends, success or failure; this is where that is kept, so
+ * the next request can be fitted to what remains instead of to a fresh minute.
+ */
+const live = new Map();
+
+const header = (headers, name) => {
+  if (!headers) return null;
+  const v = typeof headers.get === 'function' ? headers.get(name) : headers[name];
+  return v == null || v === '' ? null : String(v);
+};
+
+const num = (v) => {
+  if (v == null) return null;
+  const n = Number(String(v).replace(/[,_]/g, ''));
+  return Number.isFinite(n) ? n : null;
+};
+
+/** "7.66s", "1m2.5s", "60", or an RFC3339 timestamp, as milliseconds from now. */
+export function resetToMs(value, now = Date.now()) {
+  if (value == null || value === '') return null;
+  const raw = String(value).trim();
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  if (/^[\d.]/.test(raw)) {
+    let ms = 0;
+    for (const [, n, u] of raw.matchAll(/([\d.]+)(ms|h|m|s)/g)) {
+      ms += Number(n) * { h: 3600000, m: 60000, s: 1000, ms: 1 }[u];
+    }
+    if (ms > 0) return ms;
+  }
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - now) : null;
+}
+
+/** Record what a response said is left of this key's minute. */
+export function observe(manifest, headers, now = Date.now()) {
+  // Combined tokens where the provider reports them; Anthropic splits input
+  // from output, and input is what a growing conversation spends.
+  const families = [
+    ['x-ratelimit-remaining-tokens', 'x-ratelimit-limit-tokens', 'x-ratelimit-reset-tokens'],
+    ['anthropic-ratelimit-tokens-remaining', 'anthropic-ratelimit-tokens-limit', 'anthropic-ratelimit-tokens-reset'],
+    ['anthropic-ratelimit-input-tokens-remaining', 'anthropic-ratelimit-input-tokens-limit', 'anthropic-ratelimit-input-tokens-reset'],
+  ];
+  for (const [rem, lim, reset] of families) {
+    const remaining = num(header(headers, rem));
+    if (remaining == null) continue;
+    const state = { remaining, limit: num(header(headers, lim)), resetMs: resetToMs(header(headers, reset), now), at: now };
+    live.set(key(manifest), state);
+    return state;
+  }
+  return null;
+}
+
+/** Tokens left in the current minute, or null when unknown or already refilled. */
+export function liveRemaining(manifest, now = Date.now()) {
+  const s = live.get(key(manifest));
+  if (!s) return null;
+  // Once the window has turned over, what was left no longer describes it.
+  if (s.resetMs != null && now >= s.at + s.resetMs) return null;
+  return s.remaining;
+}
+
+/** How long until the minute refills, as the provider last reported it. */
+export function msUntilRefill(manifest, now = Date.now()) {
+  const s = live.get(key(manifest));
+  if (!s || s.resetMs == null) return null;
+  return Math.max(0, s.at + s.resetMs - now);
+}
+
+export const forgetLive = () => live.clear();
+
+/**
+ * DUTIES.md, fitted to a tight key.
+ *
+ * It is the largest fixed part of every request — about a thousand tokens,
+ * resent on every step — and on an 8,000-a-minute key that alone is an eighth
+ * of the minute per step. Its opening explains the file itself (how agents
+ * declare themselves, that it may be deleted), which helps the person reading
+ * it and nobody at runtime; the sections after it are the protocol. So the
+ * preamble goes first, then whole sections from the end, and what is left out
+ * is said.
+ *
+ * Only ever when a budget is known and the file is a real share of it. With
+ * room to spare the file is sent exactly as the user wrote it.
+ */
+export function fitDuties(text, budget, manifest) {
+  const duties = String(text ?? '');
+  if (!duties || !budget) return duties;
+  const share = Math.floor(budget * 0.06);
+  if (estimateTokens(duties, manifest) <= share) return duties;
+
+  const firstSection = duties.search(/^## /m);
+  const body = firstSection > 0 ? duties.slice(firstSection) : duties;
+  const sections = body.split(/(?=^## )/m);
+  const limitChars = Math.floor(share * charsPerToken(manifest));
+
+  const kept = [];
+  let used = 0;
+  for (const section of sections) {
+    if (used + section.length > limitChars && kept.length) break;
+    kept.push(section.trimEnd());
+    used += section.length;
+  }
+  const dropped = sections.length - kept.length;
+  const note = '_(Shortened to fit this key’s per-minute limit' +
+    (dropped ? `; ${dropped} later section${dropped === 1 ? '' : 's'} left out` : '') +
+    '. Guardrails and escalation are still enforced by the harness.)_';
+  return `${kept.join('\n\n')}\n\n${note}`;
+}
+
 export const formatTokens = (n) =>
   (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 
@@ -138,8 +258,12 @@ export const formatTokens = (n) =>
  */
 export function fit({
   system = '', messages = [], tools = null, maxTokens = null, budget = null, manifest = null,
+  minOutput = MIN_OUTPUT,
 } = {}) {
   const wanted = maxTokens ?? MIN_OUTPUT;
+  // The least room a reply must have. Normally MIN_OUTPUT; more when a reply
+  // was just cut off and has to be sent again with the room it ran out of.
+  const MIN_OUTPUT_HERE = Math.max(MIN_OUTPUT, Math.min(minOutput, wanted));
   const input = estimateRequest({ system, messages, tools, manifest });
 
   if (!budget) return { fits: true, input, maxTokens: wanted, trimmed: [], budget: null };
@@ -167,7 +291,7 @@ export function fit({
   let used = input;
 
   // Oldest first, and never the opening task or the two most recent turns.
-  for (let i = 1; i < messages.length - 2 && used + MIN_OUTPUT > room; i++) {
+  for (let i = 1; i < messages.length - 2 && used + MIN_OUTPUT_HERE > room; i++) {
     const m = messages[i];
     if (m.role !== 'tool') continue;
     for (const result of m.results ?? []) {
@@ -184,15 +308,15 @@ export function fit({
   }
 
   const available = room - used;
-  const allowed = Math.max(MIN_OUTPUT, Math.min(wanted, available));
+  const allowed = Math.max(MIN_OUTPUT_HERE, Math.min(wanted, available));
 
   return {
-    fits: used + MIN_OUTPUT <= room,
+    fits: used + MIN_OUTPUT_HERE <= room,
     input: used,
     maxTokens: allowed,
     trimmed,
     budget,
-    reason: used + MIN_OUTPUT > room
+    reason: used + MIN_OUTPUT_HERE > room
       ? `the conversation is ~${formatTokens(used)} tokens and the key allows ~${formatTokens(budget)} per request.`
       : null,
   };
