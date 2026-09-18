@@ -393,8 +393,9 @@ every request under it:
 ```
 
 - **`read_file` is capped by the budget**, not by a constant. A file that
-  doesn't fit comes back cut, with a note saying how much was left and that a
-  later section can be read with `run_command`.
+  doesn't fit comes back in parts — `[index.html · lines 1-253 of 1019]` — and
+  says exactly where the next part starts (`start_line=254`). A one-line
+  (minified) file too long for a request is cut and says so.
 - **The reply cap shrinks first** when a request is tight, because a shorter
   answer still answers.
 - **Then the oldest tool output is dropped**, with a note in its place — the
@@ -412,6 +413,15 @@ every request under it:
   later sections) — it is the largest part of every step.
 - **A reply cut off because its cap was lowered is sent again with more room**,
   rather than handing the model its own half-written tool call.
+
+- **An agent going round in circles is stopped.** On a small key an agent
+  can read a part, have it dropped to make room, and read it again — one
+  reported run spent a day's 200,000-token allowance that way on one file. The
+  model is told its own replies survive while tool output does not, and to note
+  what it needs as it goes; reading the same part a third time with nothing
+  written in between stops the task.
+- **A spent daily allowance stops the run at once**, rather than letting the
+  next attempt ask to be told the same thing.
 
 A per-minute limit is a per-minute limit: on an 8,000-a-minute key, an agent
 gets two or three steps a minute however tightly it is packed. The waits get

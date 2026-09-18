@@ -113,7 +113,8 @@ describe('fitting a request', () => {
     assert.equal(room.trimmed[0].name, 'read_file', 'the oldest and largest went');
     assert.notEqual(messages[2].results[0].content, big, 'it really was dropped, not just measured');
     assert.match(messages[2].results[0].content, /dropped to fit/);
-    assert.match(messages[2].results[0].content, /Read it again/, 'the model is told it can re-read');
+    assert.match(messages[2].results[0].content, /rely on what you said about it/, 'the model is pointed at its own notes');
+    assert.doesNotMatch(messages[2].results[0].content, /Read it again/, 'and not invited to re-read, which was the loop');
     assert.equal(messages[0].content, 'summarise the readme', 'the task is never trimmed');
     assert.equal(messages[4].results[0].content, 'src/index.js', 'nor the most recent turns');
   });

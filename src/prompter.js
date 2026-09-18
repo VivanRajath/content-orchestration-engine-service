@@ -127,11 +127,19 @@ export function createPrompter({
     },
 
     async confirm(q, fallback = true) {
-      const answer = await question(`  ${q} ${c.d(fallback ? '[Y/n]' : '[y/N]')} `);
-      if (answer === null) return fallback;
-      const a = answer.trim().toLowerCase();
-      if (!a) return fallback;
-      return a === 'y' || a === 'yes';
+      // Anything but a yes or a no is asked again. Treating it as "no" meant a
+      // menu number typed at a [Y/n] prompt — someone answering the question
+      // they expected next — silently chose no: "Pick a different model? 4"
+      // kept a model that cannot call tools.
+      for (;;) {
+        const answer = await question(`  ${q} ${c.d(fallback ? '[Y/n]' : '[y/N]')} `);
+        if (answer === null) return fallback;
+        const a = answer.trim().toLowerCase();
+        if (!a) return fallback;
+        if (a === 'y' || a === 'yes') return true;
+        if (a === 'n' || a === 'no') return false;
+        console.log(`  ${c.y('!')} answer y or n`);
+      }
     },
 
     async secret(q) {

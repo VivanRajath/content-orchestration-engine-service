@@ -194,7 +194,12 @@ const MIN_OUTPUT = 400;
  * requests to learn something the first reply already said.
  */
 export function isFatalProviderError(err) {
-  return err instanceof ProviderError && (err.kind === 'model' || err.kind === 'auth');
+  if (!(err instanceof ProviderError)) return false;
+  if (err.kind === 'model' || err.kind === 'auth') return true;
+  // A daily allowance that is spent stays spent for the rest of this run.
+  // Another attempt, or another agent on the same key, only spends a request
+  // to be told the same thing.
+  return err.kind === 'rate-limit' && /day|TPD|RPD/i.test(String(err.unit ?? ''));
 }
 
 export class ProviderError extends Error {

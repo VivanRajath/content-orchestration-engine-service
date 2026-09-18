@@ -279,3 +279,76 @@ describe('the tool schemas', () => {
     }
   });
 });
+
+describe('reading a large file in parts', () => {
+  /** A repo with one long file and the shipped hooks, for read_file alone. */
+  function reader(ceiling) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'jra-parts-')));
+    cpSync(TEMPLATES, join(root, '.gitagent'), { recursive: true });
+    const lines = Array.from({ length: 1019 }, (_, i) => `<p>line ${i + 1} of the landing page</p>`);
+    writeFileSync(join(root, 'index.html'), lines.join('\n'));
+    writeFileSync(join(root, 'small.txt'), 'a\nb\nc\n');
+    writeFileSync(join(root, 'min.js'), 'x'.repeat(50000));
+    const ctx = {
+      root, tier: 'junior-dev', readCeiling: ceiling,
+      hooks: loadHooks(join(root, '.gitagent'), { reload: true }),
+      session: { transcript: join(root, 't.jsonl') },
+    };
+    const read = (input) => dispatch({ name: 'read_file', input }, ctx);
+    return { root, read, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  }
+
+  test('a file that fits comes back exactly as it is', async () => {
+    const r = reader(9000);
+    try {
+      assert.equal((await r.read({ path: 'small.txt' })).content, 'a\nb\nc\n');
+    } finally { r.cleanup(); }
+  });
+
+  test('one that does not comes in parts, each saying where the next begins', async () => {
+    const r = reader(9000);
+    try {
+      const first = (await r.read({ path: 'index.html' })).content;
+      const m = first.match(/lines 1-(\d+) of 1019/);
+      assert.ok(m, 'it says which part this is');
+      const next = Number(m[1]) + 1;
+      assert.match(first, new RegExp(`start_line=${next}`), 'and exactly where to continue');
+      assert.doesNotMatch(first, /sed/, 'no advice to use a tool Windows does not have');
+
+      const second = (await r.read({ path: 'index.html', start_line: next })).content;
+      assert.match(second, new RegExp(`lines ${next}-`), 'the next part starts where the last ended');
+      assert.match(second, new RegExp(`<p>line ${next} of`), 'on that exact line');
+    } finally { r.cleanup(); }
+  });
+
+  test('an exact range can be asked for', async () => {
+    const r = reader(9000);
+    try {
+      const part = (await r.read({ path: 'index.html', start_line: 10, line_count: 3 })).content;
+      assert.match(part, /lines 10-12 of 1019/);
+      assert.match(part, /line 10 of/);
+      assert.doesNotMatch(part, /line 13 of/);
+    } finally { r.cleanup(); }
+  });
+
+  test('a single line too long for a request is cut, and says so', async () => {
+    // A minified file is one line. It used to match the "whole file" shortcut
+    // and come back in full — 50,000 characters into a 9,000 budget.
+    const r = reader(9000);
+    try {
+      const part = (await r.read({ path: 'min.js' })).content;
+      assert.ok(part.length < 10000, `it was cut (${part.length} characters)`);
+      assert.match(part, /50000 characters long/);
+      assert.match(part, /probably minified/);
+    } finally { r.cleanup(); }
+  });
+
+  test('asking past the end is a clear error', async () => {
+    const r = reader(9000);
+    try {
+      const out = await r.read({ path: 'index.html', start_line: 5000 });
+      assert.equal(out.isError, true);
+      assert.match(out.content, /has 1019 lines/);
+    } finally { r.cleanup(); }
+  });
+});

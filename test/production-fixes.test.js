@@ -403,7 +403,8 @@ describe('a key with a small per-minute allowance', () => {
 
       assert.ok(toolResult, 'the read happened');
       assert.ok(toolResult.length < 200000, 'and was cut to something the key can carry');
-      assert.match(toolResult, /is 200000 characters/, 'the model is told what it did not get');
+      // Plain digits: model-facing text must not depend on the machine's locale.
+      assert.match(toolResult, /200000 characters/, 'the model is told what it did not get');
       assert.match(toolResult, /fits in one request on this key/);
     });
   });
@@ -673,6 +674,89 @@ describe('the minute, not just the request', () => {
       const out = await run(['write it'], { quiet: true, 'allow-dirty': true }, { call });
       assert.equal(out.status, 'done', 'it did not give up on a step that fits');
       assert.ok(calls <= 3, `and it did not loop (${calls} calls)`);
+    });
+  });
+});
+
+describe('an agent going round in circles', () => {
+  test('re-reading the same part again and again is stopped, not paid for', async () => {
+    // Reported from a real session: a file too big for the key was read in
+    // slices, each slice was dropped to make room for the next, and the agent
+    // re-read them until the day's 200,000 tokens were gone.
+    const box = sandbox();
+    await inRepo(box, async () => {
+      let calls = 0;
+      const call = async (_m, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        calls++;
+        return { text: '', toolCalls: [{ id: `r${calls}`, name: 'read_file', input: { path: 'index.js', start_line: 1 } }], stopReason: 'tool_use' };
+      };
+      const out = await run(['describe the repo'], { quiet: true }, { call });
+
+      assert.equal(out.status, 'stopped');
+      assert.equal(out.fatal, 'stuck');
+      assert.match(out.reason, /going round in circles/);
+      assert.ok(calls <= 3, `stopped at the third identical read, not after ${calls}`);
+    });
+  });
+
+  test('running the tests again after each edit is checking, not a loop', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const script = [];
+      for (let i = 0; i < 4; i++) {
+        script.push({ name: 'write_file', input: { path: 'index.js', content: `export const a = ${i};\n` } });
+        script.push({ name: 'run_command', input: { command: ['node', '-e', '0'] } });
+      }
+      script.push({ name: 'done', input: { summary: 'iterated' } });
+      let step = 0;
+      const call = async (_m, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        const next = script[Math.min(step++, script.length - 1)];
+        return { text: '', toolCalls: [{ id: `c${step}`, ...next }], stopReason: 'tool_use' };
+      };
+      const out = await run(['iterate on it'], { quiet: true }, { call });
+      assert.equal(out.status, 'done', 'the same command four times, with edits between, is fine');
+    });
+  });
+
+  test('a spent daily allowance ends the run at once', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const { ProviderError } = await import('../src/provider.js');
+      let calls = 0;
+      const call = async () => {
+        calls++;
+        throw new ProviderError('Groq rate limit reached for qwen — tokens a day', { kind: 'rate-limit', unit: 'TPD' });
+      };
+      const out = await run(['anything'], { quiet: true }, { call });
+
+      assert.equal(out.status, 'stopped');
+      assert.equal(calls, 1, 'no further attempt asks to be told the same thing');
+    });
+  });
+
+  test('a lower limit named by the provider is learned, kept, and the step fitted again', async () => {
+    const box = sandbox();
+    await inRepo(box, async () => {
+      const file = join(box.dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace('  max_tokens: 8192', '  max_tokens: 900\n  tokens_per_minute: 8000'));
+      const { ProviderError } = await import('../src/provider.js');
+
+      let refused = false;
+      const call = async (_m, req) => {
+        if (/handing it to someone else/.test(req.system ?? '')) return { text: '{}', toolCalls: [], stopReason: 'end_turn' };
+        if (!refused) {
+          refused = true;
+          // Groq counts input on its own: 7,000, under the combined 8,000.
+          throw new ProviderError('too large', { kind: 'too-large', unit: 'ITPM', limit: 7000, requested: 7067, inputOnly: true });
+        }
+        return { text: '', toolCalls: [{ id: 'd', name: 'done', input: { summary: 'fine' } }], stopReason: 'tool_use' };
+      };
+      const out = await run(['describe it'], { quiet: true, 'allow-dirty': true }, { call });
+
+      assert.equal(out.status, 'done', 'the step went again, fitted, instead of failing the attempt');
+      assert.match(readFileSync(file, 'utf8'), /tokens_per_minute: 7000/, 'and the real limit is kept for next time');
     });
   });
 });

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
-import { readManifest, modelFor } from './config.js';
+import { readManifest, modelFor, setTokensPerMinute } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
 import { callModel, extractJson, isFatalProviderError } from './provider.js';
 import { classify, selectSwarm } from './classify.js';
@@ -196,6 +196,9 @@ export async function run(positional, flags, { call = callModel, prompter = null
     // What one request to this key may cost, from the rate-limit headers the
     // provider gave us at setup. null when unknown, and then nothing is fitted.
     budget: budgetFor(manifest),
+    // A lower limit the provider named mid-run. Shared by every attempt in
+    // the run (an object, so the per-attempt spread keeps one copy).
+    learned: { budget: null },
     // Canonical execution state, owned by the loop and never by a tier. This
     // is what makes a handoff survive a change of model.
     ledger: prior ? priorLedger(prior, subject) : newLedger(subject),
@@ -487,6 +490,8 @@ export async function swarmFor(ctx, { task = '', files = [] } = {}) {
 // ---------------------------------------------------------------------------
 
 async function attempt(ctx, frame, brief) {
+  // A limit learned from an earlier attempt's refusal holds for this one too.
+  if (ctx.learned?.budget) ctx.budget = Math.min(ctx.budget ?? Infinity, ctx.learned.budget);
   const messages = [{ role: 'user', content: brief }];
   const system = prompt(ctx, ctx.agent ?? findAgent(frame.tier, ctx.agents) ?? { name: frame.tier, dir: join(ctx.dir, 'agents', frame.tier), owns: [] });
   const toolCtx = {
@@ -514,6 +519,11 @@ async function attempt(ctx, frame, brief) {
   let regrow = null;
   let regrowUsed = false;
   let refills = 0;
+  // A lower limit named by the provider is learned once per attempt.
+  let relearned = false;
+  // Reads and commands already run in this attempt, to notice a loop.
+  const seen = new Map();
+  let repeats = 0;
   // commit() gates on the files this attempt actually wrote, so the set has to
   // live on the frame, not only in the tool context that closes over it.
   frame.touched = toolCtx.touched;
@@ -582,6 +592,26 @@ async function attempt(ctx, frame, brief) {
       // A wrong key, or a model that cannot do this at all, is the same answer
       // every time. Retrying it is the loop paying to be told twice.
       if (isFatalProviderError(e)) return { kind: 'fatal', reason: e.message, fatal: e.kind };
+
+      // The provider named a lower limit than the one this step was fitted
+      // to — Groq counts input on its own (7,000) under the combined 8,000.
+      // Learn it, keep it for later runs, and fit this step again rather than
+      // failing it and starting the whole attempt over.
+      const named = e.kind === 'too-large' && Number(e.limit) > 0 ? Math.floor(e.limit * 0.9) : null;
+      if (named && ctx.budget && named < ctx.budget && !relearned) {
+        relearned = true;
+        ctx.budget = named;
+        ctx.learned.budget = named;
+        toolCtx.readCeiling = readCeiling(named, model);
+        const isDefault = model === ctx.manifest
+          || (model.provider === ctx.manifest.provider && model.model === ctx.manifest.model);
+        if (isDefault && (!ctx.manifest.tokensPerMinute || e.limit < ctx.manifest.tokensPerMinute)) {
+          try { setTokensPerMinute(e.limit); } catch { /* the run matters more than the note */ }
+        }
+        info(c.d(`  … ${model.model} allows ${Number(e.limit).toLocaleString()} tokens here — fitting every request under that from now on`));
+        frame.steps--;
+        continue;
+      }
       return { kind: 'failed', reason: `model call failed: ${e.message}` };
     }
     stream?.end();
@@ -640,7 +670,40 @@ async function attempt(ctx, frame, brief) {
         results.push({ id: call.id, name: call.name, content: 'Skipped — the attempt already ended.', isError: true });
         continue;
       }
+
+      // Going round in circles. On a small key a large file never fits in view
+      // at once, older output is dropped to make room, and an agent that has
+      // not kept notes reads the same part again — and again. One reported run
+      // spent a day's allowance (200,000 tokens) re-reading one 11k-token file.
+      // Reading something twice can be legitimate after it was dropped; a
+      // third time, or a pattern of it, is a loop that will not end on its own.
+      // A write resets the count, because re-reading after a change is not a
+      // repeat — it is checking.
+      const key = REPEATABLE.has(call.name) ? callKey(call) : null;
+      if (key) {
+        const n = (seen.get(key) ?? 0) + 1;
+        seen.set(key, n);
+        if (n > 1) repeats++;
+        if (n > 2 || repeats > 4) {
+          return {
+            kind: 'fatal',
+            fatal: 'stuck',
+            reason:
+              `the agent kept re-running the same ${call.name === 'run_command' ? 'command' : 'read'} ` +
+              `(${repeats} repeats) — on this key it cannot hold everything at once, so it was going ` +
+              'round in circles. Stopped before it spent more of your allowance.',
+          };
+        }
+      }
+
       const out = await dispatch(call, toolCtx);
+      if (key && seen.get(key) === 2 && !out.isError) {
+        out.content +=
+          '\n\n[You already read this earlier in this task. Its output is dropped again as you ' +
+          'work, so say in a sentence what you need from it now — your own replies are kept, ' +
+          'tool output is not. Reading it a third time will stop the task.]';
+      }
+      if (call.name === 'write_file' && !out.isError) { seen.clear(); repeats = 0; }
       info(`  ${out.isError ? c.y('✗') : c.g('✓')} ${call.name}${describe(call)}`);
       results.push({ id: call.id, name: call.name, content: out.content, isError: out.isError });
       if (out.control) control = out.control;
@@ -804,6 +867,15 @@ function prompt(ctx, agent) {
       '',
       'run_command takes argv as an array of separate strings and runs with no shell,',
       'so pipes, redirects, and && are literal arguments, not operators.',
+      ...(ctx.budget && ctx.budget < 16000 ? [
+        '',
+        // Mechanics, not identity: what this key physically allows per request.
+        `This key allows about ${formatTokens(ctx.budget)} tokens per request. A large file will not fit`,
+        'in view at once, and older tool output is dropped as you work — your own replies are kept.',
+        'So read a large file in parts (read_file with start_line), and after each part say in a',
+        'sentence or two what matters in it, or write it straight into the file you were asked to',
+        'create. Do not read everything first, and do not re-read a part you have already read.',
+      ] : []),
       '',
       'Guardrails are enforced by the harness, not by these instructions. If a call is',
       'blocked you will be told which hook stopped it and why — read the reason and',
@@ -994,6 +1066,20 @@ function sessionBranchInUse(root, manifest) {
 }
 
 const NEWLINE = String.fromCharCode(10);
+
+/** Tools whose repetition, with nothing written in between, is a loop. */
+const REPEATABLE = new Set(['read_file', 'list_files', 'run_command']);
+
+/**
+ * What makes two calls "the same". A read is the same part of the same file,
+ * however many lines were asked for; a command is the same argv.
+ */
+function callKey(call) {
+  const input = call.input ?? {};
+  if (call.name === 'read_file') return `read:${input.path}:${input.start_line ?? 1}`;
+  if (call.name === 'list_files') return `list:${input.path ?? '.'}`;
+  return `run:${Array.isArray(input.command) ? input.command.join(String.fromCharCode(0)) : String(input.command)}`;
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function streamWriter(indent = '    ') {

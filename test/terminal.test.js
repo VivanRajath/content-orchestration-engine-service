@@ -240,3 +240,24 @@ describe('a stream request answered with plain JSON', () => {
     }
   });
 });
+
+describe('a yes-or-no question', () => {
+  test('anything but yes or no is asked again, never taken as no', async () => {
+    // Reported: "Pick a different model? [Y/n] 4" — a menu number typed at a
+    // yes/no prompt — was read as no, and kept a model that cannot call tools.
+    const { PassThrough } = await import('node:stream');
+    const { createPrompter } = await import('../src/prompter.js');
+    const input = new PassThrough();
+    const output = new PassThrough();
+    output.resume();
+    const p = createPrompter({ input, output });
+
+    const answer = p.confirm('Pick a different model?', true);
+    input.write('4\n');
+    await new Promise((r) => setTimeout(r, 30));
+    input.write('y\n');
+
+    assert.equal(await answer, true, 'the "4" was asked about again, and the real answer taken');
+    p.close();
+  });
+});

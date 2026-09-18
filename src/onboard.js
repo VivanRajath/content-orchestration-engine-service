@@ -115,8 +115,16 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
     info(`Replies are capped at ${c.c(cap.toLocaleString())} tokens ${c.d('— under what this key allows')}`);
   }
   if (extra.length) {
-    const names = extra.map((k) => providerFor(k.provider)?.label ?? k.provider).join(', ');
-    info(`Also saved: ${names}. ${c.d('Put an agent on one with /models, or when /prompt asks.')}`);
+    // Say plainly that nothing uses them yet. "Also saved: Groq, Groq, Groq"
+    // read as three keys at work; every step still went through the first.
+    info(`Also saved: ${extra.map((k) => c.c(k.keyEnv)).join(', ')} ${c.d('— no agent uses these yet.')}`);
+    info(c.d('  Put an agent on one with /models → "One agent’s model or key", or when /prompt asks.'));
+    const same = extra.filter((k) => k.provider === conn.provider);
+    if (same.length) {
+      const label = providerFor(conn.provider)?.label ?? conn.provider;
+      info(c.d(`  ${label} limits belong to the account, so keys from one ${label} account share one allowance.`));
+      info(c.d('  To give an agent a limit of its own, put it on a different provider.'));
+    }
   }
   info(c.d('See or change that with /limits, or jr-arch limits.'));
   console.log();
