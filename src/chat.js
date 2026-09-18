@@ -1,7 +1,10 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
-import { readManifest, modelFor, setModelMaxTokens, setTierMaxTokens } from './config.js';
+import {
+  readManifest, modelFor, setModelMaxTokens, setTierMaxTokens,
+  savedConnections, addSavedKey, setTierConnection,
+} from './config.js';
 import { requiresKey } from './provider.js';
 import { readAgents, findAgent } from './agents.js';
 import { dirtyFiles, isRepo, git } from './session.js';
@@ -13,9 +16,9 @@ import { promptMode } from './generate.js';
 import { newAgent, newGuard, checkAll, printCheck, pathsFor, DEV_HELP } from './dev.js';
 import { smokeTest, printSmoke } from './smoke.js';
 import { printTree } from './tree.js';
-import { writeKey, ensureIgnored } from './env.js';
+import { writeKey, ensureIgnored, nextKeyEnv } from './env.js';
 import { showLimits, suggestedCap, probeModel, DEFAULT_CAP } from './limits.js';
-import { listModels } from './providers.js';
+import { listModels, providerFor } from './providers.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -49,8 +52,8 @@ const HELP = `
   ${c.c('@name <task>')}     give it to one agent
 
   ${c.b('Setup')}
-  ${c.c('/key')}             add or change an API key
-  ${c.c('/models')}          switch model
+  ${c.c('/key')}             add an API key (as many as you like), or change one
+  ${c.c('/models')}          switch model, or put one agent on another key
   ${c.c('/limits')}          rate limits, and how many tokens each agent may use
   ${c.c('/agents')}          installed agents
   ${c.c('/tree')}            where every file is
@@ -278,12 +281,29 @@ async function command(line, ctx) {
       const conn = await obtainKey(prompter, { fetchImpl: ctx.fetchImpl });
       if (!conn) return null;
       const manifest = readManifest(join(dir, 'agent.yaml'));
+      const saved = savedConnections(manifest);
+
+      // A second key for a provider already saved: replace it, or keep both.
+      // Writing it over the first without asking silently moves every agent on
+      // that key to a different account.
+      const existing = saved.find((k) => k.provider === conn.provider);
+      if (conn.key && existing && process.env[existing.keyEnv] && process.env[existing.keyEnv] !== conn.key) {
+        const label = providerLabel(conn.provider);
+        const how = await prompter.choose(`You already have a ${label} key (${existing.keyEnv}).`, [
+          { value: 'replace', label: 'Replace it', note: 'everything using it moves to this key' },
+          { value: 'add', label: 'Keep both', note: `keys from the same ${label} account share one limit` },
+        ]);
+        if (how === null) return null;
+        conn.keyEnv = how === 'add' ? nextKeyEnv(conn.keyEnv, saved.map((k) => k.keyEnv)) : existing.keyEnv;
+      }
+
       if (conn.key) {
         ensureIgnored(root);
         writeKey(conn.keyEnv, conn.key);
         process.env[conn.keyEnv] = conn.key;
         ok(`Saved as ${c.c(conn.keyEnv)} in .gitagent/.env`);
       }
+      addSavedKey({ provider: conn.provider, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl }, join(dir, 'agent.yaml'));
       if (conn.provider !== manifest.provider
         && await prompter.confirm(`Switch your agents to ${conn.provider}?`, true)) {
         const model = await pickModel(prompter, conn);
@@ -297,6 +317,26 @@ async function command(line, ctx) {
 
     case 'models': case 'model': {
       const manifest = readManifest(join(dir, 'agent.yaml'));
+      console.log();
+      for (const a of readAgents(dir)) {
+        const m = modelFor(manifest, a.name);
+        info(`${c.c(a.name.padEnd(16))}${m.model}  ${c.d(`${m.provider} · ${m.keyEnv}`)}`);
+      }
+      console.log();
+
+      // "Nothing" is the default, so a look at the list is not a change.
+      const what = await prompter.choose('Change what?', [
+        { value: 'default', label: 'The default model', note: 'every agent without its own' },
+        { value: 'agent', label: 'One agent’s model or key', note: 'e.g. a stronger model on another provider' },
+        { value: 'none', label: 'Nothing' },
+      ], { default: 2 });
+
+      if (what === 'agent') {
+        await assignAgent({ dir, root, prompter, fetchImpl: ctx.fetchImpl });
+        return null;
+      }
+      if (what !== 'default') return null;
+
       let models = ctx.models;
       if (!models?.length) {
         try {
@@ -308,13 +348,6 @@ async function command(line, ctx) {
           return null;
         }
       }
-      console.log();
-      for (const a of readAgents(dir)) {
-        const m = modelFor(manifest, a.name);
-        info(`${c.c(a.name.padEnd(16))}${m.model}  ${c.d(m.provider)}`);
-      }
-      console.log();
-      if (!(await prompter.confirm('Switch the default model?', false))) return { models };
       const swapped = await switchModel({ dir, prompter, fetchImpl: ctx.fetchImpl, models });
       return { models: swapped?.models ?? models };
     }
@@ -457,6 +490,85 @@ async function command(line, ctx) {
       warn(`Unknown command /${cmd}. Try /help.`);
       return null;
   }
+}
+
+const providerLabel = (id) => providerFor(id)?.label ?? id;
+
+/**
+ * Put one agent on a provider, model and key the person chooses.
+ *
+ * Saved keys are offered first, so a key added once is never pasted again. A
+ * new key is last — the one option always present — so the saved ones above
+ * it keep their numbers from one run to the next. The chosen model gets the
+ * same check setup gives: can it call a tool, and what does its key allow per
+ * minute, which is recorded on the agent so it is fitted against its own
+ * provider rather than the default's.
+ */
+async function assignAgent({ dir, root, prompter, fetchImpl }) {
+  const manifest = readManifest(join(dir, 'agent.yaml'));
+  const agents = readAgents(dir);
+  if (!agents.length) { warn('No agents yet.'); return; }
+
+  const name = await prompter.choose('Which agent?', agents.map((a) => {
+    const m = modelFor(manifest, a.name);
+    return { value: a.name, label: a.name, note: `${m.model} on ${providerLabel(m.provider)}` };
+  }));
+  if (!name) return;
+
+  const saved = savedConnections(manifest);
+  const pick = await prompter.choose(`Which key should ${name} use?`, [
+    ...saved.map((k) => ({
+      value: k.keyEnv,
+      label: providerLabel(k.provider),
+      note: [k.keyEnv, k.isDefault ? 'the default' : '', requiresKey(k) && !process.env[k.keyEnv] ? 'not set' : '']
+        .filter(Boolean).join(' · '),
+    })),
+    { value: '__new', label: 'A new key', note: 'paste one now' },
+  ]);
+  if (!pick) return;
+
+  let conn;
+  if (pick === '__new') {
+    conn = await obtainKey(prompter, { fetchImpl });
+    if (!conn) return;
+    const same = saved.find((k) => conn.key && process.env[k.keyEnv] === conn.key);
+    conn.keyEnv = same ? same.keyEnv : nextKeyEnv(conn.keyEnv, saved.map((k) => k.keyEnv));
+    if (conn.key && !same) {
+      ensureIgnored(root);
+      writeKey(conn.keyEnv, conn.key);
+      process.env[conn.keyEnv] = conn.key;
+    }
+    addSavedKey({ provider: conn.provider, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl }, join(dir, 'agent.yaml'));
+  } else {
+    conn = { ...saved.find((k) => k.keyEnv === pick) };
+    if (requiresKey(conn) && !process.env[conn.keyEnv]) {
+      warn(`${conn.keyEnv} is not set. Add it with /key first.`);
+      return;
+    }
+    try {
+      conn.models = await listModels(conn.provider, process.env[conn.keyEnv] ?? '', { baseUrl: conn.baseUrl, fetchImpl });
+    } catch (e) {
+      warn(e.message);
+      conn.models = [];
+    }
+  }
+
+  const model = await pickModel(prompter, { models: conn.models, provider: conn.provider });
+  if (!model) return;
+
+  const check = await probeModel({
+    provider: conn.provider, model, key: process.env[conn.keyEnv] ?? '', baseUrl: conn.baseUrl, fetchImpl,
+  });
+  if (!(await keepModel(prompter, model, check))) return;
+  const perMinute = check.limits?.rows?.find((r) => r.key === 'tokens')?.limit
+    ?? check.limits?.rows?.find((r) => r.key === 'input')?.limit
+    ?? null;
+
+  setTierConnection(name, {
+    provider: conn.provider, model, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl, tokensPerMinute: perMinute,
+  }, join(dir, 'agent.yaml'));
+  ok(`${c.c(name)} now runs ${c.c(model)} on ${providerLabel(conn.provider)}`);
+  if (perMinute) info(c.d(`  its key allows ${perMinute.toLocaleString()} tokens a minute, on its own account`));
 }
 
 /** Key variables a run would actually need and cannot find. */

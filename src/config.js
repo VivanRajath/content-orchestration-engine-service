@@ -337,6 +337,12 @@ export function readManifest(file = manifestPath()) {
     // Absent until a pack is installed; `pull` reads it to know where to go
     // back to, and readManifest is the one reader of this file.
     source:   doc.source ?? null,
+    // Keys someone has added, by provider and variable name. See savedConnections().
+    keys:     Array.isArray(doc.keys)
+      ? doc.keys
+        .filter((k) => k && typeof k === 'object' && k.provider && k.api_key_env)
+        .map((k) => ({ provider: String(k.provider), keyEnv: String(k.api_key_env), baseUrl: nil(k.base_url) }))
+      : [],
     // Per-tier model overrides. Empty for the common case of one model.
     tiers:    doc.tiers && typeof doc.tiers === 'object' && !Array.isArray(doc.tiers) ? doc.tiers : {},
     raw:      doc,
@@ -384,14 +390,75 @@ export function modelFor(manifest, tier) {
   };
 }
 
-/** Every env var name the manifest references, base and per-tier. */
+/** Every env var name the manifest references: base, per-tier, and saved keys. */
 export function keyEnvs(manifest) {
   const names = new Set();
   if (manifest.keyEnv) names.add(manifest.keyEnv);
   for (const spec of Object.values(manifest.tiers ?? {})) {
     if (spec?.model?.api_key_env) names.add(String(spec.model.api_key_env));
   }
+  for (const k of manifest.keys ?? []) names.add(k.keyEnv);
   return [...names];
+}
+
+/**
+ * Every key this repo can use, the default model's first.
+ *
+ * `keys:` in agent.yaml is the list of connections someone has added, by
+ * provider and variable name — never a value, which lives in `.gitagent/.env`.
+ * It exists so a second provider's key, added once, can be offered wherever a
+ * model is chosen instead of being pasted again. It is also, deliberately, the
+ * one place that answers "which providers can my code be sent to from here".
+ */
+export function savedConnections(manifest) {
+  const out = [];
+  const seen = new Set();
+  const add = (conn, isDefault) => {
+    if (!conn?.provider || !conn?.keyEnv || seen.has(conn.keyEnv)) return;
+    seen.add(conn.keyEnv);
+    out.push({ provider: conn.provider, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl ?? null, isDefault });
+  };
+  add({ provider: manifest.provider, keyEnv: manifest.keyEnv, baseUrl: manifest.baseUrl }, true);
+  for (const k of manifest.keys ?? []) add(k, false);
+  return out;
+}
+
+/** Record a key someone added. Returns false when it was already listed. */
+export function addSavedKey({ provider, keyEnv, baseUrl = null }, file = manifestPath()) {
+  const current = readManifest(file).keys;
+  if (current.some((k) => k.keyEnv === keyEnv)) return false;
+
+  const all = [...current, { provider, keyEnv, baseUrl }];
+  const body = [
+    '# Keys added here, by provider. Only the variable names are kept in this',
+    '# file; the values live in .gitagent/.env, which is never committed.',
+    ...all.flatMap((k) => [
+      `- provider: ${k.provider}`,
+      `  api_key_env: ${k.keyEnv}`,
+      ...(k.baseUrl ? [`  base_url: ${k.baseUrl}`] : []),
+    ]),
+  ].join('\n');
+  writeFileSync(file, upsertSection(readFileSync(file, 'utf8'), 'keys', body));
+  return true;
+}
+
+/**
+ * Point one agent at a provider, model and key, leaving every other agent and
+ * every comment in the file where it was.
+ *
+ * base_url is cleared when the new connection has none: an agent moved from a
+ * local server to a hosted provider must not keep sending to localhost.
+ */
+export function setTierConnection(agent, { provider, model, keyEnv, baseUrl = null, tokensPerMinute = null }, file = manifestPath()) {
+  let text = readFileSync(file, 'utf8');
+  for (const [k, v] of [['provider', provider], ['name', model], ['api_key_env', keyEnv]]) {
+    text = patchTierModel(text, agent, k, v).text;
+  }
+  text = patchTierModel(text, agent, 'base_url', baseUrl ?? null).text;
+  // Each provider has its own per-minute allowance. An agent moved to another
+  // one is fitted against that provider's number, not the default's.
+  text = patchTierModel(text, agent, 'tokens_per_minute', tokensPerMinute ?? null).text;
+  writeFileSync(file, text);
 }
 
 export async function config(positional, _flags) {
