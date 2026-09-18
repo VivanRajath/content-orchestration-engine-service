@@ -16,7 +16,10 @@ import { promptMode } from './generate.js';
 import { newAgent, newGuard, checkAll, printCheck, pathsFor, DEV_HELP } from './dev.js';
 import { smokeTest, printSmoke } from './smoke.js';
 import { printTree } from './tree.js';
-import { writeKey, ensureIgnored, nextKeyEnv } from './env.js';
+import {
+  writeKey, ensureIgnored, nextKeyEnv, reloadEnv, discoverKeys,
+  misplacedKeys, moveMisplacedKey, keySource, fingerprint,
+} from './env.js';
 import { showLimits, suggestedCap, probeModel, DEFAULT_CAP } from './limits.js';
 import { listModels, providerFor } from './providers.js';
 import { c, ok, info, warn } from './util.js';
@@ -52,6 +55,7 @@ const HELP = `
   ${c.c('@name <task>')}     give it to one agent
 
   ${c.b('Setup')}
+  ${c.c('/keys')}            your API keys: which are set, where, and which agents use them
   ${c.c('/key')}             add an API key (as many as you like), or change one
   ${c.c('/models')}          switch model, or put one agent on another key
   ${c.c('/limits')}          rate limits, and how many tokens each agent may use
@@ -85,6 +89,11 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
     // This used to special-case the name OLLAMA_API_KEY, so a local
     // OpenAI-compatible server — which authenticates nothing — looked unset on
     // every launch and sent the user back through onboarding.
+    // Checked before deciding whether setup is needed: a key pasted into
+    // agent.yaml makes the variable it names look unset, and would send the
+    // person back through onboarding instead of telling them what happened.
+    if (interactive && existsSync(join(dir, 'agent.yaml'))) await rescueMisplacedKeys({ dir, root, prompter });
+
     const needsSetup = !existsSync(join(dir, 'agent.yaml')) || missingKeys(dir).length > 0;
 
     if (needsSetup) {
@@ -123,6 +132,11 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
       if (line === null) break;                       // ctrl-d, or a script ran out
       const input = line.trim();
       if (!input) continue;
+
+      // Someone may have edited .gitagent/.env since the last message —
+      // switched to the folder in /dev, pasted a key, come back. Pick it up now
+      // rather than at the next restart.
+      refreshKeys(dir);
 
       if (input.startsWith('/')) {
         const outcome = await command(input, { mode, prompter, call, fetchImpl, models, root, dir });
@@ -277,6 +291,10 @@ async function command(line, ctx) {
     }
 
     // --- setup --------------------------------------------------------------
+    case 'keys':
+      showKeys(dir);
+      return null;
+
     case 'key': {
       const conn = await obtainKey(prompter, { fetchImpl: ctx.fetchImpl });
       if (!conn) return null;
@@ -569,6 +587,74 @@ async function assignAgent({ dir, root, prompter, fetchImpl }) {
   }, join(dir, 'agent.yaml'));
   ok(`${c.c(name)} now runs ${c.c(model)} on ${providerLabel(conn.provider)}`);
   if (perMinute) info(c.d(`  its key allows ${perMinute.toLocaleString()} tokens a minute, on its own account`));
+}
+
+/** Read .gitagent/.env again, and say what changed. */
+function refreshKeys(dir) {
+  const changed = reloadEnv(dir);
+  const found = discoverKeys(dir);
+  if (changed.length) info(c.d(`  .gitagent/.env changed — now using ${changed.join(', ')}`));
+  for (const f of found) {
+    info(c.d(`  found ${f.name} (${providerLabel(f.provider)}) in .gitagent/.env — put an agent on it with /models`));
+  }
+}
+
+/**
+ * Every key this repo knows about, and what is true of each.
+ *
+ * Masked to four characters and a length, the same as everywhere else. The
+ * point is to answer "is it set, where from, and who uses it" — and where the
+ * file is, as a full path, so it can be opened and edited straight away.
+ */
+function showKeys(dir) {
+  const manifest = readManifest(join(dir, 'agent.yaml'));
+  const agents = readAgents(dir);
+  const file = join(dir, '.env');
+
+  console.log();
+  console.log(`  ${c.b('API keys')}  ${c.d(file)}`);
+  const rows = savedConnections(manifest);
+  if (!rows.length) info(c.d('  none yet'));
+  for (const k of rows) {
+    const value = process.env[k.keyEnv];
+    const users = agents.filter((a) => modelFor(manifest, a.name).keyEnv === k.keyEnv).map((a) => a.name);
+    const state = !requiresKey(k)
+      ? c.d('no key needed')
+      : value ? `${fingerprint(value)} ${c.d(`from ${keySource(k.keyEnv) ?? 'your environment'}`)}` : c.y('not set');
+    const used = users.length ? users.join(', ') : c.d('no agent uses it');
+    info(`  ${c.c(k.keyEnv.padEnd(20))}${providerLabel(k.provider).padEnd(12)}${state}`);
+    info(`  ${' '.repeat(20)}${c.d(k.isDefault ? 'default · ' : '')}${used}`);
+  }
+  console.log();
+  info(c.d('Add one with /key, or open the file above and add a line NAME=value.'));
+  info(c.d('It is picked up on your next message. Put an agent on a key with /models.'));
+  console.log();
+}
+
+/**
+ * A key pasted into agent.yaml, where only the NAME of its variable belongs.
+ *
+ * agent.yaml is committed; the key would go to the remote with the next push.
+ * Offered, not done silently — it is their file — but offered first thing,
+ * before anything else reads the manifest.
+ */
+async function rescueMisplacedKeys({ dir, root, prompter }) {
+  let manifest;
+  try { manifest = readManifest(join(dir, 'agent.yaml')); } catch { return; }
+  for (const entry of misplacedKeys(manifest)) {
+    console.log();
+    warn(`agent.yaml has an API key in ${entry.where}, where the NAME of a variable belongs.`);
+    info(c.d('  agent.yaml is committed with your code. Keys go in .gitagent/.env, which is not.'));
+    if (!(await prompter.confirm('Move it to .gitagent/.env now?', true))) continue;
+
+    const name = moveMisplacedKey(entry, dir, root);
+    ok(`Moved — agent.yaml now says ${c.c(`api_key_env: ${name}`)}, and the key is in .gitagent/.env`);
+    const committed = isRepo(root) && (git(['show', 'HEAD:.gitagent/agent.yaml'], { root, check: false }) ?? '').includes(entry.value);
+    if (committed) {
+      warn('That key was already committed, so it is in your git history.');
+      info(c.d('  Revoke it with the provider and make a new one — moving it cannot take it back out of history.'));
+    }
+  }
 }
 
 /** Key variables a run would actually need and cannot find. */

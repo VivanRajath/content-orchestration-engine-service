@@ -278,6 +278,7 @@ flags never do, so `run --dry-run "task"` keeps the task.
 | `<task>` | The classifier picks an agent |
 | `@name <task>` | Give the task to one agent |
 | `/chat` · `/prompt` · `/dev` | Switch mode |
+| `/keys` | Every API key: masked, where it's set, which agents use it, and the file to edit |
 | `/key` | Add an API key (as many as you like) or change one; offers to switch provider |
 | `/models` | Show each agent's model and key; switch the default, or put one agent on another key |
 | `/limits` | Provider rate limits, each agent's reply cap, and set them |
@@ -331,6 +332,33 @@ to from this repo.
 **Rate limits belong to the account, not the key.** Several keys from one Groq
 account share one allowance, so they don't reduce waits. Keys from *different*
 providers do: each agent on its own provider gets that provider's limit.
+
+### Editing keys by hand
+
+Whichever mode you work in — `/prompt`, `/dev`, or straight in your editor —
+keys live in one file: **`.gitagent/.env`**, one per line as `NAME=value`.
+
+```
+# .gitagent/.env
+GROQ_API_KEY=gsk_...
+GROQ_API_KEY_2=gsk_...          # a second key for the same provider
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Setup creates it with a placeholder line for every provider, so there is
+always somewhere to paste. The chat re-reads it before every message: add or
+change a key in your editor and it's used on your next message, no restart.
+A key under a new name is picked up and offered in `/models` and `/prompt`.
+Saving a key from the chat edits only its own line and keeps your comments.
+
+**`/keys`** shows every key — masked, where it came from, and which agents use
+it — along with the file's full path, ready to open.
+
+Put the *key* in `.gitagent/.env`, never in `agent.yaml`: that file is
+committed, and `api_key_env` there holds a variable **name**. If a key is
+pasted into `agent.yaml` anyway, the chat notices when it starts and offers to
+move it — and says so if it was already committed, because then it has to be
+revoked.
 
 **Where your key lives.** `agent.yaml` stores the *name* of an environment
 variable, never the key itself. The key goes in `.gitagent/.env`, and jr-arch
