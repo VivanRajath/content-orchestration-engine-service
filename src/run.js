@@ -1,15 +1,20 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
-import { readManifest, modelFor } from './config.js';
+import { readManifest, modelFor, setTokensPerMinute } from './config.js';
 import { loadHooks, checkCommit } from './hooks.js';
-import { callModel, extractJson } from './provider.js';
-import { classify } from './classify.js';
+import { callModel, extractJson, isFatalProviderError } from './provider.js';
+import { classify, selectSwarm } from './classify.js';
+import {
+  budgetFor, fit, estimateRequest, describeBudget, formatTokens, readCeiling,
+  liveRemaining, msUntilRefill, fitDuties,
+} from './budget.js';
 import { verify } from './verify.js';
 import { TOOLS, dispatch } from './tools.js';
 import {
   openSession, openAttempt, closeAttempt, closeSession, commitAttempt,
   revertAttempt, dirtyFiles, isRepo, listSessions, readSession, resumeBrief, git,
+  attemptPaths, headSha,
   record as sessionRecord,
 } from './session.js';
 import { newLedger, reconcile, compile, REPORT_SYSTEM, reportPrompt } from './context.js';
@@ -32,7 +37,7 @@ const DEFAULT_MAX_STEPS = 40;
 /** Consecutive tool-free replies before an attempt is declared stalled. */
 const IDLE_LIMIT = 3;
 
-export async function run(positional, flags, { call = callModel, prompter = null } = {}) {
+export async function run(positional, flags, { call = callModel, prompter = null, build: knownBuild = null } = {}) {
   const root = repoRoot();
   const dir = agentDir();
   const task = (positional ?? []).join(' ').trim() || (typeof flags.task === 'string' ? flags.task : '');
@@ -65,21 +70,36 @@ export async function run(positional, flags, { call = callModel, prompter = null
   const tiers = agents.map((a) => a.name);
   const maxSteps = manifest.raw?.routing?.max_steps ?? DEFAULT_MAX_STEPS;
 
-  // Failed attempts are reverted with `git reset --hard`. Refusing to start on
-  // a dirty tree is what makes that safe: the only work it can ever destroy is
-  // the agent's own. This guard is the precondition for revertAttempt, not a
-  // convenience — do not weaken it without removing that.
+  // Both halves of the safety net are git: the session branch that makes a run
+  // reviewable, and the per-file revert that undoes a failed attempt. Neither
+  // exists without a commit to work from — `openSession` cannot branch off
+  // nothing, and `revertAttempt` has no sha to restore to, so it returns
+  // silently and the failed attempt's files stay. That state used to be entered
+  // without a word, and the chat reaches it by default because it passes
+  // --allow-dirty.
+  requireGit(root, flags);
+
+  // Refusing to start on a dirty tree is what makes the revert safe: the only
+  // work it can ever destroy is the agent's own. This guard is the precondition
+  // for revertAttempt, not a convenience.
   const dirty = isRepo(root) ? dirtyFiles(root) : [];
   if (dirty.length && !flags['allow-dirty']) {
     throw new Error(
       `The working tree has ${dirty.length} uncommitted change(s).\n` +
       `  ${dirty.slice(0, 5).join('\n  ')}${dirty.length > 5 ? `\n  … and ${dirty.length - 5} more` : ''}\n\n` +
-      '  Failed attempts are rolled back with git reset --hard, which would destroy them.\n' +
+      '  A failed attempt is rolled back through git, which would destroy them.\n' +
       '  Commit or stash first, or pass --allow-dirty to accept that risk.',
     );
   }
 
-  const build = flags['skip-verify'] ? { green: null, output: '', label: null } : verify({ root });
+  // The chat hands back the build state from the end of the previous turn,
+  // which it has just verified. Without it every message paid for the project's
+  // whole test suite twice: once to decide routing, once to check the result.
+  // The post-task verify is still run for real — that is the one that gates a
+  // commit, and it is never taken from a cache.
+  const build = flags['skip-verify']
+    ? { green: null, output: '', label: null }
+    : (knownBuild ?? verify({ root }));
   // Chat repeats this loop once per message, so the standing facts — model,
   // agent list, build state — are banner material for a one-off `run` and
   // noise in a conversation that already showed them at startup.
@@ -113,6 +133,28 @@ export async function run(positional, flags, { call = callModel, prompter = null
     info(`agent      ${c.c(entry.tier)}  ${c.d(`(${entry.source}, confidence ${entry.confidence})`)}`);
     info(`why        ${entry.reason}`);
     console.log();
+  }
+
+  const budget = budgetFor(manifest);
+  const entryAgent = findAgent(entry.tier, agents);
+  if (entryAgent) {
+    const preflight = fit({
+      system: prompt({ dir, agents, budget, manifest }, entryAgent),
+      messages: [{ role: 'user', content: brief }],
+      tools: TOOLS,
+      maxTokens: modelFor(manifest, entry.tier).maxTokens,
+      budget,
+      manifest,
+    });
+    // The cost of a step, before the first one. On a small key this is the
+    // difference between "about 3 steps a minute" and a 429 twenty seconds in.
+    info(c.d(`  ${describeBudget(preflight)}`));
+    if (!preflight.fits) {
+      warn(`This will not fit: ${preflight.reason}`);
+      info('Pick a model with a higher limit (/models), or put this agent on another key.');
+      info(c.d('  jr-arch limits   shows what this key allows'));
+      return { status: 'stopped', tier: entry.tier, reason: preflight.reason, fatal: 'budget' };
+    }
   }
 
   if (flags['dry-run']) {
@@ -151,6 +193,12 @@ export async function run(positional, flags, { call = callModel, prompter = null
     prompter,
     askLock: { tail: Promise.resolve() },
     contextBudget: manifest.raw?.routing?.context_budget ?? 6000,
+    // What one request to this key may cost, from the rate-limit headers the
+    // provider gave us at setup. null when unknown, and then nothing is fitted.
+    budget: budgetFor(manifest),
+    // A lower limit the provider named mid-run. Shared by every attempt in
+    // the run (an object, so the per-attempt spread keeps one copy).
+    learned: { budget: null },
     // Canonical execution state, owned by the loop and never by a tier. This
     // is what makes a handoff survive a change of model.
     ledger: prior ? priorLedger(prior, subject) : newLedger(subject),
@@ -160,17 +208,35 @@ export async function run(positional, flags, { call = callModel, prompter = null
     // A swarm is opt-in. Fanning out by default would multiply a user's token
     // bill the first time they installed two scoped agents, without them ever
     // asking for it.
-    const group = flags.swarm && !named ? swarmFor(ctx, { files: repoFiles(root) }) : null;
+    const group = flags.swarm && !named
+      ? await swarmFor(ctx, { task: subject, files: repoFiles(root) })
+      : null;
     if (group) {
       const result = await swarm(ctx, group, { task: subject, brief });
+      // The same gate the ladder applies: a red build goes to whoever repairs
+      // builds, and only then is anything committed. Without this a swarm
+      // committed over a red build — every frame was closed with no verify
+      // result, and "unknown" only warns.
+      let build = result.build;
+      if (build.green === false && result.done.length) {
+        const repaired = await callBuildDoctor(ctx, result.done[0].frame, build);
+        build = repaired.build;
+      }
+      for (const d of result.done) d.frame.verify = build;
+
       const outcome = result.done.length
         ? {
-            status: result.failed.length ? 'partial' : 'done',
+            status: result.failed.length || build.green === false ? 'partial' : 'done',
             tier: result.done.map((d) => d.agent.name).join(', '),
             summary: result.done.map((d) => `${d.agent.name}: ${d.result.summary}`).join('; '),
-            build: result.build,
+            build,
           }
-        : { status: 'stopped', reason: 'every agent in the swarm failed', detail: result.failed[0]?.result?.reason };
+        : {
+            status: 'stopped',
+            reason: 'every agent in the swarm failed',
+            detail: result.failed[0]?.result?.reason,
+            fatal: result.failed.find((f) => f.result.fatal)?.result.fatal ?? null,
+          };
       if (outcome.status !== 'stopped') {
         for (const d of result.done) commit(ctx, d.frame, d.result.summary);
       }
@@ -224,6 +290,14 @@ export async function ladder(ctx, { tier, task, brief: initial = null }) {
     );
     const frame = openAttempt(ctx.session, { tier: current, task: brief, reason, owns: agentOf(ctx, current).owns });
     const result = await attempt({ ...ctx, tierModel }, frame, brief);
+
+    if (result.kind === 'fatal') {
+      // No handoff report and no escalation: the report is another call to the
+      // provider that just refused, and the next agent would use the same one.
+      closeAttempt(ctx.session, frame, { status: 'failed', reason: result.reason });
+      revertAttempt(ctx.session, frame);
+      return { status: 'stopped', tier: current, reason: result.reason, fatal: result.fatal };
+    }
 
     if (result.kind === 'done') {
       const check = await verifyAndGate(ctx);
@@ -350,7 +424,11 @@ export async function swarm(ctx, group, { task, brief }) {
     } else {
       await gitLock(ctx, async () => {
         closeAttempt(ctx.session, frame, { status: result.kind, reason: result.reason });
-        await record(ctx, { frame, tierModel, status: result.kind, reason: result.reason, result });
+        // Same rule as the ladder: do not ask a provider that just refused for
+        // a handoff report.
+        if (result.kind !== 'fatal') {
+          await record(ctx, { frame, tierModel, status: result.kind, reason: result.reason, result });
+        }
         // Only this agent's files. Its siblings succeeded on paths it never
         // owned, and a whole-tree reset would throw their work away too.
         revertAttempt(ctx.session, frame);
@@ -382,12 +460,26 @@ function agentOf(ctx, name) {
   return findAgent(name, ctx.agents) ?? { name, dir: join(ctx.dir, 'agents', name), owns: [], role: '' };
 }
 
-/** The agents a task should fan out to, or null when it is one agent's job. */
-export function swarmFor(ctx, { files = [] } = {}) {
+/**
+ * The agents a task should fan out to, or null when it is one agent's job.
+ *
+ * Selection is about the TASK. The file-ownership pass below is only a
+ * fallback, because on its own it answers a different question — "does this
+ * agent own anything in this repo" — and so fanned out to agents the task never
+ * touched, at one model call each.
+ */
+export async function swarmFor(ctx, { task = '', files = [] } = {}) {
   const groups = swarmable(ctx.agents).filter((g) => g.length > 1);
   if (!groups.length) return null;
-  // Fan out only when the work actually spans more than one agent's scope.
   const group = groups[0];
+
+  const picked = await selectSwarm({ task, agents: group, manifest: ctx.manifest, call: ctx.call });
+  if (picked) {
+    const chosen = group.filter((a) => picked.includes(a.name));
+    // One agent named is a real answer: it means this is not swarm work.
+    return chosen.length > 1 ? chosen : null;
+  }
+
   const { claims } = partition(group, files);
   const busy = group.filter((a) => (claims.get(a.name) ?? []).length);
   return busy.length > 1 ? busy : null;
@@ -398,9 +490,18 @@ export function swarmFor(ctx, { files = [] } = {}) {
 // ---------------------------------------------------------------------------
 
 async function attempt(ctx, frame, brief) {
+  // A limit learned from an earlier attempt's refusal holds for this one too.
+  if (ctx.learned?.budget) ctx.budget = Math.min(ctx.budget ?? Infinity, ctx.learned.budget);
   const messages = [{ role: 'user', content: brief }];
   const system = prompt(ctx, ctx.agent ?? findAgent(frame.tier, ctx.agents) ?? { name: frame.tier, dir: join(ctx.dir, 'agents', frame.tier), owns: [] });
-  const toolCtx = { ...ctx, tier: frame.tier, touched: new Set() };
+  const toolCtx = {
+    ...ctx,
+    tier: frame.tier,
+    touched: new Set(),
+    // A file bigger than the key's per-request allowance cannot be read whole
+    // by anyone, so the tool truncates rather than guaranteeing a refusal.
+    readCeiling: readCeiling(ctx.budget, ctx.tierModel ?? ctx.manifest),
+  };
   // Checkpoints are asked by tools.js BEFORE the write or command, through this.
   // A "no" is remembered for the attempt, so a model retrying the same thing
   // gets the same answer instead of asking the human again and again.
@@ -413,6 +514,16 @@ async function attempt(ctx, frame, brief) {
     return yes;
   };
   let idle = 0;
+  // A reply cut off because its cap was lowered to fit is sent again, once,
+  // with the room it ran out of.
+  let regrow = null;
+  let regrowUsed = false;
+  let refills = 0;
+  // A lower limit named by the provider is learned once per attempt.
+  let relearned = false;
+  // Reads and commands already run in this attempt, to notice a loop.
+  const seen = new Map();
+  let repeats = 0;
   // commit() gates on the files this attempt actually wrote, so the set has to
   // live on the frame, not only in the tool context that closes over it.
   frame.touched = toolCtx.touched;
@@ -420,21 +531,110 @@ async function attempt(ctx, frame, brief) {
   while (frame.steps < ctx.maxSteps) {
     frame.steps++;
 
+    // Fit before sending, not after being refused — and fit to what is left
+    // of this minute, not to a fresh one. Each step resends the conversation,
+    // so steps that each fit the limit can still spend it twice over; the
+    // provider reports what remains on every response, and that is the budget
+    // the next request actually has. The reply cap gives way first; only then
+    // does the oldest tool output go, which is where the weight actually is.
+    const model = ctx.tierModel ?? ctx.manifest;
+    const left = liveRemaining(model);
+    const budget = ctx.budget && left != null ? Math.min(ctx.budget, Math.floor(left * 0.95)) : ctx.budget;
+    const room = fit({
+      system, messages, tools: TOOLS,
+      maxTokens: model.maxTokens,
+      budget,
+      manifest: model,
+      ...(regrow ? { minOutput: regrow } : {}),
+    });
+    for (const t of room.trimmed) {
+      warn(`dropped ${formatTokens(t.tokens)} tokens of earlier ${t.name} output to fit this key’s limit`);
+    }
+    if (!room.fits) {
+      // Nothing useful fits in what is left of the minute. Sending anyway buys
+      // a refusal and a blind backoff; the provider has already said when the
+      // minute refills, so wait exactly that, once, and go on. Only a step
+      // that would not fit even a fresh minute is a real dead end.
+      const wait = budget !== ctx.budget ? msUntilRefill(model) : null;
+      // A retry asked for more room than even a fresh minute holds. Send it
+      // with the most room there is instead — giving up would throw away a
+      // step that fits, just not as generously as hoped.
+      if (regrow && wait == null) {
+        regrow = null;
+        frame.steps--;
+        continue;
+      }
+      if (wait != null && refills < 3) {
+        refills++;
+        info(c.d(`  … this key’s minute is spent — waiting ${Math.max(1, Math.ceil(wait / 1000))}s for it to refill`));
+        if (!ctx.refillHintShown) {
+          info(c.d('    a model or key with a higher per-minute limit avoids these waits (/models)'));
+          ctx.refillHintShown = true;
+        }
+        await sleep(wait + 250);
+        frame.steps--;
+        continue;
+      }
+      return { kind: 'fatal', reason: `this step does not fit the key's budget — ${room.reason}`, fatal: 'budget' };
+    }
+    refills = 0;
+
     let reply;
     const stream = ctx.stream ? streamWriter() : null;
     try {
       reply = await ctx.call(ctx.tierModel ?? ctx.manifest, {
         system, messages, tools: TOOLS,
+        ...(room.budget ? { maxTokens: room.maxTokens } : {}),
         ...(stream ? { onDelta: stream.write } : {}),
       });
     } catch (e) {
       stream?.end();
+      // A wrong key, or a model that cannot do this at all, is the same answer
+      // every time. Retrying it is the loop paying to be told twice.
+      if (isFatalProviderError(e)) return { kind: 'fatal', reason: e.message, fatal: e.kind };
+
+      // The provider named a lower limit than the one this step was fitted
+      // to — Groq counts input on its own (7,000) under the combined 8,000.
+      // Learn it, keep it for later runs, and fit this step again rather than
+      // failing it and starting the whole attempt over.
+      const named = e.kind === 'too-large' && Number(e.limit) > 0 ? Math.floor(e.limit * 0.9) : null;
+      if (named && ctx.budget && named < ctx.budget && !relearned) {
+        relearned = true;
+        ctx.budget = named;
+        ctx.learned.budget = named;
+        toolCtx.readCeiling = readCeiling(named, model);
+        const isDefault = model === ctx.manifest
+          || (model.provider === ctx.manifest.provider && model.model === ctx.manifest.model);
+        if (isDefault && (!ctx.manifest.tokensPerMinute || e.limit < ctx.manifest.tokensPerMinute)) {
+          try { setTokensPerMinute(e.limit); } catch { /* the run matters more than the note */ }
+        }
+        info(c.d(`  … ${model.model} allows ${Number(e.limit).toLocaleString()} tokens here — fitting every request under that from now on`));
+        frame.steps--;
+        continue;
+      }
       return { kind: 'failed', reason: `model call failed: ${e.message}` };
     }
     stream?.end();
 
     // Already shown live when streaming; printing it again would double it.
     if (!stream && reply.text?.trim()) info(c.d(`  ${truncate(reply.text.trim(), 300)}`));
+
+    // Cut off mid-call because the reply cap was lowered to fit. A half-written
+    // tool call fed back to the model wastes the step and confuses it; the
+    // answer is the same step again with the room it ran out of. Once per step
+    // — a model that fills any cap it is given is not going to stop at twice.
+    const cutOff = /^(length|max_tokens)$/.test(String(reply.stopReason ?? ''));
+    const broken = reply.toolCalls.some((call) => call.input?.__parseError !== undefined);
+    if (cutOff && (broken || !reply.toolCalls.length) && room.budget && !regrowUsed
+        && room.maxTokens < (model.maxTokens ?? room.maxTokens)) {
+      regrowUsed = true;
+      regrow = Math.min(model.maxTokens, room.maxTokens * 2);
+      info(c.d(`  … the reply was cut off at ${room.maxTokens} tokens — sending that step again with room for ${regrow}`));
+      frame.steps--;
+      continue;
+    }
+    regrow = null;
+    regrowUsed = false;
 
     if (!reply.toolCalls.length) {
       // No tool call and no done(). A capable model ends with done; one that
@@ -470,7 +670,40 @@ async function attempt(ctx, frame, brief) {
         results.push({ id: call.id, name: call.name, content: 'Skipped — the attempt already ended.', isError: true });
         continue;
       }
+
+      // Going round in circles. On a small key a large file never fits in view
+      // at once, older output is dropped to make room, and an agent that has
+      // not kept notes reads the same part again — and again. One reported run
+      // spent a day's allowance (200,000 tokens) re-reading one 11k-token file.
+      // Reading something twice can be legitimate after it was dropped; a
+      // third time, or a pattern of it, is a loop that will not end on its own.
+      // A write resets the count, because re-reading after a change is not a
+      // repeat — it is checking.
+      const key = REPEATABLE.has(call.name) ? callKey(call) : null;
+      if (key) {
+        const n = (seen.get(key) ?? 0) + 1;
+        seen.set(key, n);
+        if (n > 1) repeats++;
+        if (n > 2 || repeats > 4) {
+          return {
+            kind: 'fatal',
+            fatal: 'stuck',
+            reason:
+              `the agent kept re-running the same ${call.name === 'run_command' ? 'command' : 'read'} ` +
+              `(${repeats} repeats) — on this key it cannot hold everything at once, so it was going ` +
+              'round in circles. Stopped before it spent more of your allowance.',
+          };
+        }
+      }
+
       const out = await dispatch(call, toolCtx);
+      if (key && seen.get(key) === 2 && !out.isError) {
+        out.content +=
+          '\n\n[You already read this earlier in this task. Its output is dropped again as you ' +
+          'work, so say in a sentence what you need from it now — your own replies are kept, ' +
+          'tool output is not. Reading it a third time will stop the task.]';
+      }
+      if (call.name === 'write_file' && !out.isError) { seen.clear(); repeats = 0; }
       info(`  ${out.isError ? c.y('✗') : c.g('✓')} ${call.name}${describe(call)}`);
       results.push({ id: call.id, name: call.name, content: out.content, isError: out.isError });
       if (out.control) control = out.control;
@@ -534,7 +767,9 @@ async function callBuildDoctor(ctx, parent, build) {
 
 function commit(ctx, frame, summary) {
   if (ctx.manifest.raw?.git?.auto_commit === false) return;
-  const files = [...(frame.touched ?? [])];
+  // The same set commitAttempt will stage. Gating on frame.touched alone left
+  // anything a run_command wrote unscanned, while the commit took it anyway.
+  const files = attemptPaths(ctx.session, frame);
   const gate = checkCommit(files, frame.verify?.green ?? null, ctx.hooks, { root: ctx.root });
   if (!gate.allowed) {
     for (const b of gate.blocked) warn(`commit blocked by ${b.hook}: ${b.reason}`);
@@ -609,7 +844,9 @@ async function ask(ctx, cp) {
 function prompt(ctx, agent) {
   const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '');
   const { body: soul } = frontMatter(read(join(agent.dir, 'SOUL.md')));
-  const duties = read(join(ctx.dir, 'DUTIES.md'));
+  // Sent exactly as written unless the key is tight enough that its ~1,000
+  // tokens, resent on every step, are a real share of the minute.
+  const duties = fitDuties(read(join(ctx.dir, 'DUTIES.md')), ctx.budget, ctx.tierModel ?? ctx.manifest);
   const others = ctx.agents.filter((a) => a.name !== agent.name);
 
   return [
@@ -630,6 +867,15 @@ function prompt(ctx, agent) {
       '',
       'run_command takes argv as an array of separate strings and runs with no shell,',
       'so pipes, redirects, and && are literal arguments, not operators.',
+      ...(ctx.budget && ctx.budget < 16000 ? [
+        '',
+        // Mechanics, not identity: what this key physically allows per request.
+        `This key allows about ${formatTokens(ctx.budget)} tokens per request. A large file will not fit`,
+        'in view at once, and older tool output is dropped as you work — your own replies are kept.',
+        'So read a large file in parts (read_file with start_line), and after each part say in a',
+        'sentence or two what matters in it, or write it straight into the file you were asked to',
+        'create. Do not read everything first, and do not re-read a part you have already read.',
+      ] : []),
       '',
       'Guardrails are enforced by the harness, not by these instructions. If a call is',
       'blocked you will be told which hook stopped it and why — read the reason and',
@@ -773,6 +1019,44 @@ function priorLedger(prior, task) {
   return ledger;
 }
 
+/**
+ * Refuse to run where a failed attempt could not be undone.
+ *
+ * `--no-git` is the way to say you accept that, and it has to be typed: the
+ * cost of guessing wrong is the user's files, and "it seemed to work" is how
+ * someone finds out afterwards.
+ */
+function requireGit(root, flags) {
+  if (flags['no-git']) {
+    warn('Running without git: no session branch, and a failed attempt cannot be rolled back.');
+    return;
+  }
+
+  if (!isRepo(root)) {
+    // Coded, so the chat can offer to fix it instead of printing advice about a
+    // command-line flag nobody inside a chat can pass.
+    throw Object.assign(new Error([
+      `${root} is not a git repository.`,
+      '  Every run works on its own branch, and a failed attempt is undone with git.',
+      '  Neither is possible here, so a failed attempt would leave its edits behind.',
+      '',
+      '  Start one:   git init && git add -A && git commit -m "initial commit"',
+      '  Or accept the risk:  --no-git',
+    ].join(NEWLINE)), { code: 'NO_GIT_REPO' });
+  }
+
+  if (!headSha(root)) {
+    throw Object.assign(new Error([
+      'This repository has no commits yet.',
+      '  There is nothing to branch from and nothing to roll back to, so a failed',
+      '  attempt would leave its edits in your working tree.',
+      '',
+      '  Make the first commit:  git add -A && git commit -m "initial commit"',
+      '  Or accept the risk:     --no-git',
+    ].join(NEWLINE)), { code: 'NO_COMMITS' });
+  }
+}
+
 /** The current branch, if it is already one of our session branches. */
 function sessionBranchInUse(root, manifest) {
   if (!isRepo(root)) return null;
@@ -782,6 +1066,21 @@ function sessionBranchInUse(root, manifest) {
 }
 
 const NEWLINE = String.fromCharCode(10);
+
+/** Tools whose repetition, with nothing written in between, is a loop. */
+const REPEATABLE = new Set(['read_file', 'list_files', 'run_command']);
+
+/**
+ * What makes two calls "the same". A read is the same part of the same file,
+ * however many lines were asked for; a command is the same argv.
+ */
+function callKey(call) {
+  const input = call.input ?? {};
+  if (call.name === 'read_file') return `read:${input.path}:${input.start_line ?? 1}`;
+  if (call.name === 'list_files') return `list:${input.path ?? '.'}`;
+  return `run:${Array.isArray(input.command) ? input.command.join(String.fromCharCode(0)) : String(input.command)}`;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function streamWriter(indent = '    ') {
   let started = false;

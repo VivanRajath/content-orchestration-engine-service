@@ -24,14 +24,24 @@ import { record } from './session.js';
 const MAX_READ = 200000;
 const MAX_LIST = 400;
 const COMMAND_TIMEOUT = 120000;
+// execFileSync kills the child at one megabyte by default and reports it as a
+// SIGTERM, so a command that merely printed a lot looked to the agent like it
+// had been killed. See MAX_OUTPUT in verify.js.
+const COMMAND_MAX_OUTPUT = 64 * 1024 * 1024;
 
 export const TOOLS = [
   {
     name: 'read_file',
-    description: 'Read a file from the repository. Read before you write.',
+    description:
+      'Read a file from the repository. Read before you write. A large file is returned in parts: ' +
+      'use start_line to continue from where the last part ended.',
     input_schema: {
       type: 'object',
-      properties: { path: { type: 'string', description: 'Repo-relative path' } },
+      properties: {
+        path: { type: 'string', description: 'Repo-relative path' },
+        start_line: { type: 'integer', description: 'First line to return, counting from 1. Default 1.' },
+        line_count: { type: 'integer', description: 'How many lines to return. Default: as many as fit.' },
+      },
       required: ['path'],
     },
   },
@@ -153,7 +163,65 @@ const HANDLERS = {
     const buf = readFileSync(abs);
     if (buf.includes(0)) return err(`${rel.path} is a binary file.`);
     const text = buf.toString('utf8');
-    return ok(text.length > MAX_READ ? `${text.slice(0, MAX_READ)}\n\n… [truncated at ${MAX_READ} characters]` : text);
+
+    // The ceiling comes from what the key allows per request, not from a
+    // constant. It used to be 200,000 characters — around 50,000 tokens, more
+    // than an entire minute's allowance on a small plan, so reading one large
+    // file guaranteed that every later request in the attempt was refused.
+    const ceiling = ctx.readCeiling ?? MAX_READ;
+    const all = text.split('\n');
+    const total = all.length;
+
+    const start = Math.max(1, Math.floor(Number(input.start_line) || 1));
+    if (start > total) return err(`${rel.path} has ${total} lines; there is no line ${start}.`);
+    const wanted = Number(input.line_count) > 0 ? Math.floor(Number(input.line_count)) : total;
+    const asked = input.start_line !== undefined || input.line_count !== undefined;
+
+    // Whole lines, as many as fit under the ceiling. A part ends on a line
+    // boundary so the next one can begin exactly where it stopped.
+    const lines = [];
+    let size = 0;
+    let cutLine = false;
+    for (let i = start - 1; i < Math.min(total, start - 1 + wanted); i++) {
+      const cost = all[i].length + 1;
+      if (lines.length && size + cost > ceiling) break;
+      if (cost > ceiling) {
+        // One line longer than a whole request — a minified file, usually.
+        lines.push(all[i].slice(0, ceiling));
+        cutLine = true;
+        break;
+      }
+      lines.push(all[i]);
+      size += cost;
+    }
+    const end = start + lines.length - 1;
+
+    // The whole file, asked for plainly and fitting: returned exactly as it
+    // is. Not when a line was cut — a one-line minified file used to match
+    // this and come back in full, however large.
+    if (!asked && start === 1 && end === total && !cutLine) return ok(text);
+
+    if (cutLine) {
+      const long = all[end - 1].length;
+      return ok(
+        `[${rel.path} · line ${end} of ${total}, first ${ceiling} of ${long} characters]\n` +
+        `${lines.join('\n')}\n` +
+        `[Line ${end} is ${long} characters long — probably minified — and only this much ` +
+        'fits in one request on this key. It cannot be read further by line; work from this part.' +
+        (end < total ? ` ${total - end} more lines follow; continue with read_file start_line=${end + 1}.]` : ']'),
+      );
+    }
+
+    // Otherwise say which part this is, and how to get the next one. This used
+    // to suggest `sed`, which does not exist on Windows — every agent that took
+    // the advice failed the step, then fell back to one-line node scripts it
+    // had to escape by hand.
+    const head = `[${rel.path} · lines ${start}-${end} of ${total}]`;
+    const tail = end < total
+      ? `\n[${total - end} more lines. Continue with read_file start_line=${end + 1}.` +
+        (lines.length < wanted && ctx.readCeiling ? ' This part is what fits in one request on this key.]' : ']')
+      : '';
+    return ok(`${head}\n${lines.join('\n')}${tail}`);
   },
 
   list_files(input, ctx) {
@@ -211,10 +279,14 @@ const HANDLERS = {
     try {
       const out = execFileSync(bin, args, {
         cwd: ctx.root, timeout: COMMAND_TIMEOUT, encoding: 'utf8', stdio: 'pipe',
+        maxBuffer: COMMAND_MAX_OUTPUT,
       });
       return ok(tail(out) || '(no output)');
     } catch (e) {
       if (e.code === 'ENOENT') return err(`${argv[0]} is not installed or not on PATH.`);
+      if (e.code === 'ENOBUFS') {
+        return err(`${argv[0]} printed more than ${COMMAND_MAX_OUTPUT / 1024 / 1024}MB and was stopped. Narrow the command, or write its output to a file.`);
+      }
       if (e.killed) return err(`Timed out after ${COMMAND_TIMEOUT / 1000}s.\n${tail(e.stdout ?? '')}`);
       // A non-zero exit is information the model needs, not a harness failure —
       // a failing test IS the answer to "run the tests".

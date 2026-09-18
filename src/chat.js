@@ -1,19 +1,27 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
-import { readManifest, modelFor, keyEnvs } from './config.js';
+import {
+  readManifest, modelFor, setModelMaxTokens, setTierMaxTokens,
+  savedConnections, addSavedKey, setTierConnection,
+} from './config.js';
+import { requiresKey } from './provider.js';
 import { readAgents, findAgent } from './agents.js';
 import { dirtyFiles, isRepo, git } from './session.js';
 import { verify } from './verify.js';
 import { run } from './run.js';
 import { createPrompter } from './prompter.js';
-import { onboard, obtainKey, pickModel, setModel } from './onboard.js';
+import { onboard, obtainKey, pickModel, setModel, keepModel, ensureRepo } from './onboard.js';
 import { promptMode } from './generate.js';
 import { newAgent, newGuard, checkAll, printCheck, pathsFor, DEV_HELP } from './dev.js';
 import { smokeTest, printSmoke } from './smoke.js';
 import { printTree } from './tree.js';
-import { writeKey, ensureIgnored } from './env.js';
-import { listModels } from './providers.js';
+import {
+  writeKey, ensureIgnored, nextKeyEnv, reloadEnv, discoverKeys,
+  misplacedKeys, moveMisplacedKey, keySource, fingerprint,
+} from './env.js';
+import { showLimits, suggestedCap, probeModel, DEFAULT_CAP } from './limits.js';
+import { listModels, providerFor } from './providers.js';
 import { c, ok, info, warn } from './util.js';
 
 /**
@@ -47,8 +55,10 @@ const HELP = `
   ${c.c('@name <task>')}     give it to one agent
 
   ${c.b('Setup')}
-  ${c.c('/key')}             add or change an API key
-  ${c.c('/models')}          switch model
+  ${c.c('/keys')}            your API keys: which are set, where, and which agents use them
+  ${c.c('/key')}             add an API key (as many as you like), or change one
+  ${c.c('/models')}          switch model, or put one agent on another key
+  ${c.c('/limits')}          rate limits, and how many tokens each agent may use
   ${c.c('/agents')}          installed agents
   ${c.c('/tree')}            where every file is
   ${c.c('/smoke [name]')}    check an agent actually works
@@ -69,9 +79,22 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
     // --- first run ----------------------------------------------------------
     let mode = typeof flags.mode === 'string' && MODES[flags.mode] ? flags.mode : 'chat';
     let models = [];
+    // Carried between turns so the suite is not run twice per message.
+    let lastBuild = null;
+    // Whether this session has said "go ahead without git". Asked, never assumed.
+    let noGit = false;
+    let gitState = null;
 
-    const needsSetup = !existsSync(join(dir, 'agent.yaml'))
-      || keyEnvs(readManifest(join(dir, 'agent.yaml'))).some((n) => !process.env[n] && n !== 'OLLAMA_API_KEY');
+    // A key is missing only when the model it belongs to actually needs one.
+    // This used to special-case the name OLLAMA_API_KEY, so a local
+    // OpenAI-compatible server — which authenticates nothing — looked unset on
+    // every launch and sent the user back through onboarding.
+    // Checked before deciding whether setup is needed: a key pasted into
+    // agent.yaml makes the variable it names look unset, and would send the
+    // person back through onboarding instead of telling them what happened.
+    if (interactive && existsSync(join(dir, 'agent.yaml'))) await rescueMisplacedKeys({ dir, root, prompter });
+
+    const needsSetup = !existsSync(join(dir, 'agent.yaml')) || missingKeys(dir).length > 0;
 
     if (needsSetup) {
       // Setup asks questions. With nobody at a terminal to answer them, say
@@ -86,6 +109,7 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
       const result = await onboard(prompter, { fetchImpl, root });
       if (!result) return;
       models = result.models ?? [];
+      gitState = result.git ?? null;
       if (result.mode === 'prompt') {
         const made = await promptMode(prompter, { call: call ?? undefined, fetchImpl, models, root });
         mode = made?.mode ?? 'chat';
@@ -93,6 +117,12 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
         mode = result.mode;
       }
     }
+
+    // A returning user has not been asked yet. Only in a real conversation:
+    // a prompter reading a closed stdin would answer the default, and the
+    // default here is "yes, create a repository".
+    if (gitState === null && interactive) gitState = await ensureRepo(prompter, root);
+    noGit = gitState === 'no-git';
 
     banner(mode);
 
@@ -102,6 +132,11 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
       if (line === null) break;                       // ctrl-d, or a script ran out
       const input = line.trim();
       if (!input) continue;
+
+      // Someone may have edited .gitagent/.env since the last message —
+      // switched to the folder in /dev, pasted a key, come back. Pick it up now
+      // rather than at the next restart.
+      refreshKeys(dir);
 
       if (input.startsWith('/')) {
         const outcome = await command(input, { mode, prompter, call, fetchImpl, models, root, dir });
@@ -129,7 +164,26 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
         continue;
       }
 
-      await turn({ task, agent, call, flags, prompter });
+      let outcome = await turn({ task, agent, call, flags, prompter, build: lastBuild, noGit });
+
+      // The run refused because git cannot undo a failed attempt here. Offer the
+      // fix now and then do what was asked, rather than print a flag the person
+      // cannot pass from inside a chat.
+      if (NEEDS_GIT.has(outcome?.error?.code)) {
+        const state = await ensureRepo(prompter, root);
+        if (state === 'blocked') continue;
+        noGit = state === 'no-git';
+        outcome = await turn({ task, agent, call, flags, prompter, build: lastBuild, noGit });
+      }
+      lastBuild = outcome?.build ?? null;
+
+      // A model that cannot do this at all will not do it next message either.
+      // Offering the fix here is the difference between one wasted task and a
+      // whole conversation of them.
+      if (outcome?.fatal && await prompter.confirm('Pick a different model now?', true)) {
+        const swapped = await switchModel({ dir, prompter, fetchImpl, models });
+        if (swapped?.models) models = swapped.models;
+      }
     }
   } finally {
     prompter.close();
@@ -144,18 +198,69 @@ export async function chat(positional, flags, { call, prompter: given, fetchImpl
  * work. NOT `--yes`: a human checkpoint still stops and asks, even here. Chat
  * is a faster way to reach the loop, not a way around its rules.
  */
-async function turn({ task, agent, call, flags, prompter }) {
+const NEEDS_GIT = new Set(['NO_GIT_REPO', 'NO_COMMITS']);
+
+async function turn({ task, agent, call, flags, prompter, build, noGit = false }) {
+  let outcome = null;
   try {
-    await run([task], {
+    outcome = await run([task], {
       ...flags,
       'allow-dirty': true,
       quiet: true,
+      ...(noGit ? { 'no-git': true } : {}),
       ...(agent ? { agent: agent.name } : {}),
-    }, { ...(call ? { call } : {}), prompter });
+    }, { ...(call ? { call } : {}), prompter, build });
   } catch (e) {
+    // A git refusal is answered by the caller with an offer, so its
+    // command-line wording is not printed here.
+    if (NEEDS_GIT.has(e.code)) return { error: e };
     warn(e.message);
   }
   console.log();
+  // What the run verified on its way out is the state the next turn starts in.
+  // Anything else — a failure, a stop — leaves it unknown, and the next turn
+  // checks for itself.
+  return outcome;
+}
+
+/**
+ * Switch the default model, and check the new one can actually drive an agent.
+ *
+ * Used by /models and by the offer made after a task fails on the model itself
+ * — without the check, the obvious next move is to pick another model that
+ * cannot call tools either.
+ */
+async function switchModel({ dir, prompter, fetchImpl, models }) {
+  const manifest = readManifest(join(dir, 'agent.yaml'));
+  let list = models;
+  if (!list?.length) {
+    try {
+      list = await listModels(manifest.provider, process.env[manifest.keyEnv] ?? '', {
+        baseUrl: manifest.baseUrl, fetchImpl,
+      });
+    } catch (e) {
+      warn(e.message);
+      return null;
+    }
+  }
+
+  const picked = await pickModel(prompter, { models: list, provider: manifest.provider });
+  if (!picked) return null;
+
+  const check = await probeModel({
+    provider: manifest.provider,
+    model: picked,
+    key: process.env[manifest.keyEnv] ?? '',
+    baseUrl: manifest.baseUrl,
+    fetchImpl,
+  });
+  if (!(await keepModel(prompter, picked, check))) {
+    return switchModel({ dir, prompter, fetchImpl, models: list });
+  }
+
+  setModel({ provider: manifest.provider, model: picked, keyEnv: manifest.keyEnv, baseUrl: manifest.baseUrl });
+  ok(`Default model is now ${c.c(picked)}`);
+  return { models: list, model: picked };
 }
 
 async function command(line, ctx) {
@@ -186,16 +291,37 @@ async function command(line, ctx) {
     }
 
     // --- setup --------------------------------------------------------------
+    case 'keys':
+      showKeys(dir);
+      return null;
+
     case 'key': {
       const conn = await obtainKey(prompter, { fetchImpl: ctx.fetchImpl });
       if (!conn) return null;
       const manifest = readManifest(join(dir, 'agent.yaml'));
+      const saved = savedConnections(manifest);
+
+      // A second key for a provider already saved: replace it, or keep both.
+      // Writing it over the first without asking silently moves every agent on
+      // that key to a different account.
+      const existing = saved.find((k) => k.provider === conn.provider);
+      if (conn.key && existing && process.env[existing.keyEnv] && process.env[existing.keyEnv] !== conn.key) {
+        const label = providerLabel(conn.provider);
+        const how = await prompter.choose(`You already have a ${label} key (${existing.keyEnv}).`, [
+          { value: 'replace', label: 'Replace it', note: 'everything using it moves to this key' },
+          { value: 'add', label: 'Keep both', note: `keys from the same ${label} account share one limit` },
+        ]);
+        if (how === null) return null;
+        conn.keyEnv = how === 'add' ? nextKeyEnv(conn.keyEnv, saved.map((k) => k.keyEnv)) : existing.keyEnv;
+      }
+
       if (conn.key) {
         ensureIgnored(root);
         writeKey(conn.keyEnv, conn.key);
         process.env[conn.keyEnv] = conn.key;
         ok(`Saved as ${c.c(conn.keyEnv)} in .gitagent/.env`);
       }
+      addSavedKey({ provider: conn.provider, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl }, join(dir, 'agent.yaml'));
       if (conn.provider !== manifest.provider
         && await prompter.confirm(`Switch your agents to ${conn.provider}?`, true)) {
         const model = await pickModel(prompter, conn);
@@ -209,6 +335,26 @@ async function command(line, ctx) {
 
     case 'models': case 'model': {
       const manifest = readManifest(join(dir, 'agent.yaml'));
+      console.log();
+      for (const a of readAgents(dir)) {
+        const m = modelFor(manifest, a.name);
+        info(`${c.c(a.name.padEnd(16))}${m.model}  ${c.d(`${m.provider} · ${m.keyEnv}`)}`);
+      }
+      console.log();
+
+      // "Nothing" is the default, so a look at the list is not a change.
+      const what = await prompter.choose('Change what?', [
+        { value: 'default', label: 'The default model', note: 'every agent without its own' },
+        { value: 'agent', label: 'One agent’s model or key', note: 'e.g. a stronger model on another provider' },
+        { value: 'none', label: 'Nothing' },
+      ], { default: 2 });
+
+      if (what === 'agent') {
+        await assignAgent({ dir, root, prompter, fetchImpl: ctx.fetchImpl });
+        return null;
+      }
+      if (what !== 'default') return null;
+
       let models = ctx.models;
       if (!models?.length) {
         try {
@@ -220,19 +366,34 @@ async function command(line, ctx) {
           return null;
         }
       }
-      console.log();
-      for (const a of readAgents(dir)) {
-        const m = modelFor(manifest, a.name);
-        info(`${c.c(a.name.padEnd(16))}${m.model}  ${c.d(m.provider)}`);
+      const swapped = await switchModel({ dir, prompter, fetchImpl: ctx.fetchImpl, models });
+      return { models: swapped?.models ?? models };
+    }
+
+    case 'limits': {
+      const { manifest, agents, limits } = await showLimits({ dir, fetchImpl: ctx.fetchImpl });
+      if (!agents.length) return null;
+      if (!(await prompter.confirm('Change a reply cap?', false))) return null;
+
+      const target = await prompter.choose('Which one?', [
+        { value: 'default', label: 'the default', note: 'every agent that has not set its own' },
+        ...agents.map((a) => ({ value: a.name, label: a.name, note: a.role })),
+      ]);
+      if (target === null) return null;
+
+      const suggested = suggestedCap(limits) ?? manifest.maxTokens ?? DEFAULT_CAP;
+      const typed = await prompter.ask('Tokens per reply:', { default: String(suggested) });
+      const n = Number(typed);
+      if (!Number.isInteger(n) || n < 1) { warn(`"${typed}" is not a token count.`); return null; }
+
+      if (target === 'default') {
+        setModelMaxTokens(n);
+        ok(`Every agent may now generate up to ${c.c(n.toLocaleString())} tokens per reply.`);
+      } else {
+        setTierMaxTokens(target, n);
+        ok(`${c.c(target)} may now generate up to ${c.c(n.toLocaleString())} tokens per reply.`);
       }
-      console.log();
-      if (!(await prompter.confirm('Switch the default model?', false))) return { models };
-      const picked = await pickModel(prompter, { models, provider: manifest.provider });
-      if (picked) {
-        setModel({ provider: manifest.provider, model: picked, keyEnv: manifest.keyEnv, baseUrl: manifest.baseUrl });
-        ok(`Default model is now ${c.c(picked)}`);
-      }
-      return { models };
+      return null;
     }
 
     case 'agents': {
@@ -311,11 +472,33 @@ async function command(line, ctx) {
       return null;
     }
 
+    // Undo is the one command here that destroys work, so it checks three
+    // things first: that the commit is ours, that nothing uncommitted would go
+    // with it, and that the user means it. It used to check none of them, and
+    // `git reset --hard HEAD~1` on someone else's commit with a dirty tree
+    // takes both.
     case 'undo': {
       if (!isRepo(root)) { warn('Not a git repo — nothing to undo.'); return null; }
-      const last = git(['log', '-1', '--pretty=%s'], { root, check: false });
-      if (!last) { warn('No commits to undo.'); return null; }
-      if (!(await prompter.confirm(`Roll back "${last}"?`, false))) return null;
+
+      const body = git(['log', '-1', '--pretty=%B'], { root, check: false });
+      const subject = git(['log', '-1', '--pretty=%s'], { root, check: false });
+      if (!body) { warn('No commits to undo.'); return null; }
+
+      if (!body.includes('via jr-arch')) {
+        warn(`The last commit is not one of ours: "${subject}"`);
+        info(c.d('/undo only rolls back commits an agent made. Use git for your own.'));
+        return null;
+      }
+
+      const dirty = dirtyFiles(root);
+      if (dirty.length) {
+        warn(`${dirty.length} uncommitted change(s) would be destroyed with it.`);
+        info(c.d(`  ${dirty.slice(0, 5).join(', ')}`));
+        info(c.d('Commit or stash them first.'));
+        return null;
+      }
+
+      if (!(await prompter.confirm(`Roll back "${subject}"?`, false))) return null;
       git(['reset', '--hard', 'HEAD~1'], { root, check: false });
       ok('Rolled back.');
       return null;
@@ -325,6 +508,164 @@ async function command(line, ctx) {
       warn(`Unknown command /${cmd}. Try /help.`);
       return null;
   }
+}
+
+const providerLabel = (id) => providerFor(id)?.label ?? id;
+
+/**
+ * Put one agent on a provider, model and key the person chooses.
+ *
+ * Saved keys are offered first, so a key added once is never pasted again. A
+ * new key is last — the one option always present — so the saved ones above
+ * it keep their numbers from one run to the next. The chosen model gets the
+ * same check setup gives: can it call a tool, and what does its key allow per
+ * minute, which is recorded on the agent so it is fitted against its own
+ * provider rather than the default's.
+ */
+async function assignAgent({ dir, root, prompter, fetchImpl }) {
+  const manifest = readManifest(join(dir, 'agent.yaml'));
+  const agents = readAgents(dir);
+  if (!agents.length) { warn('No agents yet.'); return; }
+
+  const name = await prompter.choose('Which agent?', agents.map((a) => {
+    const m = modelFor(manifest, a.name);
+    return { value: a.name, label: a.name, note: `${m.model} on ${providerLabel(m.provider)}` };
+  }));
+  if (!name) return;
+
+  const saved = savedConnections(manifest);
+  const pick = await prompter.choose(`Which key should ${name} use?`, [
+    ...saved.map((k) => ({
+      value: k.keyEnv,
+      label: providerLabel(k.provider),
+      note: [k.keyEnv, k.isDefault ? 'the default' : '', requiresKey(k) && !process.env[k.keyEnv] ? 'not set' : '']
+        .filter(Boolean).join(' · '),
+    })),
+    { value: '__new', label: 'A new key', note: 'paste one now' },
+  ]);
+  if (!pick) return;
+
+  let conn;
+  if (pick === '__new') {
+    conn = await obtainKey(prompter, { fetchImpl });
+    if (!conn) return;
+    const same = saved.find((k) => conn.key && process.env[k.keyEnv] === conn.key);
+    conn.keyEnv = same ? same.keyEnv : nextKeyEnv(conn.keyEnv, saved.map((k) => k.keyEnv));
+    if (conn.key && !same) {
+      ensureIgnored(root);
+      writeKey(conn.keyEnv, conn.key);
+      process.env[conn.keyEnv] = conn.key;
+    }
+    addSavedKey({ provider: conn.provider, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl }, join(dir, 'agent.yaml'));
+  } else {
+    conn = { ...saved.find((k) => k.keyEnv === pick) };
+    if (requiresKey(conn) && !process.env[conn.keyEnv]) {
+      warn(`${conn.keyEnv} is not set. Add it with /key first.`);
+      return;
+    }
+    try {
+      conn.models = await listModels(conn.provider, process.env[conn.keyEnv] ?? '', { baseUrl: conn.baseUrl, fetchImpl });
+    } catch (e) {
+      warn(e.message);
+      conn.models = [];
+    }
+  }
+
+  const model = await pickModel(prompter, { models: conn.models, provider: conn.provider });
+  if (!model) return;
+
+  const check = await probeModel({
+    provider: conn.provider, model, key: process.env[conn.keyEnv] ?? '', baseUrl: conn.baseUrl, fetchImpl,
+  });
+  if (!(await keepModel(prompter, model, check))) return;
+  const perMinute = check.limits?.rows?.find((r) => r.key === 'tokens')?.limit
+    ?? check.limits?.rows?.find((r) => r.key === 'input')?.limit
+    ?? null;
+
+  setTierConnection(name, {
+    provider: conn.provider, model, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl, tokensPerMinute: perMinute,
+  }, join(dir, 'agent.yaml'));
+  ok(`${c.c(name)} now runs ${c.c(model)} on ${providerLabel(conn.provider)}`);
+  if (perMinute) info(c.d(`  its key allows ${perMinute.toLocaleString()} tokens a minute, on its own account`));
+}
+
+/** Read .gitagent/.env again, and say what changed. */
+function refreshKeys(dir) {
+  const changed = reloadEnv(dir);
+  const found = discoverKeys(dir);
+  if (changed.length) info(c.d(`  .gitagent/.env changed — now using ${changed.join(', ')}`));
+  for (const f of found) {
+    info(c.d(`  found ${f.name} (${providerLabel(f.provider)}) in .gitagent/.env — put an agent on it with /models`));
+  }
+}
+
+/**
+ * Every key this repo knows about, and what is true of each.
+ *
+ * Masked to four characters and a length, the same as everywhere else. The
+ * point is to answer "is it set, where from, and who uses it" — and where the
+ * file is, as a full path, so it can be opened and edited straight away.
+ */
+function showKeys(dir) {
+  const manifest = readManifest(join(dir, 'agent.yaml'));
+  const agents = readAgents(dir);
+  const file = join(dir, '.env');
+
+  console.log();
+  console.log(`  ${c.b('API keys')}  ${c.d(file)}`);
+  const rows = savedConnections(manifest);
+  if (!rows.length) info(c.d('  none yet'));
+  for (const k of rows) {
+    const value = process.env[k.keyEnv];
+    const users = agents.filter((a) => modelFor(manifest, a.name).keyEnv === k.keyEnv).map((a) => a.name);
+    const state = !requiresKey(k)
+      ? c.d('no key needed')
+      : value ? `${fingerprint(value)} ${c.d(`from ${keySource(k.keyEnv) ?? 'your environment'}`)}` : c.y('not set');
+    const used = users.length ? users.join(', ') : c.d('no agent uses it');
+    info(`  ${c.c(k.keyEnv.padEnd(20))}${providerLabel(k.provider).padEnd(12)}${state}`);
+    info(`  ${' '.repeat(20)}${c.d(k.isDefault ? 'default · ' : '')}${used}`);
+  }
+  console.log();
+  info(c.d('Add one with /key, or open the file above and add a line NAME=value.'));
+  info(c.d('It is picked up on your next message. Put an agent on a key with /models.'));
+  console.log();
+}
+
+/**
+ * A key pasted into agent.yaml, where only the NAME of its variable belongs.
+ *
+ * agent.yaml is committed; the key would go to the remote with the next push.
+ * Offered, not done silently — it is their file — but offered first thing,
+ * before anything else reads the manifest.
+ */
+async function rescueMisplacedKeys({ dir, root, prompter }) {
+  let manifest;
+  try { manifest = readManifest(join(dir, 'agent.yaml')); } catch { return; }
+  for (const entry of misplacedKeys(manifest)) {
+    console.log();
+    warn(`agent.yaml has an API key in ${entry.where}, where the NAME of a variable belongs.`);
+    info(c.d('  agent.yaml is committed with your code. Keys go in .gitagent/.env, which is not.'));
+    if (!(await prompter.confirm('Move it to .gitagent/.env now?', true))) continue;
+
+    const name = moveMisplacedKey(entry, dir, root);
+    ok(`Moved — agent.yaml now says ${c.c(`api_key_env: ${name}`)}, and the key is in .gitagent/.env`);
+    const committed = isRepo(root) && (git(['show', 'HEAD:.gitagent/agent.yaml'], { root, check: false }) ?? '').includes(entry.value);
+    if (committed) {
+      warn('That key was already committed, so it is in your git history.');
+      info(c.d('  Revoke it with the provider and make a new one — moving it cannot take it back out of history.'));
+    }
+  }
+}
+
+/** Key variables a run would actually need and cannot find. */
+function missingKeys(dir) {
+  const manifest = readManifest(join(dir, 'agent.yaml'));
+  const names = new Set();
+  for (const tier of [null, ...readAgents(dir).map((a) => a.name)]) {
+    const m = tier ? modelFor(manifest, tier) : manifest;
+    if (requiresKey(m) && m.keyEnv && !process.env[m.keyEnv]) names.add(m.keyEnv);
+  }
+  return [...names];
 }
 
 function banner(mode) {

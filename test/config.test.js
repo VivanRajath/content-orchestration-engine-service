@@ -97,7 +97,8 @@ describe('patchSection', () => {
   });
 
   test('does not reach past a dedent into the next section', () => {
-    assert.throws(() => patchSection(MANIFEST, 'memory', 'entry', 'x'), /Key "memory\.entry" not found/);
+    // `entry` exists, but under routing:, which comes later in the file.
+    assert.throws(() => patchSection(MANIFEST, 'git', 'entry', 'x'), /Key "git\.entry" not found/);
   });
 });
 

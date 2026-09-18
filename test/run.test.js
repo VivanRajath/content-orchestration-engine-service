@@ -322,7 +322,9 @@ describe('the loop', () => {
   test('the step ceiling ends an attempt that never finishes', async () => {
     const box = sandbox({ manifest: { 'max_steps: 40': 'max_steps: 3' } });
     await inRepo(box, async () => {
-      const spin = Array.from({ length: 40 }, () => ({ tools: [tool('read_file', { path: 'index.js' })] }));
+      // Different reads each time: the same read over and over is now stopped
+      // earlier as a loop, and this test is about the ceiling.
+      const spin = Array.from({ length: 40 }, (_, i) => ({ tools: [tool('list_files', { path: `dir${i}` })] }));
       const out = await run(['spin forever'], {}, { call: scripted(spin) });
 
       assert.equal(out.status, 'stopped');

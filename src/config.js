@@ -92,6 +92,214 @@ export function upsertSection(text, key, body) {
 }
 
 /**
+ * Set a scalar that may not be there yet.
+ *
+ * `patchSection` replaces a key that exists and throws when it does not, which
+ * is right for `config set` — a typo should not silently invent a key. Writing
+ * a limit is the other case: `max_tokens` is optional in the file, and the
+ * whole point is to add it. So this falls back to inserting the key at the
+ * indentation the block already uses.
+ */
+export function upsertScalar(text, section, key, value) {
+  try {
+    return patchSection(text, section, key, value);
+  } catch (err) {
+    if (!/not found in agent.yaml$/.test(err.message)) throw err;
+  }
+
+  const lines = text.split('\n');
+  const head = lines.findIndex((l) => l.startsWith(`${section}:`));
+  if (head === -1) throw new Error(`Section "${section}:" not found in agent.yaml`);
+  const end = blockEnd(lines, head);
+  const indent = indentOfBlock(lines, head + 1, end) ?? '  ';
+  // After the last real line of the block, not after its trailing comments:
+  // a comment at the end of a block is usually about the block, not about the
+  // key that happens to follow it.
+  let at = end;
+  while (at > head + 1 && (lines[at - 1].trim() === '' || lines[at - 1].trim().startsWith('#'))) at--;
+  return [...lines.slice(0, at), `${indent}${key}: ${value}`, ...lines.slice(at)].join('\n');
+}
+
+/** Where a top-level block ends: the next line in column 0, blanks trimmed. */
+function blockEnd(lines, head) {
+  let end = head + 1;
+  while (end < lines.length && (lines[end].trim() === '' || /^[ \t]/.test(lines[end]))) end++;
+  while (end > head + 1 && lines[end - 1].trim() === '') end--;
+  return end;
+}
+
+const leading = (line) => line.match(/^[ \t]*/)[0];
+
+/** The indentation the children of a block are written at. */
+function indentOfBlock(lines, from, to) {
+  for (let i = from; i < to; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    return leading(line);
+  }
+  return null;
+}
+
+/** The line index of `key:` among the direct children of a block, or -1. */
+function childAt(lines, from, to, key) {
+  const indent = indentOfBlock(lines, from, to);
+  if (indent === null) return -1;
+  const re = new RegExp(`^${indent}${escapeRe(key)}:`);
+  for (let i = from; i < to; i++) {
+    if (!lines[i].trim() || lines[i].trim().startsWith('#')) continue;
+    if (leading(lines[i]).length !== indent.length) continue;
+    if (re.test(lines[i])) return i;
+  }
+  return -1;
+}
+
+/** Where a nested block ends: the next line indented no deeper than its head. */
+function childEnd(lines, head, to) {
+  const indent = leading(lines[head]).length;
+  let end = head + 1;
+  while (end < to) {
+    const line = lines[end];
+    if (line.trim() === '' || leading(line).length > indent) { end++; continue; }
+    break;
+  }
+  while (end > head + 1 && lines[end - 1].trim() === '') end--;
+  return end;
+}
+
+/**
+ * Set or remove one scalar under `tiers.<agent>.model`, creating whatever part
+ * of the path is missing and leaving everything else — including comments —
+ * exactly where it was.
+ *
+ * Deliberately NOT a read-modify-serialize of the parsed document. `tiers:` is
+ * where a user writes down which model each agent gets and why, and rewriting
+ * the block from the parse tree drops every comment in it. Same rule as the
+ * rest of this file: agent.yaml is edited by line.
+ *
+ * Returns `{text, changed}`; `changed` is false when there was nothing to
+ * remove, so a caller can say "that agent had no cap" rather than claiming to
+ * have done something.
+ */
+export function patchTierModel(text, agent, key, value) {
+  const removing = value === null;
+  const lines = text.split('\n');
+  const head = lines.findIndex((l) => l.startsWith('tiers:'));
+
+  if (head === -1) {
+    if (removing) return { text, changed: false };
+    // No tiers: block at all. upsertSection appends one; the commented-out
+    // example in the shipped manifest is not matched, and must not be, or the
+    // write would land inside a comment.
+    const body = [`${agent}:`, '  model:', `    ${key}: ${value}`].join('\n');
+    return { text: upsertSection(text, 'tiers', body), changed: true };
+  }
+
+  const end = blockEnd(lines, head);
+  const tierIndent = indentOfBlock(lines, head + 1, end) ?? '  ';
+  const agentAt = childAt(lines, head + 1, end, agent);
+
+  if (agentAt === -1) {
+    if (removing) return { text, changed: false };
+    const block = [
+      `${tierIndent}${agent}:`,
+      `${tierIndent}${tierIndent}model:`,
+      `${tierIndent}${tierIndent}${tierIndent}${key}: ${value}`,
+    ];
+    let at = end;
+    while (at > head + 1 && (lines[at - 1].trim() === '' || lines[at - 1].trim().startsWith('#'))) at--;
+    return { text: [...lines.slice(0, at), ...block, ...lines.slice(at)].join('\n'), changed: true };
+  }
+
+  const agentEnd = childEnd(lines, agentAt, end);
+  const modelAt = childAt(lines, agentAt + 1, agentEnd, 'model');
+
+  if (modelAt === -1) {
+    if (removing) return { text, changed: false };
+    const indent = indentOfBlock(lines, agentAt + 1, agentEnd) ?? `${tierIndent}${tierIndent}`;
+    const block = [`${indent}model:`, `${indent}${tierIndent}${key}: ${value}`];
+    return { text: [...lines.slice(0, agentEnd), ...block, ...lines.slice(agentEnd)].join('\n'), changed: true };
+  }
+
+  const modelEnd = childEnd(lines, modelAt, agentEnd);
+  const keyAt = childAt(lines, modelAt + 1, modelEnd, key);
+
+  if (keyAt !== -1) {
+    if (removing) {
+      // Take the empty parents with it. A `model:` with nothing under it parses
+      // as null and is harmless, but it reads as configuration that is there,
+      // and the next person to open the file has to work out that it is not.
+      // Each index below sits above the one before it, so deleting a later line
+      // never moves an earlier one.
+      let rest = [...lines.slice(0, keyAt), ...lines.slice(keyAt + 1)];
+      rest = pruneIfEmpty(rest, modelAt);
+      rest = pruneIfEmpty(rest, agentAt);
+      rest = pruneIfEmpty(rest, head);
+      return { text: rest.join('\n'), changed: true };
+    }
+    const indent = leading(lines[keyAt]);
+    const next = [...lines];
+    next[keyAt] = `${indent}${key}: ${value}`;
+    return { text: next.join('\n'), changed: true };
+  }
+
+  if (removing) return { text, changed: false };
+  const indent = indentOfBlock(lines, modelAt + 1, modelEnd) ?? `${leading(lines[modelAt])}${tierIndent}`;
+  return {
+    text: [...lines.slice(0, modelEnd), `${indent}${key}: ${value}`, ...lines.slice(modelEnd)].join('\n'),
+    changed: true,
+  };
+}
+
+/** Drop a `key:` line that no longer has anything under it. */
+function pruneIfEmpty(lines, at) {
+  if (at < 0 || at >= lines.length) return lines;
+  const indent = leading(lines[at]).length;
+  for (let i = at + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    if (leading(line).length > indent) return lines;   // still has children
+    break;
+  }
+  const rest = [...lines.slice(0, at), ...lines.slice(at + 1)];
+  // A top-level block leaves the blank line that separated it behind.
+  if (indent === 0) {
+    while (at > 0 && rest[at - 1]?.trim() === '' && (rest[at]?.trim() === '' || rest[at] === undefined)) {
+      rest.splice(at - 1, 1);
+      break;
+    }
+  }
+  return rest;
+}
+
+/** The reply cap every agent inherits. */
+export function setModelMaxTokens(value, file = manifestPath()) {
+  writeFileSync(file, upsertScalar(readFileSync(file, 'utf8'), 'model', 'max_tokens', value));
+}
+
+/**
+ * What the provider said this key may spend a minute, as last measured.
+ *
+ * Written from the rate-limit headers rather than typed by anyone: it is a fact
+ * about the key, it changes when the plan changes, and `jr-arch limits`
+ * refreshes it.
+ */
+export function setTokensPerMinute(value, file = manifestPath()) {
+  writeFileSync(file, upsertScalar(readFileSync(file, 'utf8'), 'model', 'tokens_per_minute', value));
+}
+
+/** One agent's own reply cap, in the user's manifest — never in its SOUL.md. */
+export function setTierMaxTokens(agent, value, file = manifestPath()) {
+  const { text } = patchTierModel(readFileSync(file, 'utf8'), agent, 'max_tokens', value);
+  writeFileSync(file, text);
+}
+
+export function clearTierMaxTokens(agent, file = manifestPath()) {
+  const { text, changed } = patchTierModel(readFileSync(file, 'utf8'), agent, 'max_tokens', null);
+  if (changed) writeFileSync(file, text);
+  return changed;
+}
+
+/**
  * Read agent.yaml.
  *
  * This was a set of section-scoped regexes reading five flat scalars. The run
@@ -115,22 +323,26 @@ export function readManifest(file = manifestPath()) {
 
     temperature: nil(model.temperature),
     maxTokens:   nil(model.max_tokens),
+    // What the key allows per minute, measured at setup. Null until it is.
+    tokensPerMinute: nil(model.tokens_per_minute),
 
     // One number, not one per agent name. An agent that wants a different
     // budget declares `attempts:` in its own front matter.
     defaultAttempts: routing.default_attempts ?? routing.junior_retry_limit ?? 2,
-    diffCeiling:      routing.diff_line_ceiling ?? 400,
     confidenceFloor:  routing.classifier_confidence_floor ?? 0.6,
     // No default name. pickFallback uses the last agent by priority when this
     // is unset, which works whatever the installed agents are called.
     degradedFallback: nil(routing.degraded_fallback),
 
-    agents:   Array.isArray(doc.agents) ? doc.agents : [],
     // Absent until a pack is installed; `pull` reads it to know where to go
     // back to, and readManifest is the one reader of this file.
     source:   doc.source ?? null,
-    identity: doc.identity ?? {},
-    memory:   doc.memory ?? {},
+    // Keys someone has added, by provider and variable name. See savedConnections().
+    keys:     Array.isArray(doc.keys)
+      ? doc.keys
+        .filter((k) => k && typeof k === 'object' && k.provider && k.api_key_env)
+        .map((k) => ({ provider: String(k.provider), keyEnv: String(k.api_key_env), baseUrl: nil(k.base_url) }))
+      : [],
     // Per-tier model overrides. Empty for the common case of one model.
     tiers:    doc.tiers && typeof doc.tiers === 'object' && !Array.isArray(doc.tiers) ? doc.tiers : {},
     raw:      doc,
@@ -170,18 +382,83 @@ export function modelFor(manifest, tier) {
       : nil(over.base_url),
     temperature: pick('temperature', manifest.temperature),
     maxTokens:   pick('max_tokens', manifest.maxTokens),
+    // An agent on another provider has that provider's allowance, not this one.
+    tokensPerMinute: over.provider && over.provider !== manifest.provider
+      ? pick('tokens_per_minute', null)
+      : pick('tokens_per_minute', manifest.tokensPerMinute),
     tier,
   };
 }
 
-/** Every env var name the manifest references, base and per-tier. */
+/** Every env var name the manifest references: base, per-tier, and saved keys. */
 export function keyEnvs(manifest) {
   const names = new Set();
   if (manifest.keyEnv) names.add(manifest.keyEnv);
   for (const spec of Object.values(manifest.tiers ?? {})) {
     if (spec?.model?.api_key_env) names.add(String(spec.model.api_key_env));
   }
+  for (const k of manifest.keys ?? []) names.add(k.keyEnv);
   return [...names];
+}
+
+/**
+ * Every key this repo can use, the default model's first.
+ *
+ * `keys:` in agent.yaml is the list of connections someone has added, by
+ * provider and variable name — never a value, which lives in `.gitagent/.env`.
+ * It exists so a second provider's key, added once, can be offered wherever a
+ * model is chosen instead of being pasted again. It is also, deliberately, the
+ * one place that answers "which providers can my code be sent to from here".
+ */
+export function savedConnections(manifest) {
+  const out = [];
+  const seen = new Set();
+  const add = (conn, isDefault) => {
+    if (!conn?.provider || !conn?.keyEnv || seen.has(conn.keyEnv)) return;
+    seen.add(conn.keyEnv);
+    out.push({ provider: conn.provider, keyEnv: conn.keyEnv, baseUrl: conn.baseUrl ?? null, isDefault });
+  };
+  add({ provider: manifest.provider, keyEnv: manifest.keyEnv, baseUrl: manifest.baseUrl }, true);
+  for (const k of manifest.keys ?? []) add(k, false);
+  return out;
+}
+
+/** Record a key someone added. Returns false when it was already listed. */
+export function addSavedKey({ provider, keyEnv, baseUrl = null }, file = manifestPath()) {
+  const current = readManifest(file).keys;
+  if (current.some((k) => k.keyEnv === keyEnv)) return false;
+
+  const all = [...current, { provider, keyEnv, baseUrl }];
+  const body = [
+    '# Keys added here, by provider. Only the variable names are kept in this',
+    '# file; the values live in .gitagent/.env, which is never committed.',
+    ...all.flatMap((k) => [
+      `- provider: ${k.provider}`,
+      `  api_key_env: ${k.keyEnv}`,
+      ...(k.baseUrl ? [`  base_url: ${k.baseUrl}`] : []),
+    ]),
+  ].join('\n');
+  writeFileSync(file, upsertSection(readFileSync(file, 'utf8'), 'keys', body));
+  return true;
+}
+
+/**
+ * Point one agent at a provider, model and key, leaving every other agent and
+ * every comment in the file where it was.
+ *
+ * base_url is cleared when the new connection has none: an agent moved from a
+ * local server to a hosted provider must not keep sending to localhost.
+ */
+export function setTierConnection(agent, { provider, model, keyEnv, baseUrl = null, tokensPerMinute = null }, file = manifestPath()) {
+  let text = readFileSync(file, 'utf8');
+  for (const [k, v] of [['provider', provider], ['name', model], ['api_key_env', keyEnv]]) {
+    text = patchTierModel(text, agent, k, v).text;
+  }
+  text = patchTierModel(text, agent, 'base_url', baseUrl ?? null).text;
+  // Each provider has its own per-minute allowance. An agent moved to another
+  // one is fitted against that provider's number, not the default's.
+  text = patchTierModel(text, agent, 'tokens_per_minute', tokensPerMinute ?? null).text;
+  writeFileSync(file, text);
 }
 
 export async function config(positional, _flags) {

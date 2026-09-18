@@ -96,6 +96,18 @@ function npmClient(root) {
  * found" — three states, not two, because "we did not check" and "it passed"
  * must never collapse into the same value.
  */
+/**
+ * How much build output to hold in memory.
+ *
+ * execFileSync defaults to one megabyte and then KILLS the process with
+ * ENOBUFS, reporting signal SIGTERM — indistinguishable from a timeout unless
+ * the code looks at `err.code`. A verbose test suite therefore came back as
+ * "timed out", which is reported as unknown, which is not a pass and not a
+ * failure: the build gate stopped gating and build-doctor was never called.
+ * Real suites print tens of megabytes; only the head and tail are kept anyway.
+ */
+const MAX_OUTPUT = 64 * 1024 * 1024;
+
 export function verify({ root = repoRoot(), timeout = 300000, command = null } = {}) {
   const cmd = command ?? detect(root);
   if (!cmd) return { green: null, output: '', label: null, reason: 'no build or test command found' };
@@ -108,6 +120,7 @@ export function verify({ root = repoRoot(), timeout = 300000, command = null } =
       timeout,
       encoding: 'utf8',
       stdio: 'pipe',
+      maxBuffer: MAX_OUTPUT,
     });
     return { green: true, output: tail(out), label: cmd.label };
   } catch (err) {
@@ -115,6 +128,11 @@ export function verify({ root = repoRoot(), timeout = 300000, command = null } =
       return { green: null, output: '', label: cmd.label, reason: `${rawBin} is not installed` };
     }
     const output = tail(`${err.stdout ?? ''}${err.stderr ?? ''}` || err.message);
+    // Checked before the timeout branch below: an over-buffer kill also arrives
+    // as SIGTERM, and calling that a timeout hides the real cause.
+    if (err.code === 'ENOBUFS') {
+      return { green: null, output, label: cmd.label, reason: 'printed more output than could be captured' };
+    }
     // A timeout is not a red build. Reporting it as one sends build-doctor
     // after a bug that is not there.
     if (err.killed || err.signal === 'SIGTERM') {

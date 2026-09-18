@@ -45,6 +45,15 @@ export const PROVIDERS = {
     keyPattern: /^xai-/,
     signup: 'console.x.ai',
   },
+  gemini: {
+    label: 'Google Gemini',
+    // Google's OpenAI-compatible endpoint: same wire format, Bearer auth.
+    wire: 'openai',
+    base: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    keyEnv: 'GEMINI_API_KEY',
+    keyPattern: /^AIza/,
+    signup: 'aistudio.google.com/apikey',
+  },
   openai: {
     label: 'OpenAI',
     wire: 'openai',
@@ -75,7 +84,7 @@ export const PROVIDERS = {
 };
 
 /** Order matters: the most specific prefixes are tried first. */
-const DETECT_ORDER = ['anthropic', 'groq', 'openrouter', 'xai', 'openai'];
+const DETECT_ORDER = ['anthropic', 'groq', 'openrouter', 'xai', 'gemini', 'openai'];
 
 /**
  * Best guess at which provider a key belongs to, from its prefix.
@@ -121,8 +130,12 @@ export function wireFor(provider) {
  * the one kind of network traffic this tool permits itself.
  *
  * `fetchImpl` is injectable so tests never touch the network.
+ *
+ * `onHeaders` hands the response headers to the caller. Providers report this
+ * key's rate limits there, so the call that proves the key also reveals what
+ * the key may spend — free, on a request we were making anyway.
  */
-export async function listModels(provider, key, { baseUrl = null, fetchImpl = fetch, timeout = 15000 } = {}) {
+export async function listModels(provider, key, { baseUrl = null, fetchImpl = fetch, timeout = 15000, onHeaders = null } = {}) {
   const spec = PROVIDERS[provider];
   if (!spec) throw new Error(`Unknown provider "${provider}".`);
 
@@ -151,20 +164,29 @@ export async function listModels(provider, key, { baseUrl = null, fetchImpl = fe
     clearTimeout(timer);
   }
 
+  try { onHeaders?.(res.headers); } catch { /* reporting limits must never fail the key check */ }
+
   if (res.status === 401 || res.status === 403) {
     throw new KeyRejected(`${spec.label} rejected that key (${res.status}).`);
   }
   if (!res.ok) {
     let detail = '';
-    try { detail = (await res.text()).slice(0, 200); } catch { /* ignore */ }
-    throw new Error(`${spec.label} returned ${res.status}${detail ? `: ${detail}` : ''}`);
+    try { detail = await res.text(); } catch { /* ignore */ }
+    // Google answers a bad key with 400 INVALID_ARGUMENT, not 401. Reading it
+    // as a server error told the user to try again later with the same key.
+    if (res.status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(detail)) {
+      throw new KeyRejected(`${spec.label} rejected that key (${res.status}).`);
+    }
+    throw new Error(`${spec.label} returned ${res.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`);
   }
 
   const body = await res.json();
   const rows = Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : [];
   return rows
     .map((m) => ({
-      id: String(m.id ?? m.name ?? ''),
+      // Gemini lists "models/gemini-2.5-flash". Chat requests take the bare
+      // name, and it is the one people recognise.
+      id: String(m.id ?? m.name ?? '').replace(/^models\//, ''),
       label: m.display_name ?? m.name ?? m.id,
       created: m.created ?? (m.created_at ? Date.parse(m.created_at) / 1000 : 0),
       owner: m.owned_by ?? null,
@@ -186,6 +208,8 @@ export class KeyRejected extends Error {}
  * as the model for a coding agent is offering a guaranteed failure.
  */
 export function isChatModel(id) {
-  // orpheus is Groq's text-to-speech model; its id has no "tts" in it.
-  return !/whisper|tts|embed|moderation|guard|dall-e|image|audio|transcri|realtime|search-preview|playai|orpheus/i.test(id);
+  // orpheus is Groq's text-to-speech model; its id has no "tts" in it. aqa,
+  // veo and lyria are Gemini's attributed-answer, video and music models
+  // (imagen is caught by "image").
+  return !/whisper|tts|embed|moderation|guard|dall-e|image|audio|transcri|realtime|search-preview|playai|orpheus|\baqa\b|\bveo\b|lyria/i.test(id);
 }

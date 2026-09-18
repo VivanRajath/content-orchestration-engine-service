@@ -54,6 +54,54 @@ export function headSha(root = repoRoot()) {
   return git(['rev-parse', 'HEAD'], { root, check: false });
 }
 
+/**
+ * Give a folder the one thing a run needs from git: a commit to branch from.
+ *
+ * Only ever called after the person said yes. Creating a repository in
+ * someone's folder is theirs to decide; this makes the decision one keystroke
+ * instead of a command they have to go and find.
+ *
+ * What goes into that first commit matters more than the commit itself, so the
+ * ignore rules come first. `.gitagent/.env` holds their key. `node_modules/` is
+ * there in any folder where someone has run `npm i` — including `npm i jr-arch`
+ * — and committing it is thousands of files nobody wanted.
+ */
+export function initialCommit(root = repoRoot()) {
+  const email = git(['config', 'user.email'], { root, check: false });
+  const name = git(['config', 'user.name'], { root, check: false });
+  if (!email || !name) {
+    return {
+      ok: false,
+      reason: 'git does not know who you are yet, so it cannot make a commit.',
+      help: [
+        '  git config --global user.name "Your Name"',
+        '  git config --global user.email you@example.com',
+      ],
+    };
+  }
+
+  if (!isRepo(root)) git(['init', '-q'], { root });
+
+  const wanted = ['.gitagent/.env', '.gitagent/.session/'];
+  if (existsSync(join(root, 'node_modules'))) wanted.push('node_modules/');
+  const ignoreFile = join(root, '.gitignore');
+  const current = existsSync(ignoreFile) ? readFileSync(ignoreFile, 'utf8') : '';
+  const lines = current.split('\n').map((l) => l.trim());
+  const missing = wanted.filter((rule) => !lines.includes(rule));
+  if (missing.length) {
+    const sep = current && !current.endsWith('\n') ? '\n' : '';
+    writeFileSync(ignoreFile, `${current}${sep}${missing.join('\n')}\n`);
+  }
+
+  git(['add', '-A'], { root });
+  const staged = git(['diff', '--cached', '--name-only'], { root, check: false });
+  const files = staged ? staged.split('\n').filter(Boolean) : [];
+  // --allow-empty: an empty folder still needs a commit to branch from.
+  git(['commit', '-q', '--allow-empty', '-m', 'initial commit'], { root });
+
+  return { ok: true, files: files.length, sha: headSha(root) };
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -269,50 +317,33 @@ function existedAt(root, sha, path) {
   return git(['cat-file', '-e', `${sha}:${path}`], { root, check: false }) !== null;
 }
 
-export function commitAttempt(session, frame, message) {
-  git(['add', '--all'], { root: session.root, check: false });
-  const staged = git(['diff', '--cached', '--name-only'], { root: session.root, check: false });
-  if (!staged) return null;
-  git(['commit', '-m', message], { root: session.root, check: false });
-  const sha = headSha(session.root);
-  record(session, 'attempt.commit', { n: frame.n, tier: frame.tier, sha });
-  return sha;
-}
-
 /**
- * The handoff payload, exactly as DUTIES.md specifies it.
+ * Commit exactly what this attempt is answerable for, and nothing else.
  *
- * "Truncate file contents before truncating this." An escalation that arrives
- * without the failed diffs is just a slower retry — the senior repeats the
- * junior's first attempt with more confidence, which is the single most
- * expensive way this ladder can waste a cycle.
+ * This used to be `git add --all` followed by a bare commit, which swept up
+ * whatever else happened to be in the tree: a sibling agent's files in a swarm,
+ * and — because the chat runs with --allow-dirty — the user's own uncommitted
+ * work, all recorded under this agent's name. Worse, the pre-commit gate is
+ * evaluated against the attempt's own paths, so anything extra went into
+ * history without being scanned at all.
+ *
+ * `git commit -- <paths>` commits those paths from the working tree regardless
+ * of what else is staged, so a pathspec commit cannot pick up a neighbour's
+ * change. The add is still needed first: a pathspec does not match a file git
+ * has never seen.
  */
-export function handoffPayload(session, { task, to, reason }) {
-  const history = session.attempts.map((a) => ({
-    n: a.n,
-    tier: a.tier,
-    status: a.status,
-    steps: a.steps,
-    reason: a.reason,
-    green: a.verify?.green ?? null,
-  }));
+export function commitAttempt(session, frame, message) {
+  const paths = attemptPaths(session, frame);
+  if (!paths.length) return null;
 
-  const failed = session.attempts.filter((a) => a.diff && a.status !== 'done');
-  const last = session.attempts[session.attempts.length - 1];
+  git(['add', '--', ...paths], { root: session.root, check: false });
+  const staged = git(['diff', '--cached', '--name-only', '--', ...paths], { root: session.root, check: false });
+  if (!staged) return null;
 
-  return [
-    `## Task (unmodified)\n\n${task}`,
-    `\n## Why this reached you\n\n${reason}`,
-    `\n## Tier history\n\n${history.map((h) => `${h.n}. ${h.tier} — ${h.status}${h.reason ? ` (${h.reason})` : ''}`).join('\n')}`,
-    failed.length
-      ? `\n## Diffs already attempted — these approaches are ruled out\n\n${failed
-          .map((a) => `### attempt ${a.n} (${a.tier}, ${a.status})\n\n\`\`\`diff\n${a.diff}\n\`\`\``)
-          .join('\n\n')}`
-      : '\n## Diffs already attempted\n\nNone — no attempt produced a diff.',
-    last?.verify?.output
-      ? `\n## Last build output (${last.verify.label ?? 'unknown command'})\n\n\`\`\`\n${last.verify.output}\n\`\`\``
-      : '',
-  ].join('\n');
+  git(['commit', '-m', message, '--', ...paths], { root: session.root, check: false });
+  const sha = headSha(session.root);
+  record(session, 'attempt.commit', { n: frame.n, tier: frame.tier, sha, files: paths.length });
+  return sha;
 }
 
 // ---------------------------------------------------------------------------

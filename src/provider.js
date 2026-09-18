@@ -15,6 +15,7 @@
  */
 
 import { baseUrlFor, wireFor, providerFor } from './providers.js';
+import { calibrate, observe } from './budget.js';
 
 export function apiKey(manifest) {
   return process.env[manifest.keyEnv] || '';
@@ -45,9 +46,30 @@ export function isAnthropic(manifest) {
   return wireFor(manifest.provider) === 'anthropic';
 }
 
-/** Local endpoints like ollama take no key at all. */
+/**
+ * Does this configuration need an API key at all?
+ *
+ * Ollama says so in the registry. The other keyless case is a local server —
+ * vLLM, LM Studio, llama.cpp behind `openai-compatible` — which authenticates
+ * nothing. Treating those as needing a key sent the user back through
+ * onboarding on every launch, because the chat's setup check saw a variable
+ * that was unset and could never usefully be set.
+ */
 export function requiresKey(manifest) {
-  return !providerFor(manifest.provider)?.noKey;
+  if (providerFor(manifest.provider)?.noKey) return false;
+  return !isLocal(manifest.baseUrl);
+}
+
+const LOCAL_HOST = /^(?:localhost|127(?:\.\d+){1,3}|\[::1\]|0\.0\.0\.0|host\.docker\.internal)$/i;
+
+/** A base URL that points at this machine, so there is nobody to authenticate to. */
+export function isLocal(baseUrl) {
+  if (!baseUrl) return false;
+  try {
+    return LOCAL_HOST.test(new URL(String(baseUrl)).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -82,6 +104,13 @@ function toAnthropicMessages(messages) {
       for (const call of m.toolCalls ?? []) {
         content.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input ?? {} });
       }
+      // An assistant turn with nothing in it is rejected outright by the
+      // Messages API, which fails the whole run. It happens for real: a reply
+      // cut off at max_tokens before it produced any text arrives as empty, and
+      // the loop's next move is to nudge the model — so the turn it is nudging
+      // about has to be representable. Dropping the turn instead would leave
+      // two user turns in a row, which the same API also refuses.
+      if (!content.length) content.push({ type: 'text', text: '(no reply)' });
       return { role: 'assistant', content };
     }
     // Tool results come back as a user turn in the Anthropic shape.
@@ -155,6 +184,24 @@ const MIN_OUTPUT = 400;
  *   model       the model does not exist, or cannot do what was asked.
  *   server      the provider is having trouble.
  */
+/**
+ * Will this error be exactly the same on the next attempt?
+ *
+ * A wrong key and a model that cannot do what was asked are settings, not
+ * weather. The ladder used to treat them as ordinary attempt failures: a model
+ * without tool calling burned two attempts at one agent, escalated, burned two
+ * more at the next, and reported the same sentence four times — four paid
+ * requests to learn something the first reply already said.
+ */
+export function isFatalProviderError(err) {
+  if (!(err instanceof ProviderError)) return false;
+  if (err.kind === 'model' || err.kind === 'auth') return true;
+  // A daily allowance that is spent stays spent for the rest of this run.
+  // Another attempt, or another agent on the same key, only spends a request
+  // to be told the same thing.
+  return err.kind === 'rate-limit' && /day|TPD|RPD/i.test(String(err.unit ?? ''));
+}
+
 export class ProviderError extends Error {
   constructor(message, fields = {}) {
     super(message);
@@ -172,11 +219,50 @@ export class ProviderError extends Error {
 const learnedCaps = new Map();
 const capKey = (manifest) => `${manifest.provider}|${manifest.model}`;
 export const outputCap = (manifest) => learnedCaps.get(capKey(manifest)) ?? null;
-export const forgetCaps = () => learnedCaps.clear();
+export const forgetCaps = () => { learnedCaps.clear(); learnedParams.clear(); };
+
+/**
+ * Parameters a model turned out not to accept, learned from its own refusal.
+ *
+ * OpenAI's reasoning models reject `max_tokens` (they want
+ * `max_completion_tokens`) and reject any temperature but the default. They are
+ * in the model list this tool shows, so a user picks one and every request
+ * fails with a 400 that reads like a bug here.
+ *
+ * Deliberately NOT a list of model ids. A hard-coded list is stale the week it
+ * ships — the same reason model ids are never hard-coded anywhere else here —
+ * and the provider has just told us exactly what is wrong. So: adapt, remember
+ * for this provider and model, and carry on.
+ */
+const learnedParams = new Map();
+export const learnedParamsFor = (manifest) => learnedParams.get(capKey(manifest)) ?? null;
+
+function adaptPayload(payload, params) {
+  const out = { ...payload };
+  if (params?.maxTokensKey && out.max_tokens !== undefined) {
+    out[params.maxTokensKey] = out.max_tokens;
+    delete out.max_tokens;
+  }
+  if (params?.dropTemperature) delete out.temperature;
+  return out;
+}
+
+/** Which parameter a 400 is complaining about, if it is complaining about one. */
+export function unsupportedParam(raw) {
+  const text = String(raw ?? '');
+  if (/max_completion_tokens/i.test(text)) return 'max_tokens';
+  if (/unsupported[^.]*\bmax_tokens\b|\bmax_tokens\b[^.]*(unsupported|not supported)/i.test(text)) return 'max_tokens';
+  if (/\btemperature\b/i.test(text) && /(unsupported|not supported|only the default|does not support)/i.test(text)) {
+    return 'temperature';
+  }
+  return null;
+}
 
 export function parseProviderError(status, text, headers) {
   let body = null;
   try { body = JSON.parse(text); } catch { /* not JSON */ }
+  // Gemini's OpenAI-compatible endpoint wraps its error in a one-element array.
+  if (Array.isArray(body)) body = body[0] ?? null;
   const raw = String(body?.error?.message ?? body?.message ?? (typeof body?.error === 'string' ? body.error : '') ?? '')
     || String(text ?? '').slice(0, 300);
   const code = String(body?.error?.code ?? body?.error?.type ?? '');
@@ -184,22 +270,31 @@ export function parseProviderError(status, text, headers) {
   // "... tokens per minute (TPM): Limit 6000, Requested 7120" — Groq, OpenAI.
   const limits = raw.match(/\((\w+)\):\s*Limit\s*([\d,]+),\s*(?:Used\s*([\d,]+),\s*)?Requested\s*([\d,]+)/i);
   const num = (s) => (s ? Number(s.replace(/,/g, '')) : null);
-  const unit = limits?.[1]?.toUpperCase() ?? null;
+  // Gemini names no unit in its sentence; a daily quota shows up only in the
+  // quota id it attaches ("GenerateRequestsPerDayPerProjectPerModel-FreeTier").
+  const daily = String(text ?? '').match(/"quotaId"\s*:\s*"([^"]*PerDay[^"]*)"/)?.[1];
+  const unit = limits?.[1]?.toUpperCase() ?? (daily ? (/Token/i.test(daily) ? 'TPD' : 'RPD') : null);
   const limit = num(limits?.[2]);
   const requested = num(limits?.[4]);
 
+  const param = status === 400 || status === 422 ? unsupportedParam(raw + code) : null;
   const retryAfter = retryAfterMs(headers, raw);
   const tooLarge = /request too large|exceeds? the (?:enforced )?limit|context_length_exceeded|maximum context length|too many tokens/i.test(raw)
     || code === 'context_length_exceeded' || status === 413;
 
   let kind = 'other';
-  if (tooLarge) kind = 'too-large';
+  // Before 'model': a refusal naming a parameter usually also contains the
+  // phrase "not supported", which would otherwise read as a dead model.
+  if (param) kind = 'param';
+  else if (tooLarge) kind = 'too-large';
   else if (status === 429) kind = 'rate-limit';
   else if (status === 401 || status === 403) kind = 'auth';
+  // Google reports a bad key as 400 INVALID_ARGUMENT rather than 401.
+  else if (/API_KEY_INVALID|API key not valid|API key expired/i.test(raw + String(text))) kind = 'auth';
   else if (status === 404 || /model_not_found|does not exist|not supported|decommissioned/i.test(raw + code)) kind = 'model';
   else if (status >= 500) kind = 'server';
 
-  return { kind, status, unit, limit, requested, retryAfter, raw: tidy(raw) };
+  return { kind, status, unit, limit, requested, retryAfter, param, raw: tidy(raw) };
 }
 
 /** The provider's sentence without the organisation id and the sales pitch. */
@@ -216,7 +311,7 @@ function tidy(message) {
 function retryAfterMs(headers, message) {
   const header = Number(headers?.get?.('retry-after'));
   if (Number.isFinite(header) && header > 0) return header * 1000;
-  const m = String(message).match(/try again in\s*((?:[\d.]+h)?(?:[\d.]+m(?!s))?(?:[\d.]+s)?(?:[\d.]+ms)?)/i);
+  const m = String(message).match(/(?:try again|retry) in\s*((?:[\d.]+h)?(?:[\d.]+m(?!s))?(?:[\d.]+s)?(?:[\d.]+ms)?)/i);
   if (!m || !m[1]) return null;
   let ms = 0;
   for (const [, n, u] of m[1].matchAll(/([\d.]+)(h|ms|m|s)/g)) {
@@ -274,9 +369,12 @@ const humanWait = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Ma
 async function request(manifest, url, headers, body, key, { stream = false, retries = 2, notice = defaultNotice } = {}) {
   let lastError;
   let limitRetries = 0;
-  const payload = { ...body };
+  let payload = { ...body };
   const cap = outputCap(manifest);
   if (cap && payload.max_tokens > cap) payload.max_tokens = cap;
+  // Whatever this model refused last time, already applied.
+  let params = { ...(learnedParams.get(capKey(manifest)) ?? {}) };
+  payload = adaptPayload(payload, params);
 
   for (let attempt = 0; attempt <= retries + limitRetries; attempt++) {
     let res;
@@ -290,6 +388,10 @@ async function request(manifest, url, headers, body, key, { stream = false, retr
       await sleep(backoff(attempt));
       continue;
     }
+
+    // Every response says what is left of this key's minute, refused or not.
+    // The loop fits the next request to it rather than to a fresh minute.
+    try { observe(manifest, res.headers); } catch { /* bookkeeping must not fail a request */ }
 
     if (res.ok) {
       if (!stream) return { json: await res.json() };
@@ -309,7 +411,43 @@ async function request(manifest, url, headers, body, key, { stream = false, retr
 
     // Limit recoveries get their own small allowance, so a shrink followed by a
     // wait for the minute to roll over does not use up the network retries.
+    if (info.kind === 'param') {
+      const next = info.param === 'max_tokens'
+        ? { ...params, maxTokensKey: 'max_completion_tokens' }
+        : { ...params, dropTemperature: true };
+      // Only retry when the adaptation is new, or a model that refuses both
+      // would loop refusing one of them.
+      const changed = next.maxTokensKey !== params.maxTokensKey || next.dropTemperature !== params.dropTemperature;
+      if (!changed || limitRetries >= 2) throw lastError;
+      params = next;
+      learnedParams.set(capKey(manifest), params);
+      payload = adaptPayload({ ...body, ...(payload.max_tokens ? { max_tokens: payload.max_tokens } : {}) }, params);
+      limitRetries++;
+      continue;
+    }
+
     if (info.kind === 'too-large') {
+      // The provider just counted this exact request for us. Its number beats
+      // any constant the estimator carries, so the next estimate uses it.
+      if (info.requested) {
+        calibrate(manifest, { chars: JSON.stringify(payload).length, tokens: info.requested });
+      }
+
+      // Shrinking the reply cap cannot help when the input alone is over the
+      // limit — that was the loop that burned an attempt: cap 4,000 -> 1,236,
+      // refused again at a bigger input. Say which half is too big.
+      const output = payload.max_tokens ?? payload.max_completion_tokens ?? 0;
+      if (info.limit && info.requested && info.requested - output >= info.limit) {
+        throw new ProviderError(
+          `${providerFor(manifest.provider)?.label ?? manifest.provider} allows ${info.limit.toLocaleString()} ` +
+          `${UNIT_NAMES[info.unit] ?? 'tokens'} for ${manifest.model}, and the conversation alone needs ` +
+          `${(info.requested - output).toLocaleString()}.
+` +
+          '  A smaller reply cap cannot fix this. Read less in one step, or use a model with a higher limit (/models).',
+          { ...info, kind: 'too-large', inputOnly: true, provider: manifest.provider, model: manifest.model },
+        );
+      }
+
       const smaller = shrink(payload.max_tokens, info);
       if (!smaller || limitRetries >= 2) throw lastError;
       learnedCaps.set(capKey(manifest), smaller);
@@ -459,7 +597,15 @@ export async function readOpenAIStream(events, onDelta) {
       onDelta?.(delta.content);
     }
     for (const tc of delta.tool_calls ?? []) {
-      const i = tc.index ?? 0;
+      // Some servers (Gemini's OpenAI-compatible endpoint among them) send each
+      // call whole and leave out `index`. Reading that as 0 merged two calls
+      // into one with both argument strings glued together.
+      let i = tc.index;
+      if (i === undefined) {
+        const last = calls[calls.length - 1];
+        const fresh = !last || (tc.id && last.id && tc.id !== last.id) || (tc.function?.name && last.name);
+        i = fresh ? calls.length : calls.length - 1;
+      }
       const slot = calls[i] ?? (calls[i] = { id: null, name: '', args: '' });
       if (tc.id) slot.id = tc.id;
       if (tc.function?.name) slot.name += tc.function.name;

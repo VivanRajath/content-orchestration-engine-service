@@ -177,7 +177,7 @@ describe('npx jr-arch, first run', () => {
     const root = emptyRepo();
     delete process.env.GROQ_API_KEY;
     await inRepo(root, async () => {
-      const p = scriptedPrompter(['gsk_first_run_key_1234567', '1', '3', '/exit']);
+      const p = scriptedPrompter(['gsk_first_run_key_1234567', 'n', '1', '3', '/exit']);
       await chat([], {}, { prompter: p, fetchImpl: modelsFetch(['llama-3.3-70b-versatile']) });
 
       const dir = join(root, '.gitagent');
@@ -199,7 +199,7 @@ describe('npx jr-arch, first run', () => {
     delete process.env.GROQ_API_KEY;
     await inRepo(root, async () => {
       await chat([], {}, {
-        prompter: scriptedPrompter(['gsk_secret_value_9876543', '1', '3', '/exit']),
+        prompter: scriptedPrompter(['gsk_secret_value_9876543', 'n', '1', '3', '/exit']),
         fetchImpl: modelsFetch(['m']),
       });
       const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: root, encoding: 'utf8' });
@@ -434,5 +434,207 @@ describe('the tree', () => {
     assert.match(lines, /\.env.*gitignored/);
     assert.ok(!lines.includes('.session'), 'transcripts should be hidden');
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('more than one API key', () => {
+  /** A fetch that answers each provider's model list from its own host. */
+  const byHost = (lists) => {
+    const fn = async (url) => {
+      const host = Object.keys(lists).find((h) => String(url).includes(h));
+      return {
+        ok: true, status: 200, headers: { get: () => null }, text: async () => '',
+        json: async () => ({ data: (lists[host] ?? []).map((id, i) => ({ id, created: 100 - i })) }),
+      };
+    };
+    return fn;
+  };
+  const keysIn = (dir) => parseEnv(readFileSync(join(dir, '.env'), 'utf8'));
+
+  test('setup keeps asking for keys until told to stop, and saves each one', async () => {
+    const root = emptyRepo();
+    delete process.env.GROQ_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    await inRepo(root, async () => {
+      const p = scriptedPrompter([
+        'gsk_groq_key_value_1234567',     // the first key
+        'y', 'sk-ant-api03-another-key',   // another: Anthropic
+        'n',                               // no more
+        '1',                               // the default model
+        '3',                               // start in the chat
+        '/exit',
+      ]);
+      await chat([], {}, {
+        prompter: p,
+        fetchImpl: byHost({ 'groq.com': ['llama-3.3-70b-versatile'], 'anthropic.com': ['claude-sonnet-4-6'] }),
+      });
+
+      const dir = join(root, '.gitagent');
+      const env = keysIn(dir);
+      assert.equal(env.GROQ_API_KEY, 'gsk_groq_key_value_1234567');
+      assert.equal(env.ANTHROPIC_API_KEY, 'sk-ant-api03-another-key');
+
+      const m = readManifest(join(dir, 'agent.yaml'));
+      assert.equal(m.provider, 'groq', 'the first key is still the default');
+      assert.deepEqual(m.keys.map((k) => k.provider), ['groq', 'anthropic'], 'both are listed by name');
+      assert.doesNotMatch(readFileSync(join(dir, 'agent.yaml'), 'utf8'), /sk-ant-api03|gsk_groq/, 'and no value is in agent.yaml');
+      assert.equal(p.remaining(), 0);
+    });
+  });
+
+  test('a second key for the same provider does not overwrite the first', async () => {
+    const root = emptyRepo();
+    delete process.env.GROQ_API_KEY;
+    delete process.env.GROQ_API_KEY_2;
+    await inRepo(root, async () => {
+      await chat([], {}, {
+        prompter: scriptedPrompter([
+          'gsk_first_account_1234567',
+          'y', 'gsk_second_account_7654321',
+          'n', '1', '3', '/exit',
+        ]),
+        fetchImpl: byHost({ 'groq.com': ['llama-3.3-70b-versatile'] }),
+      });
+
+      const env = keysIn(join(root, '.gitagent'));
+      assert.equal(env.GROQ_API_KEY, 'gsk_first_account_1234567', 'the first is untouched');
+      assert.equal(env.GROQ_API_KEY_2, 'gsk_second_account_7654321', 'the second has its own name');
+    });
+  });
+
+  test('/models puts one agent on a saved key, and leaves the rest alone', async () => {
+    const { root, dir } = setUpRepo();
+    process.env.GROQ_API_KEY = 'gsk_x';
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-y';
+    await inRepo(root, async () => {
+      const { addSavedKey } = await import('../src/config.js');
+      addSavedKey({ provider: 'anthropic', keyEnv: 'ANTHROPIC_API_KEY' }, join(dir, 'agent.yaml'));
+      const agents = readAgents(dir).map((a) => a.name);
+      const target = agents.indexOf('senior-dev') + 1;
+
+      await chat([], {}, {
+        prompter: scriptedPrompter([
+          '/models',
+          '2',                // one agent's model or key
+          String(target),     // senior-dev
+          '2',                // the saved Anthropic key (the default is 1)
+          '1',                // its first model
+          '/exit',
+        ]),
+        fetchImpl: byHost({ 'groq.com': ['llama-3.3-70b-versatile'], 'anthropic.com': ['claude-sonnet-4-6'] }),
+      });
+
+      const { modelFor } = await import('../src/config.js');
+      const m = readManifest(join(dir, 'agent.yaml'));
+      const senior = modelFor(m, 'senior-dev');
+      assert.equal(senior.provider, 'anthropic');
+      assert.equal(senior.model, 'claude-sonnet-4-6');
+      assert.equal(senior.keyEnv, 'ANTHROPIC_API_KEY');
+      assert.equal(modelFor(m, 'junior-dev').provider, 'groq', 'every other agent stays on the default');
+    });
+  });
+
+  test('a key pasted on the command line goes to its own provider’s variable', async () => {
+    const { root, dir } = setUpRepo();   // a Groq setup
+    process.env.GROQ_API_KEY = 'gsk_existing_value';
+    delete process.env.ANTHROPIC_API_KEY;
+    await inRepo(root, async () => {
+      const { key } = await import('../src/env.js');
+      await key(['sk-ant-api03-pasted-into-a-groq-repo'], {}, { manifest: readManifest(join(dir, 'agent.yaml')) });
+
+      const env = keysIn(dir);
+      assert.equal(env.ANTHROPIC_API_KEY, 'sk-ant-api03-pasted-into-a-groq-repo');
+      assert.equal(env.GROQ_API_KEY, undefined, 'the Groq variable was not written over');
+      assert.ok(readManifest(join(dir, 'agent.yaml')).keys.some((k) => k.provider === 'anthropic'));
+    });
+  });
+});
+
+describe('/prompt with a saved second key', () => {
+  test('offers the saved key when choosing an agent’s model, instead of asking to paste it', async () => {
+    const { root, dir } = setUpRepo();
+    process.env.GROQ_API_KEY = 'gsk_x';
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-saved';
+    await inRepo(root, async () => {
+      const { addSavedKey, modelFor } = await import('../src/config.js');
+      addSavedKey({ provider: 'anthropic', keyEnv: 'ANTHROPIC_API_KEY' }, join(dir, 'agent.yaml'));
+
+      const plan = {
+        agents: [
+          { name: 'api-dev', role: 'API work', priority: 20, owns: ['src/api/**'], parallel: false,
+            escalates_to: 'lead', terminal: false, fixes_build: false, attempts: 2,
+            soul: '# API\n\nYou work on the API.', rules: '## Must\n- a\n\n## Must not\n- b\n\n## Hand off when\n- c' },
+          { name: 'lead', role: 'Decides', priority: 80, owns: [], parallel: false,
+            escalates_to: null, terminal: true, fixes_build: true, attempts: 2,
+            soul: '# Lead\n\nYou decide.', rules: '## Must\n- a\n\n## Must not\n- b\n\n## Hand off when\n- c' },
+        ],
+        guards: { protected_paths: [], checkpoint_paths: [] },
+      };
+      const call = async () => ({ text: JSON.stringify(plan), toolCalls: [] });
+      const fetchImpl = async (url) => ({
+        ok: true, status: 200, headers: { get: () => null }, text: async () => '',
+        json: async () => ({ data: String(url).includes('anthropic') ? [{ id: 'claude-sonnet-4-6' }] : [{ id: 'llama-3.3-70b-versatile' }] }),
+      });
+
+      const p = scriptedPrompter([
+        '/prompt', 'x', '', '', '', '', '1', 'y', 'y',
+        'n',     // not the same model for everyone
+        '1',     // api-dev: the default
+        '3',     // lead: the saved Anthropic key (default, new key, saved, other model)
+        '1',     // its model
+        '/exit',
+      ]);
+      await chat([], {}, { prompter: p, call, fetchImpl });
+
+      const lead = modelFor(readManifest(join(dir, 'agent.yaml')), 'lead');
+      assert.equal(lead.provider, 'anthropic');
+      assert.equal(lead.keyEnv, 'ANTHROPIC_API_KEY', 'the saved key, by name — nothing was pasted');
+      assert.equal(p.remaining(), 0, 'and no key was asked for');
+    });
+  });
+});
+
+describe('keys edited in the folder', () => {
+  test('a key added to .gitagent/.env while the chat is open is used on the next message', async () => {
+    const { root, dir } = setUpRepo();
+    process.env.GROQ_API_KEY = 'gsk_x';
+    delete process.env.ANTHROPIC_API_KEY;
+    await inRepo(root, async () => {
+      // Someone switches to their editor mid-conversation and pastes a key.
+      const script = scriptedPrompter(['/help', '/exit']);
+      let asked = 0;
+      const prompter = {
+        ...script,
+        async ask(q, opts) {
+          asked++;
+          if (asked === 1) writeFileSync(join(dir, '.env'), 'ANTHROPIC_API_KEY=sk-ant-api03-typed-by-hand\n');
+          return script.ask(q, opts);
+        },
+      };
+      await chat([], {}, { prompter, fetchImpl: modelsFetch(['m']) });
+
+      assert.equal(process.env.ANTHROPIC_API_KEY, 'sk-ant-api03-typed-by-hand', 'picked up without a restart');
+      const m = readManifest(join(dir, 'agent.yaml'));
+      assert.ok(m.keys.some((k) => k.keyEnv === 'ANTHROPIC_API_KEY'), 'and offered from now on');
+      delete process.env.ANTHROPIC_API_KEY;
+    });
+  });
+
+  test('a key pasted into agent.yaml is caught before anything else, and moved', async () => {
+    const { root, dir } = setUpRepo();
+    delete process.env.GROQ_API_KEY;
+    await inRepo(root, async () => {
+      const file = join(dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace(/api_key_env: \w+/, 'api_key_env: gsk_pasted_into_the_yaml_42'));
+
+      // yes, move it — then straight into the chat, no onboarding
+      const p = scriptedPrompter(['y', '/exit']);
+      await chat([], {}, { prompter: p, fetchImpl: modelsFetch(['llama-3.3-70b-versatile']) });
+
+      assert.doesNotMatch(readFileSync(file, 'utf8'), /gsk_pasted/, 'gone from the committed file');
+      assert.equal(parseEnv(readFileSync(join(dir, '.env'), 'utf8')).GROQ_API_KEY, 'gsk_pasted_into_the_yaml_42');
+      assert.equal(p.remaining(), 0, 'and the chat opened normally, without setup');
+      delete process.env.GROQ_API_KEY;
+    });
   });
 });

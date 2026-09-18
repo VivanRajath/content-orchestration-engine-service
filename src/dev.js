@@ -169,6 +169,12 @@ export function checkAll({ dir = agentDir() } = {}) {
     const files = hookFiles(dir);
     guardCount = files.length;
     for (const n of hooks.notes) warnings.push(n);
+    // Declared, loaded, and never executed. Saying so here is the same rule as
+    // everywhere else: a guard that quietly does nothing is worse than none.
+    const postRun = Object.keys(hooks.post_run ?? {});
+    if (postRun.length) {
+      warnings.push(`post_run hooks are not executed yet (${postRun.join(', ')}) — they protect nothing`);
+    }
     // A scaffolded guard still pointing at TODO/** protects nothing, and does
     // it silently — the file loads, so nothing else would ever flag it.
     for (const f of files) {
@@ -210,5 +216,6 @@ export const DEV_HELP = `
   ${c.c('/check')}           find problems before a run does
   ${c.c('/smoke <name>')}    test that an agent actually works
   ${c.c('/tree')}            show the whole .gitagent/ folder
+  ${c.c('/keys')}            your API keys, and where they live
   ${c.c('@name <task>')}     give a task to one agent
 `;

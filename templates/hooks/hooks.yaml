@@ -126,8 +126,3 @@ pre_commit:
     description: Never rewrite session branch history.
     severity: block
     overridable: false
-
-post_run:
-  - name: session-summary
-    description: Write tier path and handoff reasons to memory/MEMORY.md.
-    severity: info
