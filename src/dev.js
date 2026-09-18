@@ -216,5 +216,6 @@ export const DEV_HELP = `
   ${c.c('/check')}           find problems before a run does
   ${c.c('/smoke <name>')}    test that an agent actually works
   ${c.c('/tree')}            show the whole .gitagent/ folder
+  ${c.c('/keys')}            your API keys, and where they live
   ${c.c('@name <task>')}     give a task to one agent
 `;

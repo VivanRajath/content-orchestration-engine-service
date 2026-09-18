@@ -16,7 +16,7 @@ import { c } from './util.js';
 const NOTES = {
   'agent.yaml': 'model, provider, routing',
   'DUTIES.md': 'how agents hand work to each other',
-  '.env': 'your API key — gitignored, never committed',
+  '.env': 'your API keys (NAME=value) — edit here any time; gitignored, agents cannot read it',
   '.pack.lock': 'what a pack installed, for pull',
   'hooks': 'guardrails the harness enforces',
   'agents': 'one folder per agent',

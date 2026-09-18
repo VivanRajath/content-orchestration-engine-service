@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { agentDir, repoRoot } from './paths.js';
 import { init } from './init.js';
 import { readManifest, patchSection, setModelMaxTokens, setTokensPerMinute, addSavedKey } from './config.js';
-import { writeKey, ensureIgnored, fingerprint, nextKeyEnv } from './env.js';
+import { writeKey, ensureIgnored, fingerprint, nextKeyEnv, ensureEnvFile } from './env.js';
 import { PROVIDERS, detectProvider, providerFor, listModels, KeyRejected } from './providers.js';
 import { parseRateLimits, probeModel, printProviderLimits, suggestedCap } from './limits.js';
 import { printTree } from './tree.js';
@@ -94,6 +94,7 @@ export async function onboard(prompter, { fetchImpl = fetch, root = repoRoot() }
   const capped = cap && (configured == null || cap < configured);
   if (capped) setModelMaxTokens(cap, join(dir, 'agent.yaml'));
 
+  ensureEnvFile(dir, root);
   // Every key added in step 1, the default model's first. The ignore rule is
   // checked before the first one touches disk, never after.
   for (const k of [conn, ...extra]) {
@@ -373,8 +374,7 @@ function explainFiles(conn) {
   info(`  ${c.c('agents/<name>/RULES.md')}  what it must and must not do`);
   info(`  ${c.c('hooks/')}                  guardrails — enforced, not suggested`);
   info(`  ${c.c('agent.yaml')}              model and routing`);
-  if (conn.key) {
-    info(`  ${c.c('.env')}                    your key ${c.d('— gitignored, and the agents cannot read it')}`);
-  }
+  // Always, not only when a key was typed: this is where keys go by hand.
+  info(`  ${c.c('.env')}                    your API keys, NAME=value ${c.d('— add more here any time; gitignored, and the agents cannot read it')}`);
   console.log();
 }

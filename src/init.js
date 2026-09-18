@@ -3,6 +3,7 @@ import { join, sep } from 'node:path';
 import { TEMPLATES, agentDir, repoRoot } from './paths.js';
 import { patchSection, upsertSection } from './config.js';
 import { readAgents } from './agents.js';
+import { ensureEnvFile } from './env.js';
 import { fetchPack, readPack, inspectHooks, installPack, writeLock } from './pack.js';
 import { PROVIDERS, providerFor } from './providers.js';
 import { c, ok, info, warn } from './util.js';
@@ -110,6 +111,11 @@ export async function init(flags) {
   if (missing.length) {
     appendFileSync(gitignore, `${current && !current.endsWith('\n') ? '\n' : ''}\n# jr-arch\n${missing.join('\n')}\n`);
   }
+
+  // The key file, with its own instructions, so a person working in the
+  // folder has somewhere obvious to paste one. Created after the ignore rule
+  // above, never before it.
+  ensureEnvFile(dir, root);
 
   // Onboarding scaffolds through here too, and draws its own tree and next
   // steps afterwards; printing both would say everything twice.

@@ -593,3 +593,48 @@ describe('/prompt with a saved second key', () => {
     });
   });
 });
+
+describe('keys edited in the folder', () => {
+  test('a key added to .gitagent/.env while the chat is open is used on the next message', async () => {
+    const { root, dir } = setUpRepo();
+    process.env.GROQ_API_KEY = 'gsk_x';
+    delete process.env.ANTHROPIC_API_KEY;
+    await inRepo(root, async () => {
+      // Someone switches to their editor mid-conversation and pastes a key.
+      const script = scriptedPrompter(['/help', '/exit']);
+      let asked = 0;
+      const prompter = {
+        ...script,
+        async ask(q, opts) {
+          asked++;
+          if (asked === 1) writeFileSync(join(dir, '.env'), 'ANTHROPIC_API_KEY=sk-ant-api03-typed-by-hand\n');
+          return script.ask(q, opts);
+        },
+      };
+      await chat([], {}, { prompter, fetchImpl: modelsFetch(['m']) });
+
+      assert.equal(process.env.ANTHROPIC_API_KEY, 'sk-ant-api03-typed-by-hand', 'picked up without a restart');
+      const m = readManifest(join(dir, 'agent.yaml'));
+      assert.ok(m.keys.some((k) => k.keyEnv === 'ANTHROPIC_API_KEY'), 'and offered from now on');
+      delete process.env.ANTHROPIC_API_KEY;
+    });
+  });
+
+  test('a key pasted into agent.yaml is caught before anything else, and moved', async () => {
+    const { root, dir } = setUpRepo();
+    delete process.env.GROQ_API_KEY;
+    await inRepo(root, async () => {
+      const file = join(dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace(/api_key_env: \w+/, 'api_key_env: gsk_pasted_into_the_yaml_42'));
+
+      // yes, move it — then straight into the chat, no onboarding
+      const p = scriptedPrompter(['y', '/exit']);
+      await chat([], {}, { prompter: p, fetchImpl: modelsFetch(['llama-3.3-70b-versatile']) });
+
+      assert.doesNotMatch(readFileSync(file, 'utf8'), /gsk_pasted/, 'gone from the committed file');
+      assert.equal(parseEnv(readFileSync(join(dir, '.env'), 'utf8')).GROQ_API_KEY, 'gsk_pasted_into_the_yaml_42');
+      assert.equal(p.remaining(), 0, 'and the chat opened normally, without setup');
+      delete process.env.GROQ_API_KEY;
+    });
+  });
+});

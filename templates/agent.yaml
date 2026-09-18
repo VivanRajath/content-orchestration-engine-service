@@ -8,7 +8,9 @@ metadata:
   version: 0.1.0
 
 # Your model, your key. Nothing is pinned by this tool.
-# Key is read from the env var named below — never written to this file.
+# api_key_env is the NAME of the variable holding your key, never the key.
+# The key itself goes in .gitagent/.env as NAME=value — that file is
+# gitignored; this one is committed.
 model:
   provider: anthropic          # anthropic | openai | ollama | openai-compatible
   name: claude-sonnet-4-6

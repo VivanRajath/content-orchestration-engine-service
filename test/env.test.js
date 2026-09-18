@@ -196,3 +196,134 @@ describe('fingerprint', () => {
     assert.equal(fingerprint(''), '');
   });
 });
+
+describe('the key file, edited by hand', () => {
+  test('it exists from setup, and says what to type', async () => {
+    const { ensureEnvFile } = await import('../src/env.js');
+    const root = sandbox();
+    try {
+      assert.equal(ensureEnvFile(join(root, '.gitagent'), root), true);
+      const text = readFileSync(join(root, '.gitagent', ENV_FILE), 'utf8');
+      assert.match(text, /NAME=value/, 'it explains the format');
+      assert.match(text, /^# GROQ_API_KEY=$/m, 'with a placeholder per provider');
+      assert.match(readFileSync(join(root, '.gitignore'), 'utf8'), /\.gitagent\/\.env/, 'ignored before it existed');
+      assert.equal(ensureEnvFile(join(root, '.gitagent'), root), false, 'and never overwritten once there');
+    } finally { clean(root); }
+  });
+
+  test('saving a key edits its own line and keeps everything a person wrote', async () => {
+    const root = sandbox();
+    try {
+      const dir = join(root, '.gitagent');
+      writeFileSync(join(dir, ENV_FILE), '# my notes: the work key is below\n# GROQ_API_KEY=\nOTHER_THING=keep\n');
+      writeKey('GROQ_API_KEY', 'gsk_first', dir);
+      writeKey('GROQ_API_KEY', 'gsk_second', dir);
+
+      const text = readFileSync(join(dir, ENV_FILE), 'utf8');
+      assert.match(text, /# my notes: the work key is below/, 'comments survive');
+      assert.match(text, /^OTHER_THING=keep$/m, 'so do other lines');
+      assert.equal((text.match(/^GROQ_API_KEY=/gm) || []).length, 1, 'one line for the key, replaced in place');
+      assert.match(text, /^GROQ_API_KEY=gsk_second$/m);
+      assert.doesNotMatch(text, /# GROQ_API_KEY=/, 'the placeholder became the real line');
+
+      removeKey('GROQ_API_KEY', dir);
+      assert.match(readFileSync(join(dir, ENV_FILE), 'utf8'), /# my notes/, 'and removing one keeps the rest');
+    } finally { clean(root); }
+  });
+
+  test('what a person types by hand is read: export, spaces, CRLF, a byte-order mark', () => {
+    assert.deepEqual(
+      parseEnv('﻿export GROQ_API_KEY = gsk_abc\r\nXAI_API_KEY=xai-def\r\n'),
+      { GROQ_API_KEY: 'gsk_abc', XAI_API_KEY: 'xai-def' },
+    );
+  });
+});
+
+describe('picking up an edited key file while running', () => {
+  test('a new line is used, a changed one updated, a deleted one forgotten', async () => {
+    const { reloadEnv } = await import('../src/env.js');
+    const root = sandbox();
+    try {
+      const dir = join(root, '.gitagent');
+      writeFileSync(join(dir, ENV_FILE), `${VAR}=first\n`);
+      loadEnv(dir);
+      assert.equal(process.env[VAR], 'first');
+
+      writeFileSync(join(dir, ENV_FILE), `${VAR}=second\n${OTHER}=added\n`);
+      const changed = reloadEnv(dir);
+      assert.equal(process.env[VAR], 'second', 'an edited key is picked up');
+      assert.equal(process.env[OTHER], 'added', 'and a new one');
+      assert.deepEqual(changed.sort(), [OTHER, VAR].sort(), 'and the chat can say which');
+
+      writeFileSync(join(dir, ENV_FILE), `${OTHER}=added\n`);
+      reloadEnv(dir);
+      assert.equal(process.env[VAR], undefined, 'a deleted line is forgotten');
+    } finally { clean(root); }
+  });
+
+  test('a key exported in the shell is never overridden by the file', async () => {
+    const { reloadEnv } = await import('../src/env.js');
+    const root = sandbox();
+    try {
+      const dir = join(root, '.gitagent');
+      process.env[VAR] = 'from-the-shell';
+      writeFileSync(join(dir, ENV_FILE), `${VAR}=from-the-file\n`);
+      loadEnv(dir);
+      reloadEnv(dir);
+      assert.equal(process.env[VAR], 'from-the-shell');
+    } finally { clean(root); }
+  });
+});
+
+describe('keys found in the file', () => {
+  function withManifest() {
+    const root = sandbox();
+    const dir = join(root, '.gitagent');
+    const manifest = readFileSync(join(TEMPLATES, 'agent.yaml'), 'utf8')
+      .replace('provider: anthropic', 'provider: groq').replace('ANTHROPIC_API_KEY', 'GROQ_API_KEY');
+    writeFileSync(join(dir, 'agent.yaml'), manifest);
+    return { root, dir };
+  }
+
+  test('a key under a new name is recorded, so it is offered in /models and /prompt', async () => {
+    const { discoverKeys } = await import('../src/env.js');
+    const { readManifest } = await import('../src/config.js');
+    const { root, dir } = withManifest();
+    try {
+      writeFileSync(join(dir, ENV_FILE), [
+        'GROQ_API_KEY=gsk_default',
+        'GROQ_API_KEY_5=gsk_fifth',
+        'MY_CLAUDE=sk-ant-api03-by-its-value',
+        'LLM_API_KEY=needs-a-base-url',
+      ].join('\n'));
+
+      const found = discoverKeys(dir);
+      assert.deepEqual(found.map((f) => [f.name, f.provider]), [
+        ['GROQ_API_KEY_5', 'groq'],
+        ['MY_CLAUDE', 'anthropic'],
+      ], 'by name, then by value; the default is already known, and a keyless URL is not guessed');
+      assert.ok(readManifest(join(dir, 'agent.yaml')).keys.some((k) => k.keyEnv === 'MY_CLAUDE'));
+      assert.deepEqual(discoverKeys(dir), [], 'and found once, not every message');
+    } finally { clean(root); }
+  });
+
+  test('a key pasted into agent.yaml is moved out of the committed file', async () => {
+    const { misplacedKeys, moveMisplacedKey } = await import('../src/env.js');
+    const { readManifest } = await import('../src/config.js');
+    const { root, dir } = withManifest();
+    try {
+      const file = join(dir, 'agent.yaml');
+      writeFileSync(file, readFileSync(file, 'utf8').replace('api_key_env: GROQ_API_KEY', 'api_key_env: gsk_pasted_right_here_123'));
+
+      const found = misplacedKeys(readManifest(file));
+      assert.equal(found.length, 1);
+      const name = moveMisplacedKey(found[0], dir, root);
+
+      assert.equal(name, 'GROQ_API_KEY');
+      assert.doesNotMatch(readFileSync(file, 'utf8'), /gsk_pasted/, 'the key is gone from agent.yaml');
+      assert.equal(readManifest(file).keyEnv, 'GROQ_API_KEY', 'which names its variable again');
+      assert.equal(parseEnv(readFileSync(join(dir, ENV_FILE), 'utf8')).GROQ_API_KEY, 'gsk_pasted_right_here_123');
+      delete process.env.GROQ_API_KEY;
+    } finally { clean(root); }
+  });
+});
