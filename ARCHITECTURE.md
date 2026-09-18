@@ -868,6 +868,7 @@ containing a cmd metacharacter or whitespace is **refused**. The same
 | `groq` | openai | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `gsk_` |
 | `openrouter` | openai | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `sk-or-` |
 | `xai` | openai | `https://api.x.ai/v1` | `XAI_API_KEY` | `xai-` |
+| `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `AIza` |
 | `openai` | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `sk-` (checked last) |
 | `ollama` | openai | `http://localhost:11434/v1` | `OLLAMA_API_KEY` | none (`noKey`) |
 | `openai-compatible` | openai | **none** | `LLM_API_KEY` | none |

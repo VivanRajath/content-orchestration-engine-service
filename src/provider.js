@@ -261,6 +261,8 @@ export function unsupportedParam(raw) {
 export function parseProviderError(status, text, headers) {
   let body = null;
   try { body = JSON.parse(text); } catch { /* not JSON */ }
+  // Gemini's OpenAI-compatible endpoint wraps its error in a one-element array.
+  if (Array.isArray(body)) body = body[0] ?? null;
   const raw = String(body?.error?.message ?? body?.message ?? (typeof body?.error === 'string' ? body.error : '') ?? '')
     || String(text ?? '').slice(0, 300);
   const code = String(body?.error?.code ?? body?.error?.type ?? '');
@@ -268,7 +270,10 @@ export function parseProviderError(status, text, headers) {
   // "... tokens per minute (TPM): Limit 6000, Requested 7120" — Groq, OpenAI.
   const limits = raw.match(/\((\w+)\):\s*Limit\s*([\d,]+),\s*(?:Used\s*([\d,]+),\s*)?Requested\s*([\d,]+)/i);
   const num = (s) => (s ? Number(s.replace(/,/g, '')) : null);
-  const unit = limits?.[1]?.toUpperCase() ?? null;
+  // Gemini names no unit in its sentence; a daily quota shows up only in the
+  // quota id it attaches ("GenerateRequestsPerDayPerProjectPerModel-FreeTier").
+  const daily = String(text ?? '').match(/"quotaId"\s*:\s*"([^"]*PerDay[^"]*)"/)?.[1];
+  const unit = limits?.[1]?.toUpperCase() ?? (daily ? (/Token/i.test(daily) ? 'TPD' : 'RPD') : null);
   const limit = num(limits?.[2]);
   const requested = num(limits?.[4]);
 
@@ -284,6 +289,8 @@ export function parseProviderError(status, text, headers) {
   else if (tooLarge) kind = 'too-large';
   else if (status === 429) kind = 'rate-limit';
   else if (status === 401 || status === 403) kind = 'auth';
+  // Google reports a bad key as 400 INVALID_ARGUMENT rather than 401.
+  else if (/API_KEY_INVALID|API key not valid|API key expired/i.test(raw + String(text))) kind = 'auth';
   else if (status === 404 || /model_not_found|does not exist|not supported|decommissioned/i.test(raw + code)) kind = 'model';
   else if (status >= 500) kind = 'server';
 
@@ -304,7 +311,7 @@ function tidy(message) {
 function retryAfterMs(headers, message) {
   const header = Number(headers?.get?.('retry-after'));
   if (Number.isFinite(header) && header > 0) return header * 1000;
-  const m = String(message).match(/try again in\s*((?:[\d.]+h)?(?:[\d.]+m(?!s))?(?:[\d.]+s)?(?:[\d.]+ms)?)/i);
+  const m = String(message).match(/(?:try again|retry) in\s*((?:[\d.]+h)?(?:[\d.]+m(?!s))?(?:[\d.]+s)?(?:[\d.]+ms)?)/i);
   if (!m || !m[1]) return null;
   let ms = 0;
   for (const [, n, u] of m[1].matchAll(/([\d.]+)(h|ms|m|s)/g)) {
@@ -590,7 +597,15 @@ export async function readOpenAIStream(events, onDelta) {
       onDelta?.(delta.content);
     }
     for (const tc of delta.tool_calls ?? []) {
-      const i = tc.index ?? 0;
+      // Some servers (Gemini's OpenAI-compatible endpoint among them) send each
+      // call whole and leave out `index`. Reading that as 0 merged two calls
+      // into one with both argument strings glued together.
+      let i = tc.index;
+      if (i === undefined) {
+        const last = calls[calls.length - 1];
+        const fresh = !last || (tc.id && last.id && tc.id !== last.id) || (tc.function?.name && last.name);
+        i = fresh ? calls.length : calls.length - 1;
+      }
       const slot = calls[i] ?? (calls[i] = { id: null, name: '', args: '' });
       if (tc.id) slot.id = tc.id;
       if (tc.function?.name) slot.name += tc.function.name;

@@ -202,7 +202,7 @@ export async function ensureRepo(prompter, root = repoRoot()) {
  * a 401 on their first real task.
  */
 export async function obtainKey(prompter, { fetchImpl = fetch, attempts = 3 } = {}) {
-  info(`Paste an API key. ${c.d('Supported: Anthropic, Groq, OpenAI, OpenRouter, xAI — or type')} ${c.c('ollama')} ${c.d('for a local model.')}`);
+  info(`Paste an API key. ${c.d('Supported: Anthropic, Gemini, Groq, OpenAI, OpenRouter, xAI — or type')} ${c.c('ollama')} ${c.d('for a local model.')}`);
 
   for (let tries = 0; tries < attempts; tries++) {
     const raw = await prompter.secret('API key:');
@@ -225,7 +225,7 @@ export async function obtainKey(prompter, { fetchImpl = fetch, attempts = 3 } = 
       } else {
         info("I can't tell whose key that is from its format.");
         provider = await prompter.choose('Which provider is it for?', [
-          ...['anthropic', 'groq', 'openai', 'openrouter', 'xai'].map((id) => ({ value: id, label: PROVIDERS[id].label })),
+          ...['anthropic', 'groq', 'openai', 'openrouter', 'xai', 'gemini'].map((id) => ({ value: id, label: PROVIDERS[id].label })),
           { value: 'openai-compatible', label: 'Something else (OpenAI-compatible)' },
         ]);
         if (provider === null) return null;
